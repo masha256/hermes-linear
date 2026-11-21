@@ -115,15 +115,18 @@ def _delegation_generation(ticket: Ticket | None, state_type: str | None) -> int
     return ticket.generation
 
 
-def _is_plugin_created(store: Store, sid: str, root_comment_id: str | None) -> bool:
+def _plugin_created_row(
+    store: Store, sid: str, root_comment_id: str | None
+) -> SessionRow | None:
+    """The plugin-created session row this event belongs to, if any."""
     row = store.session(sid)
     if row is not None and row.plugin_created:
-        return True
+        return row
     if root_comment_id:
         row = store.session_by_root_comment(root_comment_id)
         if row is not None and row.plugin_created:
-            return True
-    return False
+            return row
+    return None
 
 
 def _session_key(row: SessionRow | None, ticket: Ticket) -> tuple[str, str | None]:
@@ -152,8 +155,17 @@ async def _agent_session_event(event: dict, ctx: RouterContext) -> list[Decision
     root_comment_id = session.get("commentId") or _d(session.get("comment")).get("id")
     is_mention = _d(session.get("sourceMetadata")).get("type") == "comment"
 
-    if action == "created" and _is_plugin_created(store, sid, root_comment_id):
-        return [Ignore("plugin-created")]
+    if action == "created":
+        own = _plugin_created_row(store, sid, root_comment_id)
+        if own is not None:
+            if own.agent_session_id != sid and store.session(sid) is None:
+                # Matched by root comment only: remember the real session id as
+                # ours so a later `prompted` on it is classified correctly.
+                store.record_session(
+                    sid, own.issue_id, own.root_comment_id or root_comment_id,
+                    own.kind, plugin_created=True,
+                )
+            return [Ignore("plugin-created")]
 
     # Record the session and a ticket placeholder before anything else.
     existing = store.session(sid)
@@ -249,16 +261,25 @@ async def _issue(event: dict, ctx: RouterContext) -> list[Decision]:
     decisions: list[Decision] = []
     updated_from = _d(event.get("updatedFrom"))
     if "delegateId" in updated_from:
-        decisions += _delegate_change(
-            ctx, ticket, updated_from.get("delegateId"), data.get("delegateId"),
+        decisions += await _delegate_change(
+            ctx, event, ticket, updated_from.get("delegateId"), data.get("delegateId"),
             state.get("type"),
         )
     # Task 8: AddContext for the other changed fields goes here.
     return decisions
 
 
-def _delegate_change(
+def _is_bot_actor(event: dict) -> bool:
+    """Bot/automation actor: a present ``botActor`` or a non-``user`` actor type."""
+    data = _d(event.get("data"))
+    if event.get("botActor") or data.get("botActor"):
+        return True
+    return _d(event.get("actor")).get("type") != "user"
+
+
+async def _delegate_change(
     ctx: RouterContext,
+    event: dict,
     ticket: Ticket,
     old: str | None,
     new: str | None,
@@ -270,6 +291,15 @@ def _delegate_change(
         if ticket.mode == "delegated":
             # The delegation `created` arrived first and already started the turn.
             return [Ignore("already delegated")]
+        # Spec §7.3: a delegation is a turn trigger, so the delegator must be a
+        # known, allowed human. A bot/automation or a denied user never starts
+        # the agent via this path (no SetMode, no await). Note: an automation
+        # delegating via a Linear triage rule therefore does not start the agent
+        # here; Linear's own `created` event for such a delegation still goes
+        # through the created path's access check on `creatorId`.
+        actor_id = _d(event.get("actor")).get("id")
+        if not actor_id or _is_bot_actor(event) or not await ctx.allowed(actor_id):
+            return [Ignore("denied delegator")]
         gen = _delegation_generation(ticket, state_type or ticket.state_type)
         return [SetMode(issue_id, "delegated", gen), AwaitDelegation(issue_id, DELEGATION_WAIT_S)]
     if old == me and new != me:  # §6.4 un-delegated

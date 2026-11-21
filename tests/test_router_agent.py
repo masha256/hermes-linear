@@ -341,3 +341,57 @@ async def test_unknown_type_ignored(ctx):
     assert await route({"type": "Reaction", "action": "create"}, ctx) == [
         Ignore("unhandled type")
     ]
+
+
+# ------------------------------------------------- review fixes (round 1)
+
+
+async def test_root_comment_match_records_real_session_id(ctx, store):
+    store.record_session("provisional", M_ISSUE, M_ROOT, "comment", plugin_created=True)
+    assert await route(copy.deepcopy(MENTION), ctx) == [Ignore("plugin-created")]
+    row = store.session(M_SID)
+    assert row is not None
+    assert row.plugin_created
+    assert (row.issue_id, row.root_comment_id, row.kind) == (M_ISSUE, M_ROOT, "comment")
+
+
+def _no_await(out):
+    return not any(isinstance(d, (SetMode, AwaitDelegation)) for d in out)
+
+
+async def test_denied_delegator_no_await(store):
+    seen = []
+
+    async def allowed(uid):
+        seen.append(uid)
+        return False
+
+    ctx = RouterContext(store=store, app_user_id=APP, allowed=allowed)
+    out = await route(copy.deepcopy(ISSUE_DELEGATED), ctx)
+    assert out == [Ignore("denied delegator")]
+    assert seen == [ISSUE_DELEGATED["actor"]["id"]]
+    assert store.ticket(ISSUE).mode != "delegated"
+
+
+async def test_bot_delegator_no_await(ctx):
+    ev = copy.deepcopy(ISSUE_DELEGATED)
+    ev["data"]["botActor"] = {"id": "bot-1", "type": "workflow", "name": "Triage rule"}
+    assert await route(ev, ctx) == [Ignore("denied delegator")]
+    ev = copy.deepcopy(ISSUE_DELEGATED)
+    ev["actor"]["type"] = "integration"
+    assert await route(ev, ctx) == [Ignore("denied delegator")]
+
+
+async def test_missing_actor_delegator_no_await(ctx):
+    ev = copy.deepcopy(ISSUE_DELEGATED)
+    ev.pop("actor")
+    out = await route(ev, ctx)
+    assert out == [Ignore("denied delegator")] and _no_await(out)
+
+
+async def test_denied_undelegate_still_interrupts(store):
+    ctx = RouterContext(store=store, app_user_id=APP, allowed=_no)
+    store.set_mode(ISSUE, "delegated", 1)
+    store.record_session("s1", ISSUE, "c1", "delegation")
+    out = await route(_delegate_event(APP, None), ctx)
+    assert out == [Interrupt("s1"), SetMode(issue_id=ISSUE, mode="untouched", generation=1)]
