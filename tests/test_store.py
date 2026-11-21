@@ -249,3 +249,11 @@ def test_concurrent_threads_smoke(tmp_path):
     assert errors == []
     assert len(s.pending_context("I1")) == MAX_PENDING_ITEMS
     s.close()
+
+
+def test_sessions_for_issue(store):
+    store.record_session("s1", "I1", "c1", "delegation")
+    store.record_session("s2", "I1", "c2", "mention")
+    store.record_session("s3", "I2", "c3", "mention")
+    assert [s.agent_session_id for s in store.sessions_for_issue("I1")] == ["s1", "s2"]
+    assert store.sessions_for_issue("none") == []

@@ -341,6 +341,14 @@ class Store:
             )
         return self._session_row(r)
 
+    def sessions_for_issue(self, issue_id: str) -> list[SessionRow]:
+        with self._lock:
+            rows = self._all(
+                "SELECT * FROM sessions WHERE issue_id = ? ORDER BY created_at, rowid",
+                (issue_id,),
+            )
+        return [self._session_row(r) for r in rows]  # type: ignore[misc]
+
     def is_session_root(self, comment_id: str) -> bool:
         return self.session_by_root_comment(comment_id) is not None
 
