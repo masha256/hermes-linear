@@ -18,6 +18,9 @@ from .linear_client import LinearError
 log = logging.getLogger(__name__)
 
 PARAMETER_MAX = 120
+# Linear SDL (AgentSessionUpdateInput.plan): 1–100 entries, content 1–10,000 chars.
+PLAN_MAX_ITEMS = 100
+PLAN_CONTENT_MAX = 10_000
 ELLIPSIS = "…"
 
 # Only these activity types may be posted ephemerally (Linear rejects the rest).
@@ -85,13 +88,26 @@ def parse_approval_answer(text: str) -> str | None:
 
 # ---------------------------------------------------------------- plan
 
-def plan_from_todos(todos: list[dict]) -> list[dict]:
-    """Hermes todo list -> Linear ``agentSessionUpdate.plan`` (full replace)."""
-    plan = []
+def plan_from_todos(todos: list[dict] | None) -> list[dict] | None:
+    """Hermes todo list -> Linear ``agentSessionUpdate.plan`` (full replace).
+
+    Enforces Linear's plan limits (1–100 entries, content 1–10,000 chars):
+    blank-content todos are skipped, content is truncated with '…', and only
+    the first ``PLAN_MAX_ITEMS`` remaining entries are kept. Returns None when
+    nothing remains (callers must not send an empty plan).
+    """
+    plan: list[dict] = []
     for t in todos or []:
+        if not isinstance(t, dict):
+            continue
+        content = str(t.get("content") or "")
+        if not content.strip():
+            continue
         status = _PLAN_STATUS.get(str(t.get("status") or ""), "pending")
-        plan.append({"content": str(t.get("content") or ""), "status": status})
-    return plan
+        plan.append({"content": _cap(content, PLAN_CONTENT_MAX), "status": status})
+        if len(plan) >= PLAN_MAX_ITEMS:
+            break
+    return plan or None
 
 
 # ---------------------------------------------------------------- previews
@@ -139,10 +155,23 @@ def result_preview(result: str | None) -> str:
 # ---------------------------------------------------------------- writer
 
 def _short_error(exc: BaseException) -> str:
+    """Sanitized error summary: never includes ``str(exc)``.
+
+    Exception messages (notably LinearError's raw GraphQL error text) can echo
+    request inputs such as activity bodies or tokens, so only the type name and,
+    for LinearError, the structured ``code``/``status`` are kept.
+    """
     if isinstance(exc, asyncio.TimeoutError):
         return "timeout"
-    msg = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
-    return _cap(" ".join(msg.split()), 200)
+    name = type(exc).__name__
+    if isinstance(exc, LinearError):
+        parts = [name]
+        if exc.code:
+            parts.append(f"code={exc.code}")
+        if exc.status is not None:
+            parts.append(f"status={exc.status}")
+        name = " ".join(parts)
+    return _cap(" ".join(name.split()), 200)
 
 
 class ActivityWriter:
@@ -207,8 +236,11 @@ class ActivityWriter:
         )
 
     async def update_plan(
-        self, agent_session_id: str, plan: list[dict], *, timeout_s: float | None = None
+        self, agent_session_id: str, plan: list[dict] | None, *, timeout_s: float | None = None
     ) -> bool:
+        """Replace the session plan. ``None`` (nothing to show) is a no-op → True."""
+        if plan is None:
+            return True
         return await self._call(
             "plan update",
             agent_session_id,
@@ -219,6 +251,11 @@ class ActivityWriter:
     async def set_external_url(
         self, agent_session_id: str, label: str, url: str, *, timeout_s: float | None = None
     ) -> bool:
+        """Set the session's external link.
+
+        Note: ``externalUrls`` is a full replace — this sets the list to exactly
+        this one ``{label, url}`` and drops any links previously on the session.
+        """
         return await self._call(
             "external url update",
             agent_session_id,

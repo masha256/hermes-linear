@@ -59,7 +59,28 @@ def test_plan_mapping():
         {"content": "d", "status": "canceled"},
     ]
     assert r.plan_from_todos([{"content": "x", "status": "weird"}]) == [{"content": "x", "status": "pending"}]
-    assert r.plan_from_todos([]) == []
+    assert r.plan_from_todos([]) is None
+    assert r.plan_from_todos(None) is None
+
+
+def test_plan_limits():
+    many = [{"content": f"t{i}", "status": "pending"} for i in range(150)]
+    plan = r.plan_from_todos(many)
+    assert len(plan) == 100
+    assert [p["content"] for p in plan] == [f"t{i}" for i in range(100)]
+    long = r.plan_from_todos([{"content": "x" * 20000, "status": "pending"}])
+    assert len(long[0]["content"]) == 10000 and long[0]["content"].endswith("…")
+    mixed = r.plan_from_todos([
+        {"content": "", "status": "pending"},
+        {"content": "   \n", "status": "pending"},
+        {"status": "pending"},
+        {"content": "keep", "status": "completed"},
+    ])
+    assert mixed == [{"content": "keep", "status": "completed"}]
+    assert r.plan_from_todos([{"content": " "}, {"content": None}]) is None
+    # blank entries do not count toward the 100 cap
+    padded = [{"content": ""}] * 50 + many
+    assert len(r.plan_from_todos(padded)) == 100
 
 
 def test_tool_parameter():
@@ -85,6 +106,15 @@ def test_result_preview_redacts_and_caps():
     assert "abcdefghijklmnopqrstuvwxyz123456" not in bearer
     assert r.result_preview("short") == "short"
     assert r.result_preview(None) == ""
+
+
+async def test_update_plan_none_is_noop():
+    c = FakeClient()
+    w = r.ActivityWriter(c)
+    assert await w.update_plan("s1", None) is True
+    assert await w.update_plan("s1", r.plan_from_todos([])) is True
+    assert c.updates == []
+    assert w.degraded is False
 
 
 class FakeClient:
@@ -162,3 +192,28 @@ async def test_writer_session_updates():
         ("s1", plan, None),
         ("s1", None, [{"label": "Hermes session", "url": "https://h/s"}]),
     ]
+
+
+@pytest.mark.parametrize("make_exc", [
+    lambda m: LinearError(m, code="INVALID_INPUT", status=400),
+    lambda m: RuntimeError(m),
+    lambda m: ValueError(m),
+])
+async def test_writer_errors_sanitized(make_exc, caplog):
+    secret = "sk-" + "Q7w8E9r0T1" * 4
+    snippet = "body snippet: please deploy the payroll fix"
+    exc = make_exc(f"Argument {secret} invalid; {snippet}")
+    w = r.ActivityWriter(FakeClient(exc=exc))
+    with caplog.at_level("DEBUG", logger="hermes_linear.renderer"):
+        assert await w.post("s1", r.response(snippet)) is False
+        assert await w.update_plan("s1", [{"content": snippet, "status": "pending"}]) is False
+    for text in (w.last_error, caplog.text):
+        assert secret not in text
+        assert "payroll" not in text
+        assert "invalid" not in text
+    assert w.last_error.startswith(type(exc).__name__)
+    assert w.last_error in caplog.text
+    if isinstance(exc, LinearError):
+        assert "INVALID_INPUT" in w.last_error and "400" in w.last_error
+    else:
+        assert w.last_error == type(exc).__name__
