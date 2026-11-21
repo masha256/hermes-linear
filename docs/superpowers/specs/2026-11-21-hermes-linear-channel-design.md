@@ -289,6 +289,8 @@ Each item has a defined fallback, so none blocks the plan.
 5. Link-attachment and project status-post payload shapes (not yet observed). **Fallback:** generic item rendering from the entity's title/body fields.
 6. Client credentials on an app that has **never** been installed in the workspace (the probe app had been installed earlier via the browser flow). **Fallback:** the setup wizard prints a one-time install URL (`/oauth/authorize?actor=app&scope=…`) for an admin to approve; the plugin still uses client-credentials tokens afterwards.
 7. Whether Linear requires a callback URL on an app that only uses client credentials. **Handled:** README tells users to enter any HTTPS URL if asked.
+8. Gateway access gate vs email allowlist entries (§7.3). **Resolved by T1 (fallback):** a non-empty `LINEAR_ALLOWED_USERS` bypasses the own-policy path, so the adapter also exposes `resolved_allowlist_user_ids()` (settings + email-resolved UUIDs) and builds every source with `chat_type="dm"`; see `docs/hermes-integration-notes.md` Q4.
+9. Busy-session queueing (§6.3). **Resolved by T1 (fallback):** the gateway default is interrupt and the shared runtime bypasses busy handlers, so the adapter keeps its own per-session FIFO released on `on_processing_complete` instead of installing a busy-session handler; see notes Q5.
 
 ## 13. Milestone 1 and exit test
 
