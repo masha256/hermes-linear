@@ -27,7 +27,7 @@ _RATELIMIT_CODE = "RATELIMITED"
 
 # -- GraphQL documents (verified against the Linear SDL) ---------------
 
-QUERY_VIEWER = """query Viewer { viewer { id name } }"""
+QUERY_VIEWER = """query Viewer { viewer { id name displayName } }"""
 
 QUERY_USER = """query User($id: String!) { user(id: $id) { email name } }"""
 
@@ -236,11 +236,17 @@ class LinearClient:
 
     # -- API ------------------------------------------------------------
 
+    async def viewer(self) -> dict:
+        """The app user: ``{"id", "name", "displayName"}`` (displayName is the @handle)."""
+        data = await self.gql(QUERY_VIEWER)
+        v = data["viewer"]
+        self._viewer_id = str(v["id"])
+        return {"id": self._viewer_id, "name": v.get("name"), "displayName": v.get("displayName")}
+
     async def viewer_id(self) -> str:
         if self._viewer_id is None:
-            data = await self.gql(QUERY_VIEWER)
-            self._viewer_id = str(data["viewer"]["id"])
-        return self._viewer_id
+            await self.viewer()
+        return self._viewer_id  # type: ignore[return-value]
 
     async def user(self, user_id: str) -> tuple[str, str]:
         data = await self.gql(QUERY_USER, {"id": user_id})

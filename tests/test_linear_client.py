@@ -356,3 +356,13 @@ async def test_close_closes_own_session(fake):
     own = c._session
     await c.close()
     assert own.closed
+
+
+async def test_viewer_returns_handle_and_caches_id(fake, client):
+    fake.on("Viewer", {"data": {"viewer": {"id": APP_USER, "name": "Hermes",
+                                           "displayName": "hermes"}}})
+    v = await client.viewer()
+    assert v == {"id": APP_USER, "name": "Hermes", "displayName": "hermes"}
+    assert "displayName" in fake.gql_calls("Viewer")[0].json["query"]
+    assert await client.viewer_id() == APP_USER
+    assert len(fake.gql_calls("Viewer")) == 1

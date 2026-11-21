@@ -83,7 +83,8 @@ CREATE TABLE IF NOT EXISTS pending_controls (
     agent_session_id     TEXT NOT NULL,
     execution_generation INTEGER NOT NULL,
     choices              TEXT NOT NULL,
-    created_at           REAL NOT NULL
+    created_at           REAL NOT NULL,
+    session_key          TEXT
 );
 CREATE INDEX IF NOT EXISTS controls_session ON pending_controls(agent_session_id, created_at);
 
@@ -155,6 +156,7 @@ class ControlRow:
     execution_generation: int
     choices: tuple[Any, ...]
     created_at: float
+    session_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,9 @@ class Store:
         self._lock = threading.RLock()
         with self._lock:
             conn.executescript(_SCHEMA)
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_controls)")}
+            if "session_key" not in cols:  # pre-session_key databases
+                conn.execute("ALTER TABLE pending_controls ADD COLUMN session_key TEXT")
             if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
@@ -534,13 +539,19 @@ class Store:
         agent_session_id: str,
         execution_generation: int,
         choices: Sequence[Any],
+        *,
+        session_key: str | None = None,
     ) -> None:
+        """``session_key`` is the Hermes gateway session key the request belongs to
+        (needed to resolve an approval card, integration notes Q8)."""
+
         def go() -> None:
             self.conn.execute(
                 "INSERT OR REPLACE INTO pending_controls (request_id, kind, agent_session_id, "
-                "execution_generation, choices, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                "execution_generation, choices, created_at, session_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (request_id, kind, agent_session_id, execution_generation,
-                 json.dumps(list(choices)), time.time()),
+                 json.dumps(list(choices)), time.time(), session_key),
             )
 
         self._write(go)

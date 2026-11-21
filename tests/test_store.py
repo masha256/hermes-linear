@@ -267,3 +267,26 @@ def test_sessions_for_issue(store):
     store.record_session("s3", "I2", "c3", "mention")
     assert [s.agent_session_id for s in store.sessions_for_issue("I1")] == ["s1", "s2"]
     assert store.sessions_for_issue("none") == []
+
+
+def test_control_session_key_roundtrip(store):
+    store.put_control("R9", "approval", "S9", 1, ["once", "deny"], session_key="agent:main:linear:dm:i:1")
+    assert store.control_for_session("S9").session_key == "agent:main:linear:dm:i:1"
+    store.put_control("R8", "clarify", "S8", 1, [])
+    assert store.control_for_session("S8").session_key is None
+
+
+def test_control_session_key_migrates_old_db(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE pending_controls (request_id TEXT PRIMARY KEY, kind TEXT NOT NULL, "
+        "agent_session_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, "
+        "choices TEXT NOT NULL, created_at REAL NOT NULL)")
+    conn.commit()
+    conn.close()
+    s = Store.open(path)
+    s.put_control("R1", "approval", "S1", 1, [], session_key="sk")
+    assert s.control_for_session("S1").session_key == "sk"
+    s.close()
