@@ -269,10 +269,48 @@ def _snippet(text: Any) -> str | None:
     return str(text)[:DESCRIPTION_SNIPPET]
 
 
-async def _context_allowed(event: dict, ctx: RouterContext, actor_id: str | None) -> bool:
-    """Spec §7.3: bots/integrations are exempt; humans must be allowlisted."""
-    if _is_bot_actor(event):
+# Explicit bot/automation actor types (compared case-insensitively). SDL:
+# ``union EntityActorWebhookPayload = ExternalUserActorWebhookPayload |
+# IntegrationActorWebhookPayload | OauthClientActorWebhookPayload |
+# UserActorWebhookPayload``; ``ActorBot.type`` is documented as "Source
+# category, such as integration, oauthClient, workflow, or ai". External users
+# and unknown types are NOT bots: they are humans that must pass the allowlist.
+_BOT_ACTOR_TYPES = frozenset({"integration", "oauthclient", "oauth_client", "workflow", "ai"})
+
+
+def _explicit_bot(event: dict) -> bool:
+    """True only on an explicit bot signal: ``botActor`` set or a bot actor type."""
+    data = _d(event.get("data"))
+    if event.get("botActor") or data.get("botActor"):
         return True
+    actor_type = _d(event.get("actor")).get("type")
+    return isinstance(actor_type, str) and actor_type.lower() in _BOT_ACTOR_TYPES
+
+
+def _human_actor_id(event: dict) -> str | None:
+    """The id a human actor must pass the allowlist with (fail-closed).
+
+    ``user`` actor -> its id; an external/unknown actor type -> its id (it is
+    not on the allowlist, so it is dropped); a bot actor -> None. With no actor
+    at all (the SDL allows a null actor), a Comment falls back to its author
+    ``data.userId`` / ``data.user.id``; anything else -> None.
+    """
+    actor = _d(event.get("actor"))
+    if actor:
+        if _explicit_bot(event):
+            return None
+        return actor.get("id") or None
+    if event.get("type") == "Comment":
+        data = _d(event.get("data"))
+        return data.get("userId") or _d(data.get("user")).get("id") or None
+    return None
+
+
+async def _context_allowed(event: dict, ctx: RouterContext) -> bool:
+    """Spec §7.3: explicit bots are exempt; everyone else must be allowlisted."""
+    if _explicit_bot(event):
+        return True
+    actor_id = _human_actor_id(event)
     return bool(actor_id) and await ctx.allowed(actor_id)
 
 
@@ -298,6 +336,16 @@ def _is_noise(key: str) -> bool:
         or key.endswith("At")  # timestamps: the state / archive change carries the meaning
         or key.endswith("History")
     )
+
+
+# Id-valued keys the change collectors turn into names themselves.
+_HANDLED_ID_FIELDS = frozenset({"stateId", "labelIds", "delegateId", "projectId", "statusId",
+                                "assigneeId"})
+
+
+def _is_raw_id(key: str) -> bool:
+    """Raw-id keys (``cycleId``, ``lastUpdateId``, ...) carry no readable change."""
+    return key not in _HANDLED_ID_FIELDS and (key.endswith("Id") or key.endswith("Ids"))
 
 
 _PRIORITY = {0: "No priority", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
@@ -335,6 +383,10 @@ async def _issue(event: dict, ctx: RouterContext) -> list[Decision]:
     updated_from = _d(event.get("updatedFrom"))
     if "projectId" in data and data["projectId"] is None and "projectId" in updated_from:
         store.clear_project(issue_id)  # moved out of its project
+    # Echo filter only after the caches above: an edit by the app itself must
+    # still refresh state/project/labels (spec §7.2).
+    if _is_echo(event, ctx.app_user_id):
+        return [Ignore("echo")]
 
     if event.get("action") != "update":
         # create (even one already delegated to us, R20) / remove: caches only.
@@ -348,7 +400,7 @@ async def _issue(event: dict, ctx: RouterContext) -> list[Decision]:
         )
     if ticket.mode != "delegated":
         return [Ignore("not delegated")] if _issue_changes(store, event) else []
-    if not await _context_allowed(event, ctx, _d(event.get("actor")).get("id")):
+    if not await _context_allowed(event, ctx):
         return [Ignore("denied actor")]
     items = [
         ContextItem(issue_id=issue_id, kind="issue", field=f, old=o, new=n,
@@ -364,7 +416,7 @@ def _issue_changes(store: Store, event: dict) -> list[tuple[str, str | None, str
     updated_from = _d(event.get("updatedFrom"))
     out: list[tuple[str, str | None, str | None]] = []
     for key, old in updated_from.items():
-        if key == "delegateId" or _is_noise(key):
+        if key == "delegateId" or _is_noise(key) or _is_raw_id(key):
             continue
         if key == "labelIds":
             diff = _label_diff(store, old or [], data)
@@ -405,14 +457,6 @@ def _label_diff(store: Store, old_ids: list, data: dict) -> str:
     return ", ".join(parts)
 
 
-def _is_bot_actor(event: dict) -> bool:
-    """Bot/automation actor: a present ``botActor`` or a non-``user`` actor type."""
-    data = _d(event.get("data"))
-    if event.get("botActor") or data.get("botActor"):
-        return True
-    return _d(event.get("actor")).get("type") != "user"
-
-
 async def _delegate_change(
     ctx: RouterContext,
     event: dict,
@@ -433,8 +477,10 @@ async def _delegate_change(
         # delegating via a Linear triage rule therefore does not start the agent
         # here; Linear's own `created` event for such a delegation still goes
         # through the created path's access check on `creatorId`.
-        actor_id = _d(event.get("actor")).get("id")
-        if not actor_id or _is_bot_actor(event) or not await ctx.allowed(actor_id):
+        # Strict (fail-closed): only an explicit ``user`` actor qualifies.
+        actor = _d(event.get("actor"))
+        actor_id = actor.get("id") if actor.get("type") == "user" else None
+        if not actor_id or _explicit_bot(event) or not await ctx.allowed(actor_id):
             return [Ignore("denied delegator")]
         gen = _delegation_generation(ticket, state_type or ticket.state_type)
         return [SetMode(issue_id, "delegated", gen), AwaitDelegation(issue_id, DELEGATION_WAIT_S)]
@@ -487,8 +533,8 @@ async def _comment(event: dict, ctx: RouterContext) -> list[Decision]:
         return [Ignore("session thread")]
 
     user = _d(data.get("user"))
-    actor_id = data.get("userId") or user.get("id") or _d(event.get("actor")).get("id")
-    bot = _is_bot_actor(event)
+    bot = _explicit_bot(event)
+    actor_id = _human_actor_id(event)
     if not bot and not (actor_id and await ctx.allowed(actor_id)):
         return [Ignore("denied actor")]
     if not parent_id and not bot:  # §6.2 (5): top-level human comment
@@ -516,8 +562,7 @@ async def _attachment(event: dict, ctx: RouterContext) -> list[Decision]:
     ticket = ctx.store.ticket(issue_id) if issue_id else None
     if ticket is None or ticket.mode != "delegated":
         return [Ignore("not delegated")]
-    actor_id = _d(event.get("actor")).get("id") or data.get("creatorId")
-    if not await _context_allowed(event, ctx, actor_id):
+    if not await _context_allowed(event, ctx):
         return [Ignore("denied actor")]
     link = " ".join(x for x in (data.get("title"), data.get("url")) if x)
     return [AddContext((ContextItem(
@@ -531,10 +576,13 @@ async def _attachment(event: dict, ctx: RouterContext) -> list[Decision]:
 
 def _project_changes(event: dict) -> list[tuple[str, str | None, str | None]]:
     data = _d(event.get("data"))
+    updated_from = _d(event.get("updatedFrom"))
     out: list[tuple[str, str | None, str | None]] = []
-    for key, old in _d(event.get("updatedFrom")).items():
-        if _is_noise(key) or key in ("labelIds", "teamIds", "memberIds"):
+    for key, old in updated_from.items():
+        if _is_noise(key) or _is_raw_id(key) or key in ("labelIds", "teamIds", "memberIds"):
             continue
+        if key == "health" and "lastUpdateId" in updated_from:
+            continue  # a status post: its ProjectUpdate event carries it
         if key == "statusId":
             out.append(("status", None, _d(data.get("status")).get("name")))
         elif key in ("description", "content"):
@@ -548,14 +596,14 @@ def _project_changes(event: dict) -> list[tuple[str, str | None, str | None]]:
 
 async def _fan_out(
     event: dict, ctx: RouterContext, project_id: str | None, project_name: str | None,
-    changes: list[tuple[str, str | None, str | None]], actor_id: str | None,
+    changes: list[tuple[str, str | None, str | None]],
 ) -> list[Decision]:
     issues = ctx.store.delegated_in_project(project_id) if project_id else []
     if not issues:
         return [Ignore("no delegated tickets in project")]
     if not changes:
         return [Ignore("no meaningful project change")]
-    if not await _context_allowed(event, ctx, actor_id):
+    if not await _context_allowed(event, ctx):
         return [Ignore("denied actor")]
     actor, at = _actor_name(event), _at(event)
     return [AddContext(tuple(
@@ -570,7 +618,7 @@ async def _project(event: dict, ctx: RouterContext) -> list[Decision]:
         return [Ignore(f"project {event.get('action')}")]
     data = _d(event.get("data"))
     return await _fan_out(event, ctx, data.get("id"), data.get("name"),
-                          _project_changes(event), _d(event.get("actor")).get("id"))
+                          _project_changes(event))
 
 
 async def _project_update(event: dict, ctx: RouterContext) -> list[Decision]:
@@ -579,10 +627,9 @@ async def _project_update(event: dict, ctx: RouterContext) -> list[Decision]:
         return [Ignore(f"project update {event.get('action')}")]
     data = _d(event.get("data"))
     project = _d(data.get("project"))
-    actor_id = _d(event.get("actor")).get("id") or data.get("userId")
     return await _fan_out(event, ctx, project.get("id") or data.get("projectId"),
                           project.get("name"),
-                          [("status post", None, _snippet(data.get("body") or ""))], actor_id)
+                          [("status post", None, _snippet(data.get("body") or ""))])
 
 
 # ------------------------------------------------------------- app-level
@@ -614,7 +661,7 @@ def _echo_filtered(handler: _Handler) -> _Handler:
 
 _HANDLERS: dict[str, _Handler] = {
     "AgentSessionEvent": _agent_session_event,
-    "Issue": _echo_filtered(_issue),
+    "Issue": _issue,  # echo-filtered inside, after the cache refresh
     "Comment": _echo_filtered(_comment),
     "Attachment": _echo_filtered(_attachment),
     "Project": _echo_filtered(_project),

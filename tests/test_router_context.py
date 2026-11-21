@@ -331,6 +331,102 @@ async def test_project_status_post_fans_out(ctx, store):
     assert all(len(i.new) <= DESCRIPTION_SNIPPET for i in items)
 
 
+# -------------------------------------------------- review fixes (round 1)
+
+
+def _no_actor_toplevel():
+    ev = copy.deepcopy(TOPLEVEL)
+    ev.pop("actor", None)
+    return ev
+
+
+async def test_null_actor_comment_is_human_and_checked(store):
+    _delegate(store, C_ISSUE)
+    seen = []
+
+    async def allow(uid):
+        seen.append(uid)
+        return True
+
+    ctx = RouterContext(store=store, app_user_id=APP, allowed=allow, app_user_handle=HANDLE)
+    out = await route(_no_actor_toplevel(), ctx)
+    assert len(out) == 1 and isinstance(out[0], OpenSessionOnComment)
+    assert out[0].user_id == HUMAN and seen == [HUMAN]
+    ctx = RouterContext(store=store, app_user_id=APP, allowed=_no, app_user_handle=HANDLE)
+    assert await route(_no_actor_toplevel(), ctx) == [Ignore("denied actor")]
+    assert store.pending_context(C_ISSUE) == []
+
+
+async def test_external_user_context_dropped_when_not_allowed(store):
+    async def only_human(uid):
+        return uid == HUMAN
+
+    ctx = RouterContext(store=store, app_user_id=APP, allowed=only_human, app_user_handle=HANDLE)
+    _delegate(store, C_ISSUE)
+    ev = copy.deepcopy(LABELS)
+    ev["actor"] = {"id": "ext-1", "name": "Slack person", "type": "externalUser"}
+    assert await route(ev, ctx) == [Ignore("denied actor")]
+    ev = copy.deepcopy(TOPLEVEL)
+    ev["actor"] = {"id": "ext-1", "name": "Slack person", "type": "externalUser"}
+    ev["data"]["userId"] = None
+    ev["data"].pop("user", None)
+    assert await route(ev, ctx) == [Ignore("denied actor")]
+
+
+async def test_explicit_bot_context_exempt(store):
+    ctx = RouterContext(store=store, app_user_id=APP, allowed=_no, app_user_handle=HANDLE)
+    _delegate(store, C_ISSUE)
+    for actor_type in ("integration", "oauthClient"):
+        ev = copy.deepcopy(LABELS)
+        ev["actor"] = {"id": "bot-1", "name": "GitHub", "type": actor_type}
+        (item,) = _items(await route(ev, ctx))
+        assert item.field == "labels"
+        # a top-level comment by an explicit bot is context, never a session
+        ev = copy.deepcopy(TOPLEVEL)
+        ev["actor"] = {"id": "bot-1", "name": "GitHub", "type": actor_type}
+        out = await route(ev, ctx)
+        assert not any(isinstance(d, OpenSessionOnComment) for d in out)
+        (item,) = _items(out)
+        assert item.kind == "comment"
+    # botActor alone (actor absent) is an explicit bot signal too
+    ev = copy.deepcopy(LABELS)
+    ev.pop("actor")
+    ev["botActor"] = {"id": "b", "name": "Automation", "type": "workflow"}
+    assert isinstance((await route(ev, ctx))[0], AddContext)
+
+
+async def test_echo_issue_update_still_refreshes_cache(ctx, store):
+    _delegate(store, S_ISSUE)
+    ev = copy.deepcopy(STATE)
+    ev["actor"]["id"] = APP
+    ev["data"]["state"] = {"id": "st-done", "name": "Done", "type": "completed"}
+    ev["data"]["projectId"] = PROJECT_ID
+    assert await route(ev, ctx) == [Ignore("echo")]
+    t = store.ticket(S_ISSUE)
+    assert t.state_type == "completed" and t.project_id == PROJECT_ID
+    assert store.state_name("st-done") == "Done"
+    assert store.pending_context(S_ISSUE) == []
+
+
+async def test_raw_id_fields_not_forwarded(ctx, store):
+    _delegate(store, S_ISSUE, PROJECT_ID)
+    ev = copy.deepcopy(STATE)
+    ev["updatedFrom"] = {"updatedAt": "t", "cycleId": "c-old", "teamId": "t-old",
+                         "parentId": None, "lastUpdateId": "u-old"}
+    ev["data"].update({"cycleId": "c-new", "teamId": "t-new", "parentId": "p-1"})
+    assert await route(ev, ctx) == []
+    # a status post also emits a Project update (lastUpdateId + health): not context
+    ev = _human_project_event()
+    ev["updatedFrom"] = {"updatedAt": "t", "lastUpdateId": "u-old", "health": "atRisk"}
+    ev["data"].update({"lastUpdateId": "u-new", "health": "onTrack"})
+    out = await route(ev, ctx)
+    assert out == [Ignore("no meaningful project change")]
+    # health on its own is still a real change
+    ev["updatedFrom"] = {"updatedAt": "t", "health": "atRisk"}
+    (item,) = _items(await route(ev, ctx))
+    assert (item.field, item.old, item.new) == ("health", "atRisk", "onTrack")
+
+
 # ------------------------------------------------------------ misc types
 
 
