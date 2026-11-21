@@ -116,6 +116,58 @@ def test_consume_context(store):
     assert [p.new for p in store.pending_context("I1")] == ["c"]
 
 
+def test_pending_context_batch_empty(store):
+    assert store.pending_context_batch("I1") == ([], None)
+
+
+def test_pending_context_batch_matches_pending(store):
+    store.add_context([_item(new="x"), _item(field="title", new="y"), _item(issue="I2")])
+    items, watermark = store.pending_context_batch("I1")
+    assert items == store.pending_context("I1")
+    assert watermark is not None
+
+
+def test_consume_up_to_watermark_keeps_later_items(store):
+    store.add_context([_item(new="x"), _item(field="title", new="y")])
+    rendered, watermark = store.pending_context_batch("I1")
+    assert [p.new for p in rendered] == ["x", "y"]
+    store.add_context([_item(field="labels", new="late")])  # arrives before admission
+    store.consume_context("I1", "turn-1", up_to_id=watermark)
+    assert [p.new for p in store.pending_context("I1")] == ["late"]
+
+
+def test_consume_without_watermark_consumes_all(store):
+    store.add_context([_item(new="x")])
+    _, watermark = store.pending_context_batch("I1")
+    store.add_context([_item(field="title", new="late")])
+    store.consume_context("I1", "turn-1")
+    assert store.pending_context("I1") == []
+    assert watermark is not None
+
+
+def test_merge_across_watermark_keeps_merged_row_pending(store):
+    # Rendered batch: one "state" change plus filler of distinct fields.
+    filler = [_item(field=f"f{i}", new=f"v{i}") for i in range(MAX_PENDING_ITEMS - 1)]
+    store.add_context([_item(old="o0", new="n0"), *filler])
+    rendered, watermark = store.pending_context_batch("I1")
+    assert len(rendered) == MAX_PENDING_ITEMS
+    # A later, unrendered "state" change pushes over the cap -> merge of the
+    # "state" group. The merged row keeps the group's MAX id (> watermark).
+    store.add_context([_item(old="n0", new="n1")])
+    store.consume_context("I1", "turn-1", up_to_id=watermark)
+    pending = store.pending_context("I1")
+    assert [(p.field, p.old, p.new) for p in pending] == [("state", "o0", "n1")]
+
+
+def test_merge_entirely_below_watermark_is_consumed(store):
+    filler = [_item(field=f"f{i}", new=f"v{i}") for i in range(MAX_PENDING_ITEMS - 1)]
+    store.add_context([_item(old="o0", new="n0"), *filler, _item(old="n0", new="n1")])
+    rendered, watermark = store.pending_context_batch("I1")
+    assert len(rendered) == MAX_PENDING_ITEMS  # merged already, all rendered
+    store.consume_context("I1", "turn-1", up_to_id=watermark)
+    assert store.pending_context("I1") == []
+
+
 def test_session_root_lookup(store):
     store.record_session("S1", "I1", "C1", "delegation")
     store.record_session("S2", "I1", None, "plugin", plugin_created=True)

@@ -414,6 +414,8 @@ class Store:
             return
         # 1) Collapse duplicate (kind, field, project) groups, oldest group first,
         #    into one row: earliest ``old``, latest ``new``/actor/at, latest position.
+        #    Keeping the group's MAX id is load-bearing for consume watermarks:
+        #    see ``pending_context_batch``.
         groups = self._all(
             "SELECT kind, field, project, MIN(id) AS first_id, MAX(id) AS last_id, "
             "COUNT(*) AS n FROM pending_context "
@@ -454,13 +456,58 @@ class Store:
             )
         return [ContextItem(**dict(r)) for r in rows]
 
-    def consume_context(self, issue_id: str, turn_id: str) -> None:
-        def go() -> None:
-            self.conn.execute(
-                "UPDATE pending_context SET consumed_by = ? "
-                "WHERE issue_id = ? AND consumed_by IS NULL",
-                (turn_id, issue_id),
+    def pending_context_batch(self, issue_id: str) -> tuple[list[ContextItem], int | None]:
+        """Unconsumed items (same order as ``pending_context``) plus a watermark.
+
+        The watermark is the max row id included (None when empty). Pass it to
+        ``consume_context(..., up_to_id=watermark)`` once the gateway admits the
+        turn (spec §7.5) so items that arrived after rendering stay pending.
+
+        Interaction with the cap merge (``_enforce_cap``): a merged group always
+        keeps its MAX id, so newer unrendered content never lands in a row with
+        id <= watermark. If a group straddles the watermark, the merged row has
+        id > watermark and stays pending (re-shown next turn as one consolidated
+        earliest-old -> latest-new line); if the whole group is <= watermark it
+        is consumed. Drop-oldest deletes the lowest ids, i.e. rendered rows first.
+        """
+        with self._lock:
+            rows = self._all(
+                "SELECT id, issue_id, kind, field, old, new, actor, at, project "
+                "FROM pending_context WHERE issue_id = ? AND consumed_by IS NULL ORDER BY id",
+                (issue_id,),
             )
+        items: list[ContextItem] = []
+        watermark: int | None = None
+        for r in rows:
+            d = dict(r)
+            watermark = d.pop("id")
+            items.append(ContextItem(**d))
+        return items, watermark
+
+    def consume_context(
+        self, issue_id: str, turn_id: str, up_to_id: int | None = None
+    ) -> None:
+        """Mark unconsumed rows consumed by ``turn_id``.
+
+        With ``up_to_id`` only rows with id <= ``up_to_id`` are marked (the
+        watermark from ``pending_context_batch``). ``None`` marks all unconsumed
+        rows (legacy behaviour) — callers holding an empty batch (watermark
+        None) should skip consumption rather than pass None.
+        """
+
+        def go() -> None:
+            if up_to_id is None:
+                self.conn.execute(
+                    "UPDATE pending_context SET consumed_by = ? "
+                    "WHERE issue_id = ? AND consumed_by IS NULL",
+                    (turn_id, issue_id),
+                )
+            else:
+                self.conn.execute(
+                    "UPDATE pending_context SET consumed_by = ? "
+                    "WHERE issue_id = ? AND consumed_by IS NULL AND id <= ?",
+                    (turn_id, issue_id, up_to_id),
+                )
 
         self._write(go)
 
