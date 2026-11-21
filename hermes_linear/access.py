@@ -22,6 +22,22 @@ REFUSAL_TEXT = (
 _STAR = "*"
 
 
+def gateway_allow_from(entries: frozenset[str], open_: bool) -> set[str]:
+    """Initial gateway allowlist (Q4): UUID entries (as given and lowercased), ``*`` if open.
+
+    Email entries are not UUIDs; they join one by one as the router admits users.
+    """
+    allow: set[str] = set()
+    for entry in entries:
+        if entry == _STAR:
+            allow.add(_STAR)
+        elif "@" not in entry:
+            allow.update({entry, entry.lower()})
+    if open_:
+        allow.add(_STAR)
+    return allow
+
+
 class AccessPolicy:
     """Decide whether a Linear user may talk to the agent. Default deny."""
 

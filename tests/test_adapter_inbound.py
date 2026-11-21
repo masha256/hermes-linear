@@ -34,8 +34,8 @@ from gateway.session import build_session_key  # noqa: E402  (test-only, not pub
 platform_registry.register(PlatformEntry(
     name="linear", label="Linear", adapter_factory=lambda c: None, check_fn=lambda: True))
 
-from hermes_linear import adapter as adapter_mod  # noqa: E402
 from hermes_linear import listener as listener_mod  # noqa: E402
+from hermes_linear import sessions_open as sessions_open_mod  # noqa: E402
 from hermes_linear.access import REFUSAL_TEXT  # noqa: E402
 from hermes_linear.adapter import ADAPTERS, QUEUED_ACK, LinearAdapter  # noqa: E402
 from hermes_linear.models import AwaitDelegation, ContextItem  # noqa: E402
@@ -390,7 +390,7 @@ async def test_fifo_queues_second_turn_until_complete(env):
     assert len(gw.events) == 1
     key = (f"{D_ISSUE}:1", None)
     assert a.last_outcome[key] is ProcessingOutcome.FAILURE
-    assert key not in a._inflight
+    assert key not in a.turns.inflight
     await a.wait_idle()
     assert len(gw.events) == 2
     assert gw.events[1].message_id == second_mid
@@ -455,9 +455,9 @@ async def test_delegation_wait_opens_session_once(env):
     a, client, gw, store, order = env
     issue = ISSUE_DELEGATED["data"]["id"]
     await deliver(a, issue_delegated_event(), issue_delegated_event())
-    timer = a._delegation_timers[issue]
+    timer = a.opener.delegation_timers[issue]
     await a._execute(AwaitDelegation(issue, 0.05), {})
-    assert a._delegation_timers[issue] is timer  # no second timer while pending
+    assert a.opener.delegation_timers[issue] is timer  # no second timer while pending
     await asyncio.sleep(0.2)
     await a.wait_idle()
     opened = [c for c in client.calls if c[0] == "create_session_on_issue"]
@@ -615,8 +615,8 @@ async def test_ack_failure_does_not_block_turn_or_degrade(env):
 async def test_approval_answer_resolves_card(env, monkeypatch):
     a, client, gw, store, order = env
     resolved = []
-    monkeypatch.setattr(adapter_mod, "_approval_refusal", lambda *a, **k: None)
-    monkeypatch.setattr(adapter_mod, "_resolve_approval_card",
+    monkeypatch.setattr(sessions_open_mod, "_approval_refusal", lambda *a, **k: None)
+    monkeypatch.setattr(sessions_open_mod, "_resolve_approval_card",
                         lambda sk, choice, rid, *, actor_id: resolved.append(
                             (sk, choice, rid, actor_id)) or 1)
     await deliver(a, DELEGATION)
@@ -630,7 +630,7 @@ async def test_approval_answer_resolves_card(env, monkeypatch):
 
 async def test_approval_unrecognised_answer_reasks(env, monkeypatch):
     a, client, gw, store, order = env
-    monkeypatch.setattr(adapter_mod, "_resolve_approval_card",
+    monkeypatch.setattr(sessions_open_mod, "_resolve_approval_card",
                         lambda *a, **k: pytest.fail("must not resolve"))
     store.put_control("req-1", "approval", D_SID, 1, ["once", "session", "deny"],
                       session_key="sk")
@@ -644,9 +644,9 @@ async def test_approval_unrecognised_answer_reasks(env, monkeypatch):
 
 async def test_approval_refused_actor_keeps_control(env, monkeypatch):
     a, client, gw, store, order = env
-    monkeypatch.setattr(adapter_mod, "_approval_refusal", lambda *a, **k: "Alice")
-    monkeypatch.setattr(adapter_mod, "_refusal_text", lambda who: f"only {who}")
-    monkeypatch.setattr(adapter_mod, "_resolve_approval_card",
+    monkeypatch.setattr(sessions_open_mod, "_approval_refusal", lambda *a, **k: "Alice")
+    monkeypatch.setattr(sessions_open_mod, "_refusal_text", lambda who: f"only {who}")
+    monkeypatch.setattr(sessions_open_mod, "_resolve_approval_card",
                         lambda *a, **k: pytest.fail("must not resolve"))
     store.put_control("req-1", "approval", D_SID, 1, ["once", "deny"], session_key="sk")
     await deliver(a, prompted(D_SID, D_ISSUE, "deny", "act-a"))
@@ -657,7 +657,7 @@ async def test_approval_refused_actor_keeps_control(env, monkeypatch):
 async def test_clarify_answer_resolves(env, monkeypatch):
     a, client, gw, store, order = env
     got = []
-    monkeypatch.setattr(adapter_mod, "_resolve_clarify",
+    monkeypatch.setattr(sessions_open_mod, "_resolve_clarify",
                         lambda rid, answer: got.append((rid, answer)) or True)
     store.put_control("clar-1", "clarify", D_SID, 1, [], session_key="sk")
     await deliver(a, prompted(D_SID, D_ISSUE, "the blue one", "act-c"))
@@ -808,7 +808,7 @@ async def test_dispatch_error_frees_fifo(env, monkeypatch):
 
     monkeypatch.setattr(a, "build_source", flaky)
     await deliver(a, DELEGATION)
-    assert gw.events == [] and a._inflight == {}
+    assert gw.events == [] and a.turns.inflight == {}
     await deliver(a, prompted(D_SID, D_ISSUE, "again", "act-2"))
     assert len(gw.events) == 1
 
@@ -868,7 +868,7 @@ async def test_fifo_release_after_real_base_session_guard():
         assert completed == [(first, ProcessingOutcome.SUCCESS),
                              (second, ProcessingOutcome.SUCCESS)]
         await a.wait_idle()
-        assert a._inflight == {} and a._queues == {}
+        assert a.turns.inflight == {} and a.turns.queues == {}
     finally:
         await a.disconnect()
 
@@ -878,10 +878,10 @@ async def test_stop_before_handoff_cancels_dispatch(env):
     client.snapshot_delay = 5.0  # first-turn dispatch parks in the snapshot fetch
     await deliver_nowait(a, DELEGATION)
     await asyncio.sleep(0.05)
-    assert gw.events == [] and a._inflight  # in flight, not handed off yet
+    assert gw.events == [] and a.turns.inflight  # in flight, not handed off yet
     await deliver(a, prompted(D_SID, D_ISSUE, "", "act-stop", signal="stop"))
     assert gw.events == []  # neither the turn nor a /stop reached the gateway
-    assert a._inflight == {}
+    assert a.turns.inflight == {}
     responses = [(sid, c["body"]) for sid, c, *_ in client.activities if c["type"] == "response"]
     assert responses == [(D_SID, "Stopped.")]
     client.snapshot_delay = 0.0
@@ -895,7 +895,7 @@ async def test_unadmitted_turn_frees_fifo(env, caplog):
     with caplog.at_level(logging.WARNING):
         await deliver(a, DELEGATION)
     assert len(gw.events) == 1
-    assert a._inflight == {}
+    assert a.turns.inflight == {}
     assert "not admitted" in caplog.text
     gw.admit = True
     await deliver(a, prompted(D_SID, D_ISSUE, "again", "act-2"))
@@ -937,7 +937,7 @@ async def test_dispatch_exception_before_handoff_frees_fifo(env, monkeypatch):
 
     monkeypatch.setattr(store, "pending_context_batch", flaky)
     await deliver(a, DELEGATION)
-    assert gw.events == [] and a._inflight == {}
+    assert gw.events == [] and a.turns.inflight == {}
     errors = [sid for sid, c, *_ in client.activities if c["type"] == "error"]
     assert errors == [D_SID]
     await deliver(a, prompted(D_SID, D_ISSUE, "again", "act-2"))

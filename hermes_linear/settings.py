@@ -148,9 +148,32 @@ def load_settings(
     )
 
 
+def load_scoped_settings(
+    get_config: Callable[[str, Any], Any], get_secret: Callable[[str], str | None]
+) -> Settings:
+    """``load_settings`` with the allowlist env vars read through ``get_secret`` (Q3)."""
+    env = {k: v for k in (ALLOWED_USERS_ENV, ALLOW_ALL_USERS_ENV) if (v := get_secret(k))}
+    return load_settings(get_config, get_secret, env)
+
+
+GLOBAL_ALLOWLIST_WARNING = (
+    "linear: GATEWAY_ALLOWED_USERS is set but %s is not; the gateway will admit only "
+    "Linear UUIDs listed in GATEWAY_ALLOWED_USERS (email/settings entries are denied). "
+    "Set %s to enable the Linear allowlist." % (ALLOWED_USERS_ENV, ALLOWED_USERS_ENV)
+)
+
+
+def only_global_allowlist(get_secret: Callable[[str], str | None]) -> bool:
+    """True when ``GATEWAY_ALLOWED_USERS`` is set but the Linear allowlist env is not (Q4)."""
+    return bool(get_secret("GATEWAY_ALLOWED_USERS")) and not get_secret(ALLOWED_USERS_ENV)
+
+
 __all__ = [
+    "GLOBAL_ALLOWLIST_WARNING",
     "Settings",
     "SettingsError",
+    "load_scoped_settings",
     "load_settings",
+    "only_global_allowlist",
     "parse_allowlist",
 ]
