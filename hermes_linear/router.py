@@ -13,9 +13,11 @@ so they survive a gateway restart (Review Focus 3):
 * @mention on a non-delegated ticket: ``chat_id = <issueId>``,
   ``thread_id = <agentSessionId>``.
 
-``route`` dispatches on payload ``type`` via ``_HANDLERS``. Task 8 adds the
-data-change handlers (Issue-update context, Comment, Project, ...) there and
-in ``_issue``.
+``route`` dispatches on payload ``type`` via ``_HANDLERS``. Data-change
+types (``Issue``, ``Comment``, ``Attachment``, ``Project``, ``ProjectUpdate``)
+pass the echo filter first and feed the context collector (spec §7.2–7.4):
+only tickets in mode ``delegated`` collect context; bots are context-only and
+exempt from the allowlist; denied humans are dropped.
 """
 
 from __future__ import annotations
@@ -26,12 +28,16 @@ from dataclasses import dataclass
 from typing import Any
 
 from .access import REFUSAL_TEXT
-from .constants import DELEGATION_WAIT_S
+from .constants import DELEGATION_WAIT_S, DESCRIPTION_SNIPPET
 from .models import (
+    AddContext,
     AwaitDelegation,
+    ContextItem,
     Decision,
+    Fatal,
     Ignore,
     Interrupt,
+    OpenSessionOnComment,
     Refuse,
     ResolveControl,
     SetMode,
@@ -49,6 +55,9 @@ class RouterContext:
     store: Store
     app_user_id: str
     allowed: Callable[[str | None], Awaitable[bool]]
+    # The app user's Linear handle (``displayName``), for spotting @mentions in
+    # plain comments (R18). Optional for backward compatibility.
+    app_user_handle: str | None = None
 
 
 # ------------------------------------------------------------------ keys
@@ -232,6 +241,74 @@ async def _agent_session_event(event: dict, ctx: RouterContext) -> list[Decision
     return [turn(chat_id, thread_id, body, False)]
 
 
+# ------------------------------------------------------ data-change shared
+
+
+def _is_echo(event: dict, me: str) -> bool:
+    """Spec §7.2: the event's actor / comment author is the app user."""
+    data = _d(event.get("data"))
+    return me in (
+        _d(event.get("actor")).get("id"),
+        data.get("userId"),
+        _d(data.get("user")).get("id"),
+    )
+
+
+def _actor_name(event: dict) -> str:
+    return _d(event.get("actor")).get("name") or "Linear"
+
+
+def _at(event: dict) -> str:
+    data = _d(event.get("data"))
+    return event.get("createdAt") or data.get("updatedAt") or data.get("createdAt") or ""
+
+
+def _snippet(text: Any) -> str | None:
+    if text is None:
+        return None
+    return str(text)[:DESCRIPTION_SNIPPET]
+
+
+async def _context_allowed(event: dict, ctx: RouterContext, actor_id: str | None) -> bool:
+    """Spec §7.3: bots/integrations are exempt; humans must be allowlisted."""
+    if _is_bot_actor(event):
+        return True
+    return bool(actor_id) and await ctx.allowed(actor_id)
+
+
+def _scalar(value: Any) -> str | None:
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    return str(value)
+
+
+# updatedFrom keys that are bookkeeping, not meaningful changes.
+_NOISE_FIELDS = frozenset({
+    "updatedAt", "sortOrder", "subscriberIds", "startedAt", "reactionData",
+    "descriptionData", "prioritySortOrder", "subIssueSortOrder", "previousIdentifiers",
+    "activitySummary", "aiAnalysis", "lastAppliedTemplateId", "contentData",
+    "bodyData", "priorityLabel", "slugId", "documentContentId",
+})
+
+
+def _is_noise(key: str) -> bool:
+    return (
+        key in _NOISE_FIELDS
+        or key.endswith("Order")
+        or key.endswith("At")  # timestamps: the state / archive change carries the meaning
+        or key.endswith("History")
+    )
+
+
+_PRIORITY = {0: "No priority", 1: "Urgent", 2: "High", 3: "Medium", 4: "Low"}
+
+
+def _priority_name(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _PRIORITY.get(value) if isinstance(value, int) else str(value)
+
+
 # ---------------------------------------------------------------- Issue
 
 
@@ -255,18 +332,77 @@ async def _issue(event: dict, ctx: RouterContext) -> list[Decision]:
         project_id=data.get("projectId"),
         state_type=state.get("type"),
     )
+    updated_from = _d(event.get("updatedFrom"))
+    if "projectId" in data and data["projectId"] is None and "projectId" in updated_from:
+        store.clear_project(issue_id)  # moved out of its project
 
     if event.get("action") != "update":
-        return []  # Task 8: Issue create / remove
-    decisions: list[Decision] = []
-    updated_from = _d(event.get("updatedFrom"))
+        # create (even one already delegated to us, R20) / remove: caches only.
+        return []
     if "delegateId" in updated_from:
-        decisions += await _delegate_change(
+        # Delegation transitions are turn/lifecycle triggers (Task 7); the
+        # other fields of the same edit are covered by the delegation snapshot.
+        return await _delegate_change(
             ctx, event, ticket, updated_from.get("delegateId"), data.get("delegateId"),
             state.get("type"),
         )
-    # Task 8: AddContext for the other changed fields goes here.
-    return decisions
+    if ticket.mode != "delegated":
+        return [Ignore("not delegated")] if _issue_changes(store, event) else []
+    if not await _context_allowed(event, ctx, _d(event.get("actor")).get("id")):
+        return [Ignore("denied actor")]
+    items = [
+        ContextItem(issue_id=issue_id, kind="issue", field=f, old=o, new=n,
+                    actor=_actor_name(event), at=_at(event))
+        for f, o, n in _issue_changes(store, event)
+    ]
+    return [AddContext(tuple(items))] if items else []
+
+
+def _issue_changes(store: Store, event: dict) -> list[tuple[str, str | None, str | None]]:
+    """``(field, old, new)`` for each meaningful change of an Issue update."""
+    data = _d(event.get("data"))
+    updated_from = _d(event.get("updatedFrom"))
+    out: list[tuple[str, str | None, str | None]] = []
+    for key, old in updated_from.items():
+        if key == "delegateId" or _is_noise(key):
+            continue
+        if key == "labelIds":
+            diff = _label_diff(store, old or [], data)
+            if diff:
+                out.append(("labels", None, diff))
+        elif key == "stateId":
+            old_name = (store.state_name(old) if old else None) or "(previous)"
+            out.append(("state", old_name, _d(data.get("state")).get("name")))
+        elif key == "description":
+            out.append(("description", None, _snippet(data.get("description"))))
+        elif key == "priority":
+            out.append(("priority", _priority_name(old),
+                        data.get("priorityLabel") or _priority_name(data.get("priority"))))
+        elif key == "assigneeId":
+            new = _d(data.get("assignee")).get("name") if data.get("assigneeId") else None
+            out.append(("assignee", None, new or "(unassigned)"))
+        elif key == "projectId":
+            new = _d(data.get("project")).get("name") if data.get("projectId") else None
+            out.append(("project", None, new or "(none)"))
+        elif not isinstance(old, (dict, list)) and not isinstance(data.get(key), (dict, list)):
+            out.append((key, _scalar(old), _scalar(data.get(key))))
+    return out
+
+
+def _label_diff(store: Store, old_ids: list, data: dict) -> str:
+    names = {
+        _d(lb).get("id"): _d(lb).get("name") for lb in data.get("labels") or []
+    }
+    new_ids = list(data.get("labelIds") or [i for i in names if i])
+    parts = [
+        f"+{names.get(i) or store.label_name(i) or '(label)'}"
+        for i in new_ids if i not in old_ids
+    ]
+    parts += [
+        f"-{store.label_name(i) or '(removed label)'}"
+        for i in old_ids if i not in new_ids
+    ]
+    return ", ".join(parts)
 
 
 def _is_bot_actor(event: dict) -> bool:
@@ -310,10 +446,182 @@ async def _delegate_change(
     return []
 
 
-_HANDLERS: dict[str, Callable[[dict, RouterContext], Awaitable[list[Decision]]]] = {
+# --------------------------------------------------------------- Comment
+
+
+def _mentions_app(body: str, ctx: RouterContext) -> bool:
+    """R18: the comment @mentions the app (Linear also sends a `created` for it)."""
+    if ctx.app_user_id and ctx.app_user_id in body:
+        return True
+    handle = (ctx.app_user_handle or "").strip().lstrip("@")
+    if not handle:
+        return False
+    h = re.escape(handle)
+    if re.search(rf"(?<![\w@.-])@{h}(?![\w-])", body, re.IGNORECASE):
+        return True
+    return re.search(rf"linear\.app/[^\s/]+/profiles/{h}(?![\w-])", body, re.IGNORECASE) is not None
+
+
+async def _comment(event: dict, ctx: RouterContext) -> list[Decision]:
+    if event.get("action") != "create":
+        return [Ignore(f"comment {event.get('action')}")]
+    store = ctx.store
+    data = _d(event.get("data"))
+    issue_id = data.get("issueId") or _d(data.get("issue")).get("id")
+    comment_id = data.get("id")
+    if not issue_id or not comment_id:
+        return [Ignore("comment not on an issue")]
+    body = data.get("body") or ""
+    if _mentions_app(body, ctx):
+        return [Ignore("mention comment")]
+    issue = _d(data.get("issue"))
+    ticket = store.upsert_ticket(
+        issue_id, identifier=issue.get("identifier"),
+        team_id=issue.get("teamId") or _d(issue.get("team")).get("id"),
+    )
+    if ticket.mode != "delegated":
+        return [Ignore("not delegated")]
+    parent_id = data.get("parentId") or _d(data.get("parent")).get("id")
+    if parent_id and store.is_session_root(parent_id):
+        # Review Focus 2: already delivered as the session's `prompted`.
+        return [Ignore("session thread")]
+
+    user = _d(data.get("user"))
+    actor_id = data.get("userId") or user.get("id") or _d(event.get("actor")).get("id")
+    bot = _is_bot_actor(event)
+    if not bot and not (actor_id and await ctx.allowed(actor_id)):
+        return [Ignore("denied actor")]
+    if not parent_id and not bot:  # §6.2 (5): top-level human comment
+        return [OpenSessionOnComment(
+            issue_id=issue_id, comment_id=comment_id, user_id=actor_id,
+            user_name=user.get("name") or _d(event.get("actor")).get("name") or DEFAULT_AUTHOR,
+            body=body,
+        )]
+    bot_name = _d(data.get("botActor")).get("name") if isinstance(data.get("botActor"), dict) else None
+    return [AddContext((ContextItem(
+        issue_id=issue_id, kind="comment", field="reply" if parent_id else "comment",
+        old=None, new=_snippet(body),
+        actor=user.get("name") or bot_name or _actor_name(event), at=_at(event),
+    ),))]
+
+
+# ------------------------------------------------------------ Attachment
+
+
+async def _attachment(event: dict, ctx: RouterContext) -> list[Decision]:
+    if event.get("action") not in ("create", "update"):
+        return [Ignore(f"attachment {event.get('action')}")]
+    data = _d(event.get("data"))
+    issue_id = data.get("issueId")
+    ticket = ctx.store.ticket(issue_id) if issue_id else None
+    if ticket is None or ticket.mode != "delegated":
+        return [Ignore("not delegated")]
+    actor_id = _d(event.get("actor")).get("id") or data.get("creatorId")
+    if not await _context_allowed(event, ctx, actor_id):
+        return [Ignore("denied actor")]
+    link = " ".join(x for x in (data.get("title"), data.get("url")) if x)
+    return [AddContext((ContextItem(
+        issue_id=issue_id, kind="attachment", field="link", old=None, new=link,
+        actor=_actor_name(event), at=_at(event),
+    ),))]
+
+
+# --------------------------------------------------------------- Project
+
+
+def _project_changes(event: dict) -> list[tuple[str, str | None, str | None]]:
+    data = _d(event.get("data"))
+    out: list[tuple[str, str | None, str | None]] = []
+    for key, old in _d(event.get("updatedFrom")).items():
+        if _is_noise(key) or key in ("labelIds", "teamIds", "memberIds"):
+            continue
+        if key == "statusId":
+            out.append(("status", None, _d(data.get("status")).get("name")))
+        elif key in ("description", "content"):
+            out.append((key, None, _snippet(data.get(key))))
+        elif key == "priority":
+            out.append(("priority", _priority_name(old), _priority_name(data.get("priority"))))
+        elif not isinstance(old, (dict, list)) and not isinstance(data.get(key), (dict, list)):
+            out.append((key, _scalar(old), _scalar(data.get(key))))
+    return out
+
+
+async def _fan_out(
+    event: dict, ctx: RouterContext, project_id: str | None, project_name: str | None,
+    changes: list[tuple[str, str | None, str | None]], actor_id: str | None,
+) -> list[Decision]:
+    issues = ctx.store.delegated_in_project(project_id) if project_id else []
+    if not issues:
+        return [Ignore("no delegated tickets in project")]
+    if not changes:
+        return [Ignore("no meaningful project change")]
+    if not await _context_allowed(event, ctx, actor_id):
+        return [Ignore("denied actor")]
+    actor, at = _actor_name(event), _at(event)
+    return [AddContext(tuple(
+        ContextItem(issue_id=i, kind="project", field=f, old=o, new=n,
+                    actor=actor, at=at, project=project_name)
+        for i in issues for f, o, n in changes
+    ))]
+
+
+async def _project(event: dict, ctx: RouterContext) -> list[Decision]:
+    if event.get("action") != "update":
+        return [Ignore(f"project {event.get('action')}")]
+    data = _d(event.get("data"))
+    return await _fan_out(event, ctx, data.get("id"), data.get("name"),
+                          _project_changes(event), _d(event.get("actor")).get("id"))
+
+
+async def _project_update(event: dict, ctx: RouterContext) -> list[Decision]:
+    """A project status post (``ProjectUpdate``)."""
+    if event.get("action") not in ("create", "update"):
+        return [Ignore(f"project update {event.get('action')}")]
+    data = _d(event.get("data"))
+    project = _d(data.get("project"))
+    actor_id = _d(event.get("actor")).get("id") or data.get("userId")
+    return await _fan_out(event, ctx, project.get("id") or data.get("projectId"),
+                          project.get("name"),
+                          [("status post", None, _snippet(data.get("body") or ""))], actor_id)
+
+
+# ------------------------------------------------------------- app-level
+
+
+async def _oauth_app(event: dict, ctx: RouterContext) -> list[Decision]:
+    if event.get("action") == "revoked":
+        return [Fatal("oauth app revoked")]
+    return [Ignore(f"oauth app {event.get('action')}")]
+
+
+async def _log_only(event: dict, ctx: RouterContext) -> list[Decision]:
+    return [Ignore(f"{event.get('type')} ignored")]
+
+
+_Handler = Callable[[dict, RouterContext], Awaitable[list[Decision]]]
+
+
+def _echo_filtered(handler: _Handler) -> _Handler:
+    """Spec §7.2: drop data-change events authored by the app user itself."""
+
+    async def wrapped(event: dict, ctx: RouterContext) -> list[Decision]:
+        if _is_echo(event, ctx.app_user_id):
+            return [Ignore("echo")]
+        return await handler(event, ctx)
+
+    return wrapped
+
+
+_HANDLERS: dict[str, _Handler] = {
     "AgentSessionEvent": _agent_session_event,
-    "Issue": _issue,
-    # Task 8: "Comment", "Project", "ProjectUpdate", ...
+    "Issue": _echo_filtered(_issue),
+    "Comment": _echo_filtered(_comment),
+    "Attachment": _echo_filtered(_attachment),
+    "Project": _echo_filtered(_project),
+    "ProjectUpdate": _echo_filtered(_project_update),
+    "OAuthApp": _oauth_app,
+    "AppUserNotification": _log_only,
+    "PermissionChange": _log_only,
 }
 
 __all__ = ["ACK_TEXT", "RouterContext", "message_id", "route", "ticket_chat_id", "turn_header"]

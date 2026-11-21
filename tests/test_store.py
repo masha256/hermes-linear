@@ -71,6 +71,16 @@ def test_delegated_in_project(store):
     assert store.delegated_in_project("P") == ["I1"]
 
 
+def test_clear_project(store):
+    store.upsert_ticket("I1", project_id="P")
+    store.set_mode("I1", "delegated")
+    store.clear_project("I1")
+    assert store.ticket("I1").project_id is None
+    assert store.delegated_in_project("P") == []
+    store.clear_project("missing")  # no-op
+    assert store.ticket("missing") is None
+
+
 def test_seen_webhook_ttl(store):
     assert store.seen_webhook("w1", 0) is False
     assert store.seen_webhook("w1", 10) is True

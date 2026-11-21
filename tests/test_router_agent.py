@@ -326,7 +326,9 @@ async def test_redelegate_open_keeps_generation(ctx, store):
 async def test_issue_update_without_delegate_change_is_empty(ctx, store):
     ev = copy.deepcopy(ISSUE_DELEGATED)
     ev["updatedFrom"].pop("delegateId")
-    assert await route(ev, ctx) == []
+    # Untouched ticket: the remaining (assignee) edit is not context (Task 8).
+    out = await route(ev, ctx)
+    assert all(isinstance(d, Ignore) for d in out)
 
 
 async def test_issue_update_caches_labels(ctx, store):

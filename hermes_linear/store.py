@@ -281,6 +281,12 @@ class Store:
 
         self._write(go)
 
+    def clear_project(self, issue_id: str) -> None:
+        """Forget the ticket's project (issue moved out of it). No-op if unknown."""
+        self._write(lambda: self.conn.execute(
+            "UPDATE tickets SET project_id = NULL, updated_at = ? WHERE issue_id = ?",
+            (time.time(), issue_id)))
+
     def delegated_in_project(self, project_id: str) -> list[str]:
         with self._lock:
             rows = self._all(
