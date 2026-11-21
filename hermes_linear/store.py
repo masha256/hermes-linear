@@ -329,6 +329,14 @@ class Store:
 
         self._write(go)
 
+    def delete_session(self, agent_session_id: str) -> None:
+        """Remove one session row (e.g. a ``pending:<comment>`` placeholder)."""
+        def go() -> None:
+            self.conn.execute("DELETE FROM sessions WHERE agent_session_id = ?",
+                              (agent_session_id,))
+
+        self._write(go)
+
     @staticmethod
     def _session_row(r: sqlite3.Row | None) -> SessionRow | None:
         if r is None:

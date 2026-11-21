@@ -74,6 +74,9 @@ class FakeClient:
         self.user_emails: dict[str, str] = {}
         self.on_comment_hook = None
         self.closed = False
+        self.activity_delay: dict[str, float] = {}  # agent session id -> seconds
+        self.snapshot_delay = 0.0
+        self.comment_fails = False
 
     async def token(self):
         return "tok"
@@ -92,6 +95,9 @@ class FakeClient:
                               signal_metadata=None):
         if self.fail_activity:
             raise RuntimeError("linear down")
+        delay = self.activity_delay.pop(sid, 0.0)
+        if delay:
+            await asyncio.sleep(delay)
         self.activities.append((sid, content, ephemeral, signal, signal_metadata))
         self.order.append(("activity", content["type"], content.get("body")))
         return f"act-{len(self.activities)}"
@@ -100,6 +106,8 @@ class FakeClient:
         self.calls.append(("create_session_on_comment", comment_id))
         if self.on_comment_hook is not None:
             await self.on_comment_hook()
+        if self.comment_fails:
+            raise RuntimeError("linear down")
         return "sess-comment"
 
     async def create_session_on_issue(self, issue_id):
@@ -112,6 +120,8 @@ class FakeClient:
 
     async def issue_snapshot(self, issue_id):
         self.calls.append(("issue_snapshot", issue_id))
+        if self.snapshot_delay:
+            await asyncio.sleep(self.snapshot_delay)
         if self.snapshot_fails:
             raise RuntimeError("snapshot down")
         return {
@@ -162,12 +172,19 @@ def make_settings(**kw) -> Settings:
 
 
 class Gateway:
-    """Fake gateway: records handed-off events; can be told to raise."""
+    """Fake gateway: records handed-off events; can be told to raise.
+
+    Like the base ``handle_message``, it admits a turn (``on_processing_start``)
+    unless ``admit`` is False (the base dropped the event); ``/stop`` takes the
+    busy bypass path, which fires no processing hooks.
+    """
 
     def __init__(self, order: list):
         self.order = order
         self.events: list = []
         self.raise_next = False
+        self.admit = True
+        self.adapter = None
 
     async def __call__(self, event):
         self.order.append(("handle", event.text))
@@ -175,6 +192,8 @@ class Gateway:
         if self.raise_next:
             self.raise_next = False
             raise RuntimeError("gateway refused")
+        if self.admit and event.text != "/stop" and self.adapter is not None:
+            await self.adapter.on_processing_start(event)
 
 
 def _new_adapter(settings=None, listener=None, order=None):
@@ -186,6 +205,7 @@ def _new_adapter(settings=None, listener=None, order=None):
                       client=client, store=store, listener=listener)
     a._write_runtime_status_safe = lambda *args, **kw: None
     gw = Gateway(order)
+    gw.adapter = a
     a.handle_message = gw
     a.delegation_wait_s = 0.05
     return a, client, gw, store, listener, order
@@ -206,7 +226,8 @@ async def deliver(a, *events):
 
 
 async def complete(a, event, outcome=ProcessingOutcome.SUCCESS):
-    await a.on_processing_complete(event, outcome)
+    # The base runs the hook inside the turn's own background task.
+    await asyncio.create_task(a.on_processing_complete(event, outcome))
     await a.wait_idle()
 
 
@@ -364,7 +385,7 @@ async def test_fifo_queues_second_turn_until_complete(env):
     second_mid = f"{D_SID}:act-2"
     assert len(gw.events) == 1
     assert store.turn(second_mid) is None  # not recorded while queued
-    await a.on_processing_complete(gw.events[0], ProcessingOutcome.FAILURE)
+    await asyncio.create_task(a.on_processing_complete(gw.events[0], ProcessingOutcome.FAILURE))
     # Released via call_soon / a task, never inline.
     assert len(gw.events) == 1
     key = (f"{D_ISSUE}:1", None)
@@ -403,11 +424,12 @@ async def test_stop_synthesizes_control_event(env):
     assert len(client.activities) == n_acts  # no ack for a stop
 
 
-async def test_interrupt_without_running_turn_is_noop(env):
+async def test_interrupt_without_running_turn_acks_stop(env):
     a, client, gw, store, order = env
     await deliver(a, prompted(D_SID, D_ISSUE, "", "act-stop", signal="stop"))
-    assert gw.events == []
-    assert client.activities == []
+    assert gw.events == []  # no /stop to the gateway
+    assert [(sid, c) for sid, c, *_ in client.activities] == [
+        (D_SID, {"type": "response", "body": "Stopped."})]
 
 
 async def test_interrupt_drops_queued_turns(env):
@@ -711,6 +733,7 @@ async def test_connect_real_listener_port0():
                       client=client, store=Store.open(":memory:"))
     a._write_runtime_status_safe = lambda *args, **kw: None
     gw = Gateway(order)
+    gw.adapter = a
     a.handle_message = gw
     try:
         assert await a.connect()
@@ -788,3 +811,165 @@ async def test_dispatch_error_frees_fifo(env, monkeypatch):
     assert gw.events == [] and a._inflight == {}
     await deliver(a, prompted(D_SID, D_ISSUE, "again", "act-2"))
     assert len(gw.events) == 1
+
+
+
+# ------------------------------------------------- robustness (fix round 1)
+
+
+async def _until(pred, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pred():
+            return True
+        await asyncio.sleep(0.01)
+    return pred()
+
+
+async def deliver_nowait(a, *events):
+    """Queue events and wait for the worker only (not for turn tasks)."""
+    for ev in events:
+        a.deliver(copy.deepcopy(ev))
+    await a._events.join()
+
+
+async def test_fifo_release_after_real_base_session_guard():
+    a, client, gw, store, listener, order = _new_adapter()
+    del a.handle_message  # the REAL BasePlatformAdapter.handle_message path
+    handled, busy, completed = [], [], []
+
+    async def handler(event):
+        handled.append(event.message_id)
+        await asyncio.sleep(0.02)
+        return None
+
+    a.set_message_handler(handler)
+    real_busy = a._handle_message_while_active
+
+    async def busy_spy(event, session_key):
+        busy.append(event.message_id)
+        return await real_busy(event, session_key)
+
+    a._handle_message_while_active = busy_spy
+    real_complete = a.on_processing_complete
+
+    async def complete_spy(event, outcome):
+        completed.append((event.message_id, outcome))
+        return await real_complete(event, outcome)
+
+    a.on_processing_complete = complete_spy
+    assert await a.connect()
+    try:
+        await deliver_nowait(a, DELEGATION, prompted(D_SID, D_ISSUE, "more", "act-2"))
+        first, second = f"{D_SID}:{D_ACT}", f"{D_SID}:act-2"
+        assert await _until(lambda: len(completed) == 2, 5.0), (handled, busy, completed)
+        assert handled == [first, second]
+        assert busy == []  # the second turn never took the base's busy path
+        assert completed == [(first, ProcessingOutcome.SUCCESS),
+                             (second, ProcessingOutcome.SUCCESS)]
+        await a.wait_idle()
+        assert a._inflight == {} and a._queues == {}
+    finally:
+        await a.disconnect()
+
+
+async def test_stop_before_handoff_cancels_dispatch(env):
+    a, client, gw, store, order = env
+    client.snapshot_delay = 5.0  # first-turn dispatch parks in the snapshot fetch
+    await deliver_nowait(a, DELEGATION)
+    await asyncio.sleep(0.05)
+    assert gw.events == [] and a._inflight  # in flight, not handed off yet
+    await deliver(a, prompted(D_SID, D_ISSUE, "", "act-stop", signal="stop"))
+    assert gw.events == []  # neither the turn nor a /stop reached the gateway
+    assert a._inflight == {}
+    responses = [(sid, c["body"]) for sid, c, *_ in client.activities if c["type"] == "response"]
+    assert responses == [(D_SID, "Stopped.")]
+    client.snapshot_delay = 0.0
+    await deliver(a, prompted(D_SID, D_ISSUE, "again", "act-2"))
+    assert [e.message_id for e in gw.events] == [f"{D_SID}:act-2"]  # FIFO is free
+
+
+async def test_unadmitted_turn_frees_fifo(env, caplog):
+    a, client, gw, store, order = env
+    gw.admit = False  # handle_message returns but the base never starts processing
+    with caplog.at_level(logging.WARNING):
+        await deliver(a, DELEGATION)
+    assert len(gw.events) == 1
+    assert a._inflight == {}
+    assert "not admitted" in caplog.text
+    gw.admit = True
+    await deliver(a, prompted(D_SID, D_ISSUE, "again", "act-2"))
+    assert len(gw.events) == 2
+
+
+async def test_turn_safety_timeout_frees_fifo(env, monkeypatch, caplog):
+    from hermes_linear import constants
+    a, client, gw, store, order = env
+    monkeypatch.setattr(constants, "TURN_SAFETY_TIMEOUT_S", 0.05)
+    with caplog.at_level(logging.ERROR):
+        await deliver(a, DELEGATION)
+        await deliver(a, prompted(D_SID, D_ISSUE, "more", "act-2"))
+        assert len(gw.events) == 1
+        assert await _until(lambda: len(gw.events) == 2, 2.0)
+    assert gw.events[1].message_id == f"{D_SID}:act-2"
+    assert "safety timeout" in caplog.text
+
+
+async def test_slow_linear_does_not_block_next_event_ack(env):
+    a, client, gw, store, order = env
+    client.activity_delay[D_SID] = 5.0  # the first event's ack hangs
+    a.deliver(copy.deepcopy(DELEGATION))
+    a.deliver(copy.deepcopy(MENTION))
+    assert await _until(lambda: any(sid == M_SID for sid, *_ in client.activities), 1.0)
+    assert await _until(lambda: any(e.source.thread_id == M_SID for e in gw.events), 1.0)
+
+
+async def test_dispatch_exception_before_handoff_frees_fifo(env, monkeypatch):
+    a, client, gw, store, order = env
+    real = store.pending_context_batch
+    calls = {"n": 0}
+
+    def flaky(issue_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("db locked")
+        return real(issue_id)
+
+    monkeypatch.setattr(store, "pending_context_batch", flaky)
+    await deliver(a, DELEGATION)
+    assert gw.events == [] and a._inflight == {}
+    errors = [sid for sid, c, *_ in client.activities if c["type"] == "error"]
+    assert errors == [D_SID]
+    await deliver(a, prompted(D_SID, D_ISSUE, "again", "act-2"))
+    assert len(gw.events) == 1
+
+
+async def test_comment_session_failure_deletes_placeholder(env):
+    a, client, gw, store, order = env
+    issue = COMMENT_PLAIN["data"]["issueId"]
+    comment_id = COMMENT_PLAIN["data"]["id"]
+    store.set_mode(issue, "delegated", 1)
+    client.comment_fails = True
+    await deliver(a, plain_comment())
+    assert store.session(f"pending:{comment_id}") is None
+    assert store.session_by_root_comment(comment_id) is None
+    assert gw.events == []
+
+
+async def test_connect_twice_does_not_reregister(env, caplog):
+    a, client, gw, store, order = env
+    worker = a._worker
+    with caplog.at_level(logging.INFO):
+        assert await a.connect() is True
+    assert a._worker is worker
+    assert "already connected" in caplog.text
+
+
+async def test_deliver_after_disconnect_is_noop(caplog):
+    a, client, gw, store, listener, order = _new_adapter()
+    assert await a.connect()
+    await a.disconnect()
+    assert a._events is None
+    with caplog.at_level(logging.WARNING):
+        a.deliver(copy.deepcopy(DELEGATION))
+    assert "not connected" in caplog.text

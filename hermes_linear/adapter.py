@@ -8,13 +8,17 @@ Hermes ``BasePlatformAdapter``. Hermes contracts follow
   ``<ns>:linear:dm:<issueId>:<gen>`` / ``<ns>:linear:dm:<issueId>:<agentSessionId>``;
 * the gateway interrupts busy sessions (Q5), so the adapter keeps its own
   per-Hermes-session FIFO and hands the next turn to ``handle_message`` only
-  after ``on_processing_complete`` for the previous one;
+  after the previous one's base processing task has finished (the base fires
+  ``on_processing_complete`` inside its session guard); a turn the base never
+  admits, or one that never completes (``TURN_SAFETY_TIMEOUT_S``), frees it;
 * stop is a synthesized ``/stop`` with ``allow_gateway_control=True`` (Q6);
   every user-originated event uses ``allow_gateway_control=False``
   (Review Focus 1).
 
 Webhook events for one profile are processed strictly in order by one worker
-task: route -> execute every decision -> next event.
+task: route -> execute every decision -> next event. Linear calls on the
+worker are bounded by ``ACK_TIMEOUT_S`` or spawned, so the next event's ack is
+never held past Linear's 10 s window.
 
 Outbound (``send``, typing, approval prompts, tool hooks) is Task 12; ``send``
 is a stub here. Seams for it: ``self._writer`` (response writer whose
@@ -39,9 +43,9 @@ from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, ProcessingOutcome
 
-from . import renderer
+from . import constants, renderer
 from .access import AccessPolicy
-from .constants import SNAPSHOT_DESCRIPTION
+from .constants import ACK_TIMEOUT_S, SNAPSHOT_DESCRIPTION
 from .digest import fold
 from .linear_client import LinearClient
 from .listener import ProfileEndpoint, get_listener
@@ -64,8 +68,10 @@ STOPPED_TEXT = "Stopped."
 REASK_TEXT = "Please answer with one of the options."
 STALE_APPROVAL_TEXT = "That approval is no longer pending."
 STALE_CLARIFY_TEXT = "That question is no longer pending."
-ACK_TIMEOUT_S = 8  # acks must not stall the worker past Linear's 10 s window
+TURN_FAILED_TEXT = "Hermes could not start this turn. Please try again."
 SNAPSHOT_TIMEOUT_S = 15
+RELEASE_RETRY_S = 0.05  # re-check interval while the base still holds the session guard
+RELEASE_MAX_TRIES = 200
 AUTO_START_TIMEOUT_S = 20
 _AUTO_START_STATES = frozenset({"backlog", "unstarted", "triage"})
 _APPROVAL_CHOICES = ("once", "session", "deny")
@@ -106,11 +112,17 @@ def _resolve_clarify(request_id: str, answer: str) -> bool:
 Key = tuple[str, Optional[str]]  # (hermes chat_id, thread_id) == one Hermes session
 
 
-@dataclass
+@dataclass(eq=False)
 class _Turn:
     decision: StartTurn
     mid: str
     human: bool = False  # a human (not an automation) started this delegation
+    ack: Optional[asyncio.Task] = None  # the ack post; awaited (bounded) before hand-off
+    task: Optional[asyncio.Task] = None  # this turn's _dispatch task
+    handed_off: bool = False  # set immediately before handle_message
+    admitted: bool = False  # on_processing_start fired for this turn
+    session_key: Optional[str] = None  # the base's session key (busy-guard lookups)
+    safety: Optional[asyncio.TimerHandle] = None  # TURN_SAFETY_TIMEOUT_S watchdog
 
 
 def _human_creator(event: dict) -> bool:
@@ -175,6 +187,10 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._tasks: set[asyncio.Task] = set()
         self._queues: dict[Key, deque[_Turn]] = {}
         self._inflight: dict[Key, _Turn] = {}
+        # Completed turns whose base task has not finished yet; release waits for it (Q5).
+        self._draining: set[Key] = set()
+        self._drain_timers: dict[Key, asyncio.TimerHandle] = {}
+        self._unadmitted_logged = False
         self.last_outcome: dict[Key, ProcessingOutcome] = {}
         self.stop_message_ids: dict[str, str] = {}  # synthesized stop message_id -> agent session
         self._delegation_timers: dict[str, asyncio.TimerHandle | None] = {}
@@ -218,7 +234,8 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         row = self._store.cached_user(user_id, time.time())
         if row is not None:
             return row.email
-        email, name = await self._client.user(user_id)
+        # Bounded: router lookups run on the event worker. A timeout raises -> denied.
+        email, name = await asyncio.wait_for(self._client.user(user_id), ACK_TIMEOUT_S)
         self._store.put_user(user_id, email or None, name or None, time.time())
         return email or None
 
@@ -247,6 +264,11 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         return load_settings(get_config, lambda name: get_scoped_secret(name), env)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        if self._registered and self._worker is not None and not self._worker.done():
+            log.info("linear: connect() while already connected; nothing to do")
+            return True
+        if self._worker is not None:
+            await self._stop_worker()  # left over from a fatal unregister
         # Q3: all settings and secrets are snapshotted here, inside the profile's scope.
         try:
             settings = self._settings_override or self._load_settings()
@@ -325,7 +347,15 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             if handle is not None:
                 handle.cancel()
         self._delegation_timers.clear()
-        await self._stop_worker()
+        for turn in self._inflight.values():
+            if turn.safety is not None:
+                turn.safety.cancel()
+        for handle in self._drain_timers.values():
+            handle.cancel()
+        self._drain_timers.clear()
+        self._draining.clear()
+        await self._stop_worker()  # also cancels spawned tasks (acks, dispatches, stops)
+        self._events = None  # deliver() is now a logged no-op
         if ADAPTERS.get(self._profile) is self:
             del ADAPTERS[self._profile]
         if self._client is not None:
@@ -335,6 +365,8 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._store = None
         self._queues.clear()
         self._inflight.clear()
+        self.last_outcome.clear()
+        self.stop_message_ids.clear()
         self._mark_disconnected()
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
@@ -354,15 +386,16 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     def deliver(self, payload: dict) -> None:
         """Listener callback: queue one verified webhook payload for the worker."""
-        if self._events is None:
+        if self._events is None:  # never connected, or disconnected
             log.warning("linear: webhook dropped, adapter not connected")
             return
         self._events.put_nowait(("event", payload))
 
     async def _run_worker(self) -> None:
-        assert self._events is not None
+        events = self._events
+        assert events is not None
         while True:
-            kind, item = await self._events.get()
+            kind, item = await events.get()
             try:
                 if kind == "event":
                     await self.on_event(item)
@@ -372,7 +405,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 log.error("linear: event processing failed: %s", type(exc).__name__)
                 log.debug("linear: event processing traceback", exc_info=True)
             finally:
-                self._events.task_done()
+                events.task_done()
 
     def _spawn(self, coro) -> asyncio.Task:
         task = asyncio.get_running_loop().create_task(coro)
@@ -389,6 +422,9 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             pending = [t for t in self._tasks if not t.done()]
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+                continue
+            if self._draining:
+                await asyncio.sleep(0.01)
                 continue
             await asyncio.sleep(0)
             if not any(not t.done() for t in self._tasks) and (
@@ -417,7 +453,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         elif isinstance(d, ResolveControl):
             await self._resolve_control(d)
         elif isinstance(d, Interrupt):
-            await self._interrupt(d.agent_session_id)
+            self._interrupt(d.agent_session_id)
         elif isinstance(d, Refuse):
             await self._ack_writer.post(d.agent_session_id, renderer.error(d.text))
         elif isinstance(d, AwaitDelegation):
@@ -433,22 +469,25 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     # ------------------------------------------------------------ turns / FIFO (Q5)
 
+    def _busy(self, key: Key) -> bool:
+        return key in self._inflight or key in self._draining or bool(self._queues.get(key))
+
     async def _enqueue_turn(self, d: StartTurn, *, human: bool = False) -> None:
         assert self._ack_writer is not None
         self._cancel_delegation_timer(d.issue_id)
         key: Key = (d.chat_id, d.thread_id)
-        busy = key in self._inflight or bool(self._queues.get(key))
-        # §8.1: the ack goes out before the turn is handed to the gateway. Short timeout;
-        # a failed ack never blocks the turn.
-        await self._ack_writer.post(d.agent_session_id,
-                                    renderer.thought(QUEUED_ACK if busy else d.ack), ephemeral=True)
+        text = QUEUED_ACK if self._busy(key) else d.ack
+        # §8.1: the ack goes out before the hand-off. Spawned so a slow Linear never stalls
+        # the event worker; _dispatch waits for it (bounded). A failed ack never blocks.
+        ack = self._spawn(self._ack_writer.post(d.agent_session_id, renderer.thought(text),
+                                                ephemeral=True))
         mid = make_message_id(d.agent_session_id, d.activity_id)
-        self._queues.setdefault(key, deque()).append(_Turn(d, mid, human))
+        self._queues.setdefault(key, deque()).append(_Turn(d, mid, human, ack=ack))
         self._release_next(key)
 
     def _release_next(self, key: Key) -> None:
         """Start the next queued turn for ``key`` if none is in flight (synchronous)."""
-        if key in self._inflight:
+        if key in self._inflight or key in self._draining:
             return
         queue = self._queues.get(key)
         if not queue:
@@ -458,12 +497,45 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if not queue:
             del self._queues[key]
         self._inflight[key] = turn
-        self._spawn(self._dispatch(key, turn))
+        turn.task = self._spawn(self._dispatch(key, turn))
+
+    def _free(self, key: Key, turn: _Turn) -> None:
+        """Drop ``turn`` from in-flight (if it is still the current one); schedule the next."""
+        if self._inflight.get(key) is not turn:
+            return
+        del self._inflight[key]
+        if turn.safety is not None:
+            turn.safety.cancel()
+        asyncio.get_running_loop().call_soon(self._release_next, key)
+
+    def _turn_failed(self, key: Key, turn: _Turn) -> None:
+        self._free(key, turn)
+        if self._ack_writer is not None:
+            self._spawn(self._ack_writer.post(turn.decision.agent_session_id,
+                                              renderer.error(TURN_FAILED_TEXT)))
 
     async def _dispatch(self, key: Key, turn: _Turn) -> None:
+        try:
+            await self._hand_off(key, turn)
+        except asyncio.CancelledError:
+            if not turn.handed_off:
+                self._free(key, turn)  # stopped before hand-off (Interrupt already freed it)
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failed turn must never wedge the FIFO
+            if turn.handed_off:
+                log.error("linear: post-hand-off step failed for %s: %s", turn.mid,
+                          type(exc).__name__)
+                return
+            log.error("linear: turn %s not started: %s", turn.mid, type(exc).__name__)
+            log.debug("linear: turn start traceback", exc_info=True)
+            self._turn_failed(key, turn)  # context stays unconsumed for the next turn
+
+    async def _hand_off(self, key: Key, turn: _Turn) -> None:
         store = self._store
         assert store is not None
         d = turn.decision
+        if turn.ack is not None:
+            await asyncio.wait({turn.ack}, timeout=ACK_TIMEOUT_S)  # ack before hand-off (§8.1)
         ticket_session = d.thread_id is None
         text = d.text
         items, watermark = ([], None)
@@ -477,37 +549,111 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             snap = await self._snapshot(d.issue_id)
             if snap:
                 text = f"{text}\n\n{snapshot_block(snap)}"
+        store.record_turn(turn.mid, d.agent_session_id, d.chat_id, d.thread_id)
+        self.last_outcome.pop(key, None)
+        source = self.build_source(chat_id=d.chat_id, chat_type="dm", user_id=d.user_id,
+                                   user_name=d.user_name, thread_id=d.thread_id,
+                                   message_id=turn.mid)
+        event = MessageEvent(text=text, source=source, message_id=turn.mid, user_id=d.user_id,
+                             user_name=d.user_name, allow_gateway_control=False)
+        turn.handed_off = True  # from here on, Interrupt synthesizes /stop
         try:
-            store.record_turn(turn.mid, d.agent_session_id, d.chat_id, d.thread_id)
-            self.last_outcome.pop(key, None)
-            source = self.build_source(chat_id=d.chat_id, chat_type="dm", user_id=d.user_id,
-                                       user_name=d.user_name, thread_id=d.thread_id,
-                                       message_id=turn.mid)
-            event = MessageEvent(text=text, source=source, message_id=turn.mid, user_id=d.user_id,
-                                 user_name=d.user_name, allow_gateway_control=False)
             await self.handle_message(event)
-        except Exception as exc:  # noqa: BLE001 - not admitted: free the FIFO, keep context
-            log.error("linear: gateway refused turn %s: %s", turn.mid, type(exc).__name__)
-            if self._inflight.get(key) is turn:
-                del self._inflight[key]
-            asyncio.get_running_loop().call_soon(self._release_next, key)
+        except Exception:
+            turn.handed_off = False  # the gateway refused it: not admitted
+            raise
+        # The base spawns the processing task (and registers it) before handle_message
+        # returns, so "admitted" is checkable now: hook fired, or the base owns the session.
+        turn.session_key = self._base_session_key(event)
+        if not turn.admitted and not self._base_owns(turn.session_key):
+            self._not_admitted(key, turn)
             return
+        if self._inflight.get(key) is turn:
+            turn.safety = asyncio.get_running_loop().call_later(
+                constants.TURN_SAFETY_TIMEOUT_S, self._safety_expired, key, turn)
         if items:
             store.consume_context(d.issue_id, turn.mid, up_to_id=watermark)
         if d.first_turn and ticket_session and turn.human:
             await self._maybe_auto_start(d, snap)
 
+    def _base_session_key(self, event: MessageEvent) -> str | None:
+        try:
+            return self._event_session_key(event)
+        except Exception:  # noqa: BLE001 - unknown key: assume the base owns it (watchdog)
+            return None
+
+    def _base_owns(self, session_key: str | None) -> bool:
+        """True while the base holds a guard or a live processing task for ``session_key``."""
+        if session_key is None:
+            return True
+        task = getattr(self, "_session_tasks", {}).get(session_key)
+        return (session_key in getattr(self, "_active_sessions", {})
+                or (task is not None and not task.done()))
+
+    def _not_admitted(self, key: Key, turn: _Turn) -> None:
+        (log.debug if self._unadmitted_logged else log.warning)(
+            "linear: turn %s was not admitted by the gateway (no processing started); "
+            "freeing its queue", turn.mid)
+        self._unadmitted_logged = True
+        self._free(key, turn)
+
+    def _safety_expired(self, key: Key, turn: _Turn) -> None:
+        if self._inflight.get(key) is not turn:
+            return
+        log.error("linear: turn %s hit the safety timeout (%ss) without completing; "
+                  "freeing its queue", turn.mid, constants.TURN_SAFETY_TIMEOUT_S)
+        turn.safety = None
+        self._free(key, turn)
+
+    def _key_for_mid(self, mid: str | None) -> Key | None:
+        return next((k for k, t in self._inflight.items() if t.mid == mid), None)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        try:
+            await super().on_processing_start(event)
+        finally:
+            key = self._key_for_mid(event.message_id)
+            if key is not None:
+                self._inflight[key].admitted = True
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        key = next((k for k, t in self._inflight.items() if t.mid == event.message_id), None)
+        key = self._key_for_mid(event.message_id)
+        turn = self._inflight[key] if key is not None else None
         try:
             await super().on_processing_complete(event, outcome)
             if key is not None:
                 self.last_outcome[key] = outcome
         finally:
-            if key is not None:
-                self._inflight.pop(key, None)
-                # Never inline: the turn-error notice must reach send() first (Q1/Q5).
-                asyncio.get_running_loop().call_soon(self._release_next, key)
+            if key is not None and turn is not None and self._inflight.get(key) is turn:
+                del self._inflight[key]
+                if turn.safety is not None:
+                    turn.safety.cancel()
+                # The base fires this hook INSIDE its session guard (base.py ~4533; the guard
+                # drops in _finish_session_task ~4602). Releasing now would hit the busy path,
+                # which fires no hooks. Release once this task has finished (Q1/Q5: never
+                # inline, so the turn-error notice reaches send() first).
+                self._draining.add(key)
+                loop = asyncio.get_running_loop()
+                task = asyncio.current_task()
+                if task is None:
+                    loop.call_soon(self._release_after_drain, key, turn.session_key, 0)
+                else:
+                    task.add_done_callback(lambda _t: loop.call_soon(
+                        self._release_after_drain, key, turn.session_key, 0))
+
+    def _release_after_drain(self, key: Key, session_key: str | None, tries: int) -> None:
+        self._drain_timers.pop(key, None)
+        if key not in self._draining:
+            return  # disconnected meanwhile
+        if session_key and session_key in getattr(self, "_active_sessions", {}):
+            if tries < RELEASE_MAX_TRIES:
+                self._drain_timers[key] = asyncio.get_running_loop().call_later(
+                    RELEASE_RETRY_S, self._release_after_drain, key, session_key, tries + 1)
+                return
+            log.warning("linear: session %s still busy in the gateway after %.0fs; releasing "
+                        "the next turn anyway", session_key, RELEASE_RETRY_S * RELEASE_MAX_TRIES)
+        self._draining.discard(key)
+        self._release_next(key)
 
     async def _snapshot(self, issue_id: str) -> dict | None:
         assert self._client is not None
@@ -535,22 +681,31 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     # ------------------------------------------------------------ stop (Q6)
 
-    async def _interrupt(self, agent_session_id: str) -> None:
-        dropped = 0
+    def _interrupt(self, agent_session_id: str) -> None:
+        """Drop the session's queued turns; stop its in-flight turn. Never awaits Linear."""
         for key in list(self._queues):
             queue = self._queues[key]
             keep = deque(t for t in queue if t.decision.agent_session_id != agent_session_id)
-            dropped += len(queue) - len(keep)
             if keep:
                 self._queues[key] = keep
             else:
                 del self._queues[key]
-        running = [t for t in self._inflight.values()
-                   if t.decision.agent_session_id == agent_session_id]
-        for turn in running:
-            await self._send_stop(turn)
-        if dropped and not running and self._writer is not None:
-            await self._writer.post(agent_session_id, renderer.response(STOPPED_TEXT))
+        gateway_stop = False
+        for key, turn in list(self._inflight.items()):
+            if turn.decision.agent_session_id != agent_session_id:
+                continue
+            if turn.handed_off:
+                self._spawn(self._send_stop(turn))  # the gateway posts the stop notice
+                gateway_stop = True
+            else:  # still preparing: cancel it here, nothing reached the gateway
+                if turn.task is not None:
+                    turn.task.cancel()
+                self._free(key, turn)
+        # Design decision: a stop in thread B while thread A's turn runs in the shared ticket
+        # session only drops B's queued turns. Otherwise Linear would hang in "stopping".
+        if not gateway_stop and self._writer is not None:
+            self._spawn(self._writer.post(agent_session_id, renderer.response(STOPPED_TEXT),
+                                          timeout_s=ACK_TIMEOUT_S))
 
     async def _send_stop(self, turn: _Turn) -> None:
         d = turn.decision
@@ -633,12 +788,16 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         ticket = store.ticket(issue_id)
         if ticket is None or ticket.mode != "delegated" or not actor_id:
             return
-        try:
-            existing = await client.app_sessions_on_issue(issue_id)
-            sid = existing[0]["id"] if existing else await client.create_session_on_issue(issue_id)
-        except Exception as exc:  # noqa: BLE001
+        try:  # bounded: this runs on the event worker
+            existing = await asyncio.wait_for(client.app_sessions_on_issue(issue_id),
+                                              ACK_TIMEOUT_S)
+            sid = existing[0]["id"] if existing else await asyncio.wait_for(
+                client.create_session_on_issue(issue_id), ACK_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 - includes TimeoutError
             log.error("linear: opening a session on %s failed: %s", issue_id, type(exc).__name__)
             return
+        # A reused session is one of *our app's* sessions (app_sessions_on_issue), so marking
+        # it plugin_created is accurate; the flag is sticky (MAX) if it was already set.
         store.record_session(sid, issue_id, None, "delegation", plugin_created=True)
         ident = ticket.identifier or issue_id
         author = actor_name or DEFAULT_AUTHOR
@@ -659,12 +818,15 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if ticket is None or ticket.mode != "delegated":
             return
         # Placeholder first, so a `created` for it is ignored whatever the arrival order.
-        store.record_session(f"pending:{d.comment_id}", d.issue_id, d.comment_id, "comment",
+        placeholder = f"pending:{d.comment_id}"
+        store.record_session(placeholder, d.issue_id, d.comment_id, "comment",
                              plugin_created=True)
-        try:
-            sid = await client.create_session_on_comment(d.comment_id)
-        except Exception as exc:  # noqa: BLE001
+        try:  # bounded: this runs on the event worker
+            sid = await asyncio.wait_for(client.create_session_on_comment(d.comment_id),
+                                         ACK_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 - includes TimeoutError
             log.error("linear: session on comment %s failed: %s", d.comment_id, type(exc).__name__)
+            store.delete_session(placeholder)  # let a later comment try again
             return
         store.record_session(sid, d.issue_id, d.comment_id, "comment", plugin_created=True)
         ident = ticket.identifier or d.issue_id
