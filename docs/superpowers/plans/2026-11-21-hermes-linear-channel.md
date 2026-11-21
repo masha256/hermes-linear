@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md` (read it first; section refs below are `§n`).
 
+**Tracking:** Linear project *Valkyrie*. One issue per task (named in each task heading, titled `T<n> · <task>`); milestone exit is RET-60. Move an issue to In Progress when its task starts and Done when its commit lands.
+
 ## Global Constraints
 
 - Import only modules/names listed in Hermes's public plugin API (`hermes plugins validate` must report no private imports). Allowed modules used here: `gateway.platforms.base`, `gateway.platforms.event`, `gateway.platforms._shared`, `gateway.platforms.helpers`, `gateway.config`, `gateway.platforms.access_policy_mixin`, `gateway.session_context.get_session_env`, `gateway.approval_actor.{approval_refusal, refusal_text}`, `tools.approval.resolve_gateway_approval_card`, `tools.clarify_gateway.{get_pending, resolve_gateway_clarify, mark_awaiting_text, SKIPPED}`, `agent.secret_scope`, `agent.redact.redact_sensitive_text`, `plugins.plugin_storage.{plugin_data_dir, plugin_db}`, `hermes_cli.gateway_setup_wizard.*` (listed names), `hermes_cli.setup.{prompt, prompt_choice, prompt_yes_no}`, `hermes_cli.cli_output`. Duck-type anything else (e.g. stream event classes by `type(x).__name__`).
@@ -65,7 +67,7 @@ docs/hermes-integration-notes.md  findings from Task 1
 
 ---
 
-### Task 0: Dev environment, skeleton, fixtures
+### Task 0: Dev environment, skeleton, fixtures — RET-46
 
 **Files:**
 - Create: `plugin.yaml`, `__init__.py`, `pyproject.toml`, `hermes_linear/__init__.py`, `hermes_linear/constants.py`, `hermes_linear/plugin.py` (stub), `scripts/dev-env.sh`, `scripts/scrub_fixtures.py`, `tests/conftest.py`, `tests/fixtures/probe/*.json`, `tests/test_skeleton.py`, `.gitignore`
@@ -81,7 +83,7 @@ docs/hermes-integration-notes.md  findings from Task 1
 - [ ] **Step 6: Run** `hermes plugins validate .` → no errors, no private-import warnings.
 - [ ] **Step 7: Commit** `chore: plugin skeleton, dev env, scrubbed probe fixtures`.
 
-### Task 1: Hermes integration probe
+### Task 1: Hermes integration probe — RET-63
 
 Answers spec §12 items 1–2 plus the gateway contracts the adapter depends on. Output is a findings doc; no product code. Each question names the default the rest of the plan assumes and the fallback if the probe disproves it.
 
@@ -104,7 +106,7 @@ Answers spec §12 items 1–2 plus the gateway contracts the adapter depends on.
   10. *Fatal errors and expiry.* The public way for an adapter to report a fatal error (base exposes `set_fatal_error_handler` / `has_fatal_error`), and how approval timeouts reach the adapter (clarify uses `retire_clarify_card(clarify_id, notice)`). Record the exact calls.
 - [ ] **Step 2: Commit** `docs: Hermes integration notes`. If any answer takes a fallback, add a one-line amendment to the spec's §12 entry in the same commit.
 
-### Task 2: Models and settings
+### Task 2: Models and settings — RET-64
 
 **Files:**
 - Create: `hermes_linear/models.py`, `hermes_linear/settings.py`, `tests/test_settings.py`
@@ -124,7 +126,7 @@ Answers spec §12 items 1–2 plus the gateway contracts the adapter depends on.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat: settings and decision models`.
 
-### Task 3: Store
+### Task 3: Store — RET-49
 
 **Files:**
 - Create: `hermes_linear/store.py`, `tests/test_store.py`
@@ -148,7 +150,7 @@ Answers spec §12 items 1–2 plus the gateway contracts the adapter depends on.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat: per-profile state store`.
 
-### Task 4: Linear client
+### Task 4: Linear client — RET-47
 
 **Files:**
 - Create: `hermes_linear/linear_client.py`, `tests/fake_linear.py`, `tests/test_linear_client.py`
@@ -171,7 +173,7 @@ Answers spec §12 items 1–2 plus the gateway contracts the adapter depends on.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat: Linear client with client-credentials tokens`.
 
-### Task 5: Webhook listener
+### Task 5: Webhook listener — RET-48
 
 **Files:**
 - Create: `hermes_linear/listener.py`, `tests/test_listener.py`
@@ -189,7 +191,7 @@ Answers spec §12 items 1–2 plus the gateway contracts the adapter depends on.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat: shared webhook listener`.
 
-### Task 6: Access policy
+### Task 6: Access policy — RET-55
 
 **Files:**
 - Create: `hermes_linear/access.py`, `tests/test_access.py`
@@ -202,7 +204,7 @@ Answers spec §12 items 1–2 plus the gateway contracts the adapter depends on.
 - [ ] **Step 2–4:** run → FAIL, implement, run → PASS.
 - [ ] **Step 5: Commit** `feat: allowlist access policy`.
 
-### Task 7: Router — agent session events and lifecycle
+### Task 7: Router — agent session events and lifecycle — RET-50
 
 **Files:**
 - Create: `hermes_linear/router.py`, `tests/test_router_agent.py`
@@ -231,7 +233,7 @@ Rules are spec §6.2–6.4 verbatim; the tests below pin them.
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** `feat: router for agent session events and ticket lifecycle`.
 
-### Task 8: Router — data-change events, context, plain comments
+### Task 8: Router — data-change events, context, plain comments — RET-53
 
 **Files:**
 - Modify: `hermes_linear/router.py`
@@ -256,7 +258,7 @@ Rules are spec §6.2–6.4 verbatim; the tests below pin them.
 - [ ] **Step 2–4:** run → FAIL, implement, run → PASS.
 - [ ] **Step 5: Commit** `feat: router for context events and plain comments`.
 
-### Task 9: Digest
+### Task 9: Digest — RET-54
 
 **Files:**
 - Create: `hermes_linear/digest.py`, `tests/test_digest.py`
@@ -269,7 +271,7 @@ Rules are spec §6.2–6.4 verbatim; the tests below pin them.
 - [ ] **Step 2–4:** run → FAIL, implement, run → PASS.
 - [ ] **Step 5: Commit** `feat: context digest`.
 
-### Task 10: Renderer
+### Task 10: Renderer — RET-51
 
 **Files:**
 - Create: `hermes_linear/renderer.py`, `tests/test_renderer.py`
@@ -284,7 +286,7 @@ Rules are spec §6.2–6.4 verbatim; the tests below pin them.
 - [ ] **Step 2–4:** run → FAIL, implement, run → PASS.
 - [ ] **Step 5: Commit** `feat: activity renderer`.
 
-### Task 11: Adapter — inbound path and turns
+### Task 11: Adapter — inbound path and turns — RET-65
 
 **Files:**
 - Create: `hermes_linear/adapter.py`, `tests/test_adapter_inbound.py`
@@ -318,7 +320,7 @@ Decision execution:
 - [ ] **Step 2–4:** run → FAIL, implement, run → PASS.
 - [ ] **Step 5: Commit** `feat: adapter inbound path`.
 
-### Task 12: Adapter — outbound path and hooks
+### Task 12: Adapter — outbound path and hooks — RET-66
 
 **Files:**
 - Modify: `hermes_linear/adapter.py`
@@ -331,7 +333,7 @@ Decision execution:
 - [ ] **Step 2–4:** run → FAIL, implement, run → PASS.
 - [ ] **Step 5: Commit** `feat: adapter outbound path and tool hooks`.
 
-### Task 13: Registration, setup, CLI, dev install
+### Task 13: Registration, setup, CLI, dev install — RET-67
 
 **Files:**
 - Modify: `hermes_linear/plugin.py`
@@ -345,7 +347,7 @@ Decision execution:
 - [ ] **Step 5: Dev install** — `ln -s ~/git/hermes-linear ~/.hermes/profiles/neo/plugins/linear`, `hermes -p neo plugins enable linear`, configure with the Hermes Test app (`client_id` from `op://hermes/linear-raymond-app/client-id`; secrets into the neo `.env` via `hermes -p neo linear setup`). **Ask Mike to restart the shared gateway** (it drops every bot briefly). Then stop the probe logger, repoint Funnel path `/linear` → `127.0.0.1:8650/linear`, run `hermes -p neo linear test` → 200 and `hermes -p neo linear status` healthy.
 - [ ] **Step 6: Commit** `feat: plugin registration, setup wizard and CLI`.
 
-### Task 14: Live smoke, docs, CI
+### Task 14: Live smoke, docs, CI — RET-59
 
 **Files:**
 - Create: `scripts/smoke.md`, `.github/workflows/ci.yml`
@@ -357,4 +359,4 @@ Decision execution:
 - [ ] **Step 4: README** — remove the pre-release banner's "target interface" wording for anything that now exists; correct any command/setting that changed during implementation; add a "Development" section (`scripts/dev-env.sh`, `pytest`, dev symlink install).
 - [ ] **Step 5: Commit** `docs: smoke checklist, CI, README for 0.1.0`; tag `v0.1.0`.
 
-Milestone exit (spec §13 dogfood: a real profile moves its Linear work onto the plugin, `linear-orion` route retired, one week without a missed 10 s ack) is tracked in RET-60 and is outside this plan.
+Milestone exit (spec §13 dogfood: a real profile moves its Linear work onto the plugin, `linear-orion` route retired, one week without a missed 10 s ack) is tracked in RET-60 (`M1 exit · Dogfood`) and is outside this plan.

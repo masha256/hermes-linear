@@ -2,7 +2,7 @@
 
 - **Date:** 2026-11-21
 - **Status:** Draft for review
-- **Tracking:** Linear project *Valkyrie* (RET-43 … RET-60)
+- **Tracking:** Linear project *Valkyrie* — probe RET-43, spec RET-44, plan RET-45; implementation tasks per the plan (RET-46…RET-67); milestone exit RET-60
 - **Repo:** `masha256/hermes-linear`
 
 ## 1. Summary
