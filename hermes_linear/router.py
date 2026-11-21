@@ -279,9 +279,18 @@ _BOT_ACTOR_TYPES = frozenset({"integration", "oauthclient", "oauth_client", "wor
 
 
 def _explicit_bot(event: dict) -> bool:
-    """True only on an explicit bot signal: ``botActor`` set or a bot actor type."""
-    data = _d(event.get("data"))
-    if event.get("botActor") or data.get("botActor"):
+    """True only on an explicit bot signal: ``botActor`` set or a bot actor type.
+
+    ``data.botActor`` is an entity field, so it only says who triggered the
+    event for a Comment (it credits the comment's author). On an Issue it is
+    "the bot that created the issue" and on other entities it is likewise not
+    the triggering actor, so it is ignored there: a human editing a
+    bot-created issue must still pass the allowlist. Event-level ``botActor``
+    and ``actor.type`` apply to every event type.
+    """
+    if event.get("botActor"):
+        return True
+    if event.get("type") == "Comment" and _d(event.get("data")).get("botActor"):
         return True
     actor_type = _d(event.get("actor")).get("type")
     return isinstance(actor_type, str) and actor_type.lower() in _BOT_ACTOR_TYPES

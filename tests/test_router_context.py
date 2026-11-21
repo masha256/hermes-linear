@@ -395,6 +395,57 @@ async def test_explicit_bot_context_exempt(store):
     assert isinstance((await route(ev, ctx))[0], AddContext)
 
 
+_INTEGRATION = {"id": "bot-1", "name": "GitHub", "type": "integration"}
+
+
+async def test_issue_created_by_bot_human_edit_still_checked(store):
+    # Issue ``data.botActor`` is "the bot that created the issue", not who
+    # triggered this update: a human editing it must still pass the allowlist.
+    _delegate(store, C_ISSUE)
+    ev = copy.deepcopy(LABELS)
+    assert ev["actor"]["type"] == "user"
+    ev["data"]["botActor"] = dict(_INTEGRATION)
+    ctx = RouterContext(store=store, app_user_id=APP, allowed=_no, app_user_handle=HANDLE)
+    assert await route(copy.deepcopy(ev), ctx) == [Ignore("denied actor")]
+    assert store.pending_context(C_ISSUE) == []
+    ctx = RouterContext(store=store, app_user_id=APP, allowed=_yes, app_user_handle=HANDLE)
+    (item,) = _items(await route(copy.deepcopy(ev), ctx))
+    assert item.actor == LABELS["actor"]["name"] and item.actor != "GitHub"
+
+
+def _attachment_event():
+    return {
+        "type": "Attachment", "action": "create", "createdAt": "2026-11-21T21:00:00Z",
+        "actor": copy.deepcopy(LABELS["actor"]),
+        "data": {"id": "A1", "issueId": C_ISSUE, "title": "PR #12",
+                 "url": "https://github.com/x/y/pull/12", "updatedAt": "t"},
+    }
+
+
+def _project_update_event():
+    return {
+        "type": "ProjectUpdate", "action": "create", "createdAt": "2026-11-21T22:00:00Z",
+        "actor": copy.deepcopy(LABELS["actor"]),
+        "data": {"id": "PU1", "body": "status", "projectId": PROJECT_ID,
+                 "project": {"id": PROJECT_ID, "name": "Valkyrie"},
+                 "userId": HUMAN, "user": {"id": HUMAN, "name": "Test User"}},
+    }
+
+
+@pytest.mark.parametrize("make", [_attachment_event, _human_project_event, _project_update_event],
+                         ids=["Attachment", "Project", "ProjectUpdate"])
+async def test_entity_bot_actor_not_exempt_for_non_comment(store, make):
+    _delegate(store, C_ISSUE, PROJECT_ID)
+    ev = make()
+    ev["data"]["botActor"] = dict(_INTEGRATION)
+    ctx = RouterContext(store=store, app_user_id=APP, allowed=_no, app_user_handle=HANDLE)
+    assert await route(ev, ctx) == [Ignore("denied actor")]
+    # event-level botActor is still an explicit bot signal
+    ev = make()
+    ev["botActor"] = dict(_INTEGRATION)
+    assert isinstance((await route(ev, ctx))[0], AddContext)
+
+
 async def test_echo_issue_update_still_refreshes_cache(ctx, store):
     _delegate(store, S_ISSUE)
     ev = copy.deepcopy(STATE)

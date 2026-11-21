@@ -376,11 +376,19 @@ async def test_denied_delegator_no_await(store):
 
 async def test_bot_delegator_no_await(ctx):
     ev = copy.deepcopy(ISSUE_DELEGATED)
-    ev["data"]["botActor"] = {"id": "bot-1", "type": "workflow", "name": "Triage rule"}
+    ev["botActor"] = {"id": "bot-1", "type": "workflow", "name": "Triage rule"}
     assert await route(ev, ctx) == [Ignore("denied delegator")]
     ev = copy.deepcopy(ISSUE_DELEGATED)
     ev["actor"]["type"] = "integration"
     assert await route(ev, ctx) == [Ignore("denied delegator")]
+
+
+async def test_bot_created_issue_human_delegator_allowed(ctx):
+    # Issue data.botActor is the issue's creator, not the delegator.
+    ev = copy.deepcopy(ISSUE_DELEGATED)
+    ev["data"]["botActor"] = {"id": "bot-1", "type": "workflow", "name": "Triage rule"}
+    out = await route(ev, ctx)
+    assert isinstance(out[0], SetMode) and out[0].mode == "delegated"
 
 
 async def test_missing_actor_delegator_no_await(ctx):
