@@ -33,7 +33,7 @@ does not.
 - Tool progress never reaches `send()` when `format_tool_event` returns `None`
   (`gateway/stream_dispatch.py:71-81`).
 - Unmarked sends that are not the turn's final reply: the turn-error notice
-  (`base.py:4329`, no `notify`), slash-command acks (`gateway/run_busy.py:1091`) and busy acks.
+  (`base.py:4329`, no `notify`, no anchor; handled in the send contract below), slash-command acks (`gateway/run_busy.py:1091`) and busy acks.
   The adapter never triggers the last two: user text is sent with `allow_gateway_control=False` and
   Q5 keeps the gateway from seeing busy input.
 - Probe `probe_commentary.py`: commentary send metadata =
@@ -48,7 +48,7 @@ does not.
   `True` through `getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)`
   (`gateway/run_turn_runner.py:276-282`). The adapter overrides `edit_message` (Q10), so with
   `streaming.enabled` an adapter that keeps the default would get partial text as an unmarked
-  `send()`, and the rule below would post it as the `response`.
+  `send()` preview. Only `expect_edits` would mark it as a preview, and its edits would be lost.
 
 Adapter contract:
 
@@ -64,23 +64,111 @@ Adapter contract:
     (`gateway/run_turn_runner_approval_settle.py:99-110`).
   - Plugin-message edits are refused (`gateway/plugin_messages.py:58-62`), which the adapter does not
     need. Those three call sites are the only readers outside platform plugins.
-- Rule: `_interim_send` → `thought`; otherwise → `response`. Resolve the Linear session from
-  `reply_to`, falling back to `metadata["reply_to_message_id"]`. A send that resolves to no session
-  (no `reply_to`, no `reply_to_message_id`, e.g. Q4's pairing/decline text) is dropped and logged.
-- Residual: proxy mode (`GATEWAY_PROXY_URL` / `gateway.proxy_url`) builds its consumer with
-  `on_missing_cursor="fallback"` when streaming is on, whatever the flag says
-  (`run_turn.py:629-660,721-723`). It then sends one `expect_edits: True` preview, its edits fail,
-  and the tail arrives as a fallback send (`stream_consumer_transport.py:525-605`). Linear does not
-  support that combination. The adapter treats a send whose metadata has `expect_edits` as a
-  `thought` and logs a warning.
-- The adapter task adds `test_supports_message_editing_false`, asserting
-  `LinearAdapter.SUPPORTS_MESSAGE_EDITING is False`. It also adds a classification test: a send with
-  `expect_edits` → `thought`; an unmarked send with `notify` → `response`.
+- Proxy mode is not supported with streaming. Proxy mode (`GATEWAY_PROXY_URL` / `gateway.proxy_url`)
+  builds its consumer with `on_missing_cursor="fallback"` when streaming is on, whatever the flag
+  says (`run_turn.py:629-660,721-723`). The sends then come from `gateway/stream_consumer_fallback.py`:
+  - The preview is `send(reply_to=<turn id>, metadata={…, "reply_to_message_id", "expect_edits": True})`
+    (`stream_consumer_fallback.py:25-29`, and the first send at `stream_consumer_transport.py:460-462`).
+    Its edits fail.
+  - The final tail continuation is `_send_with_flood_retry` with final metadata
+    (`reply_to_message_id`, `notify: True`, no `expect_edits`; `stream_consumer_fallback.py:225-233`).
+    A tail-only continuation has `reply_to=None` (anchor only on a full resend, lines 128-131), so it
+    resolves through rule (b) below.
+  - A segment-break tail flush is `send(chat_id, tail, metadata=<thread meta> + _interim_send)` with
+    no `reply_to` and no `reply_to_message_id` (`stream_consumer_fallback.py:328-330`), so it resolves
+    through rule (c).
 
-Caveat: when commentary text matches the final answer, the gateway's final-send dedup may skip the
-final send (`gateway/run_turn_runner.py:286-288`). The adapter needs a turn-end fallback (see Q5:
-`on_processing_complete`). If no `response` was posted for the turn, promote the last `thought` to
-the `response`. **Live-verify in T13.**
+  Visible outcome on Linear: the prefix stays a `thought` (the adapter treats `expect_edits` as a
+  `thought` and logs a warning), segment tails are `thought`s, and the `response` holds only the
+  final tail. That is readable but split, so the combination stays declared unsupported.
+
+Send contract. The adapter resolves the target Linear agent session in this order, using the first
+step that finds a turn:
+
+  a. `reply_to` → `store.turn(reply_to)`.
+  b. `metadata["reply_to_message_id"]` → `store.turn(...)`.
+  c. The latest turn for `(chat_id, metadata.get("thread_id"))` via `store.latest_turn_for_chat`.
+     The thread id must match exactly, so a mention session (`thread_id=<agentSessionId>`) is never
+     reached by a send with no thread metadata. The plan's `latest_turn_for_chat(chat_id)` therefore
+     needs a `thread_id=None` parameter.
+
+If all three fail, the send is dropped and logged, and `send()` returns
+`SendResult(success=False, error="no linear session")`. Classification, in order:
+
+1. `_interim_send` → `thought`.
+2. `expect_edits` → `thought`, with a warning (proxy residual above).
+3. Turn-error notice → `error` activity (see below).
+4. Anything else → `response`.
+
+Turn-error notice. `_notify_turn_error` sends `send(chat_id=source.chat_id, content=…,
+metadata=_thread_metadata_for_event(event))` with no `reply_to` (`base.py:4313-4333`, send at
+`4329`). For a Linear source that metadata is `None` or `{"thread_id": …}`, plus `hermes_profile`
+when the source carries a profile. No `reply_to_message_id`, `notify`, `_interim_send` or
+`expect_edits` is added: the Telegram and Slack branches do not apply (`base.py:119-140`). Content
+is the localized `gateway.notify.turn_error_detailed` / `turn_error` (`locales/en.yaml:652-654`)
+through `warning_text`. It can be `None` for a muted diagnostic wake, and then nothing is sent. The
+adapter does not match on text. The source identifies the notice by order and shape:
+
+- In `_process_message_background` the exception path runs
+  `_run_processing_hook("on_processing_complete", event, FAILURE)` and then
+  `_notify_turn_error(event, e)` (`base.py:4556-4559`). Both run in the same task, with no
+  suspension between the hook's return and the adapter's `send()` entry (`_run_processing_hook`
+  only awaits the hook, `base.py:3430-3438`).
+- The adapter's `on_processing_complete` (Q5) records `last_outcome[key] = outcome`. It clears the
+  in-flight flag for the key **after** `await super()`. It schedules the next FIFO item with
+  `loop.call_soon`/`create_task` and never starts it inline, so the notice reaches `send()` before
+  the next turn is recorded.
+- `send()` snapshots in-flight state synchronously at entry, before its first `await`.
+
+A send is classified as the turn-error notice when all of these hold:
+
+- `reply_to` is `None`.
+- Metadata keys are within `{"thread_id", "hermes_profile"}`.
+- It resolved through (c).
+- The key has no turn in flight.
+- `last_outcome[key]` is `FAILURE`.
+
+The adapter consumes `last_outcome` on that match. The adapter never reaches the other
+`_notify_turn_error` caller, the shared-runtime busy follow-up (`gateway/session_ingress.py:529`),
+because Q5 keeps busy input away from the gateway. An unmarked send that resolves via (c) while no
+turn is in flight and the last outcome is not `FAILURE` is posted as a `thought` and logged, not as
+a `response`. A `response` would close the agent session.
+
+Pairing and decline texts (Q4) are `send(source.chat_id, text)` with no `reply_to` and no metadata
+(`gateway/run_inbound.py:80-131`). They are sent from inside the runner's handler while the adapter's
+turn is in flight:
+
+- On a delegated session (`chat_id=<issueId>:<gen>`, no thread), (c) finds the turn recorded for
+  that event, and the text is posted as that turn's `response`. A pairing code would then be visible
+  to everyone who can read the issue.
+- On a mention session, (c) finds nothing (no thread metadata), and the text is dropped and logged.
+
+Both happen only when an operator sets `unauthorized_dm_behavior` to `pair`/`decline` (default
+`ignore`, Q4). Setup docs say to leave it unset for Linear.
+
+Tests the adapter task adds:
+
+- `test_supports_message_editing_false`: `LinearAdapter.SUPPORTS_MESSAGE_EDITING is False`.
+- `test_send_resolves_reply_to` / `test_send_resolves_reply_to_message_id` /
+  `test_send_resolves_latest_turn_for_chat_and_thread` (rules a, b, c, with the thread id matched
+  exactly).
+- `test_unresolvable_send_dropped`: no anchor and no turn for `(chat_id, thread_id)` → no activity,
+  a log record, and `success=False`.
+- `test_interim_send_is_thought` and `test_expect_edits_is_thought_with_warning`.
+- `test_final_send_is_response`: `reply_to` plus `notify` → `response`.
+- `test_turn_error_notice_posted_as_error`: drive
+  `on_processing_complete(event, FAILURE)` and then
+  `send(chat_id, text, metadata={"thread_id": …})`. The result is an `error` activity on that turn's
+  agent session, and a queued FIFO item starts only afterwards.
+- `test_anchorless_send_after_success_is_thought`.
+- `test_pairing_text_delegated_posts_response` and `test_pairing_text_mention_dropped`.
+
+Caveat: the gateway's final-send dedup may skip the final send when commentary text matches the final
+answer. The commentary-only consumer is built with `on_missing_cursor="fallback"` so that it
+participates in that dedup (`gateway/run_turn_runner.py:284-288`). Suppression happens in
+`_run_agent_mark_streamed_delivery`, which sets `already_sent` (`gateway/run_turn.py:1909-1953`). The
+adapter needs a turn-end fallback (see Q5: `on_processing_complete`). If no `response` was posted for
+the turn, it promotes the last `thought` to the `response`. **Live-verify in T13.**
 
 Decision: default
 
@@ -188,12 +276,13 @@ Contract the adapter must implement:
   user_id=<Linear UUID>, user_name=…, thread_id=…, message_id=…)`). Then the gateway re-checks
   `_is_dm_allowed` instead of rubber-stamping. Keys stay user-independent.
   `build_session_key` (`gateway/session.py:700-746`) gives `<ns>:linear:dm:<chat_id>[:<thread_id>]`
-  for a `dm` with a `chat_id`. The participant is added only when `chat_id` is empty (line 726), and
-  `<ns>` is `agent:main` for the default profile or `agent:<profile>` otherwise (`session.py:679-688`).
+  for a `dm` with a `chat_id`. The participant is added only when `chat_id` is empty (line 726).
+  `<ns>` is `agent:main` for the default profile and `agent:<profile>` otherwise. A profile literally
+  named `main` gets `agent:main~`, so it never shares the default's sessions (`session.py:679-688`).
   With the spec §5 sources:
-  - delegated (`chat_id=<issueId>:<generation>`, no thread) → `agent:<ns>:linear:dm:<issueId>:<gen>`
+  - delegated (`chat_id=<issueId>:<generation>`, no thread) → `<ns>:linear:dm:<issueId>:<gen>`
   - mention (`chat_id=<issueId>`, `thread_id=<agentSessionId>`) →
-    `agent:<ns>:linear:dm:<issueId>:<agentSessionId>`
+    `<ns>:linear:dm:<issueId>:<agentSessionId>`
 
   Probe output: `agent:main:linear:dm:ISSUE-UUID:1` and
   `agent:main:linear:dm:ISSUE-UUID:agentSession-9`. Delegated and mention keys could collide only if
@@ -213,8 +302,9 @@ Contract the adapter must implement:
   (`authz_mixin.py:853-854`). An explicit per-platform `unauthorized_dm_behavior`, or any global
   value other than `pair`, wins first (`authz_mixin.py:836-844`). `decline` would then post the
   decline text, and `pair` a pairing code, through `adapter.send(chat_id, text)` with no `reply_to`
-  and no metadata (`run_inbound.py:80-131`). Those sends resolve to no Linear session and are dropped
-  (Q1 rule).
+  and no metadata (`run_inbound.py:80-131`). The Q1 send contract resolves them through (c). On a
+  delegated session the text becomes that turn's `response`, and on a mention session it is dropped
+  and logged. Setup docs say to leave `unauthorized_dm_behavior` unset for Linear.
 
 Decision: fallback — admit email/settings-only entries through `resolved_allowlist_user_ids()` (consulted when `LINEAR_ALLOWED_USERS` is set) plus `OwnAccessPolicyMixin` allowlist (consulted when it is not), with `chat_type="dm"` on every source
 
