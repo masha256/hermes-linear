@@ -40,8 +40,42 @@ does not.
   `{"thread_id": null, "reply_to_message_id": "as1:act1", "_interim_send": true}`, `reply_to=None`.
   Probe `probe_adapter.py`: final send `reply_to="as1:act2"`, metadata `{"notify": true}`.
 
-Adapter rule: `_interim_send` → `thought`; otherwise → `response`. Resolve the Linear session from
-`reply_to`, falling back to `metadata["reply_to_message_id"]`.
+- Streaming previews are **unmarked**. When text streaming is on, the consumer's first preview is
+  `adapter.send(..., metadata={…, "reply_to_message_id", "expect_edits": True})` with no
+  `_interim_send` (`gateway/stream_consumer_transport.py:460-462`, `gateway/stream_consumer.py:261-272`),
+  and later deltas arrive through `edit_message`. Whether the consumer streams deltas depends on
+  `SUPPORTS_MESSAGE_EDITING`. The attribute is not defined on the base class, so it defaults to
+  `True` through `getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)`
+  (`gateway/run_turn_runner.py:276-282`). The adapter overrides `edit_message` (Q10), so with
+  `streaming.enabled` an adapter that keeps the default would get partial text as an unmarked
+  `send()`, and the rule below would post it as the `response`.
+
+Adapter contract:
+
+- `SUPPORTS_MESSAGE_EDITING = False` as a class attribute, the same as `signal`, `wecom`, `qqbot`,
+  `weixin`, `bluebubbles` and `photon`. Effects of the flag:
+  - `consumer_stream_deltas` is False whatever `streaming.enabled` says
+    (`run_turn_runner.py:279-282,303`), so no delta previews.
+  - A commentary-only consumer still works. It is built with `on_missing_cursor="fallback"`, which
+    for a non-editing adapter means an empty cursor instead of the `RuntimeError` skip
+    (`run_turn_runner.py:288`, `gateway/run_turn.py:593-597`).
+  - The approval-timeout edit (Q10) still reaches the adapter. `_edit_card` looks up
+    `getattr(adapter, "edit_message", None)` and never reads the flag
+    (`gateway/run_turn_runner_approval_settle.py:99-110`).
+  - Plugin-message edits are refused (`gateway/plugin_messages.py:58-62`), which the adapter does not
+    need. Those three call sites are the only readers outside platform plugins.
+- Rule: `_interim_send` → `thought`; otherwise → `response`. Resolve the Linear session from
+  `reply_to`, falling back to `metadata["reply_to_message_id"]`. A send that resolves to no session
+  (no `reply_to`, no `reply_to_message_id`, e.g. Q4's pairing/decline text) is dropped and logged.
+- Residual: proxy mode (`GATEWAY_PROXY_URL` / `gateway.proxy_url`) builds its consumer with
+  `on_missing_cursor="fallback"` when streaming is on, whatever the flag says
+  (`run_turn.py:629-660,721-723`). It then sends one `expect_edits: True` preview, its edits fail,
+  and the tail arrives as a fallback send (`stream_consumer_transport.py:525-605`). Linear does not
+  support that combination. The adapter treats a send whose metadata has `expect_edits` as a
+  `thought` and logs a warning.
+- The adapter task adds `test_supports_message_editing_false`, asserting
+  `LinearAdapter.SUPPORTS_MESSAGE_EDITING is False`. It also adds a classification test: a send with
+  `expect_edits` → `thought`; an unmarked send with `notify` → `response`.
 
 Caveat: when commentary text matches the final answer, the gateway's final-send dedup may skip the
 final send (`gateway/run_turn_runner.py:286-288`). The adapter needs a turn-end fallback (see Q5:
@@ -152,10 +186,35 @@ Contract the adapter must implement:
   `LINEAR_ALLOWED_USERS` denies everyone listed only by email or only in settings.
 - Every `SessionSource` uses `chat_type="dm"` (`self.build_source(chat_id=…, chat_type="dm",
   user_id=<Linear UUID>, user_name=…, thread_id=…, message_id=…)`). Then the gateway re-checks
-  `_is_dm_allowed` instead of rubber-stamping. Keys stay user-independent: probe output
-  `agent:main:linear:dm:ISSUE-UUID:1` and `agent:main:linear:dm:ISSUE-UUID:agentSession-9`
-  (`gateway/session.py:714-746`). `shared_session` is moot for `dm`, and `build_source` cannot set
-  it anyway. `SessionSource` is not in the public API (`hermes_cli/data/plugin_api.json`).
+  `_is_dm_allowed` instead of rubber-stamping. Keys stay user-independent.
+  `build_session_key` (`gateway/session.py:700-746`) gives `<ns>:linear:dm:<chat_id>[:<thread_id>]`
+  for a `dm` with a `chat_id`. The participant is added only when `chat_id` is empty (line 726), and
+  `<ns>` is `agent:main` for the default profile or `agent:<profile>` otherwise (`session.py:679-688`).
+  With the spec §5 sources:
+  - delegated (`chat_id=<issueId>:<generation>`, no thread) → `agent:<ns>:linear:dm:<issueId>:<gen>`
+  - mention (`chat_id=<issueId>`, `thread_id=<agentSessionId>`) →
+    `agent:<ns>:linear:dm:<issueId>:<agentSessionId>`
+
+  Probe output: `agent:main:linear:dm:ISSUE-UUID:1` and
+  `agent:main:linear:dm:ISSUE-UUID:agentSession-9`. Delegated and mention keys could collide only if
+  an agentSessionId equalled a generation integer, and agentSessionIds are UUIDs. `shared_session` is moot for
+  `dm`, and `build_source` cannot set it anyway. `SessionSource` is not in the public API
+  (`hermes_cli/data/plugin_api.json`).
+- `GATEWAY_ALLOWED_USERS` is an env allowlist too. If it is set, the own-policy branch is skipped
+  even while `LINEAR_ALLOWED_USERS` is empty (`authz_mixin.py:788-798`). The adapter's resolved ids
+  are merged only `if platform_allowlist`, so they are not consulted either
+  (`authz_mixin.py:811-818`). Email-only and settings-only Linear users are then denied, and only
+  literal UUIDs in `GATEWAY_ALLOWED_USERS` pass. This fails closed. The adapter logs a warning at
+  `connect()` when `GATEWAY_ALLOWED_USERS` is set and `LINEAR_ALLOWED_USERS` is not. Setup docs tell
+  operators who use the global list to also set `LINEAR_ALLOWED_USERS` (one listed UUID is
+  enough to enable the resolver union).
+- Side effect of `chat_type="dm"`: a denied sender is "pairable", so `_get_unauthorized_dm_behavior`
+  runs (`gateway/run_inbound.py:234-244`). With `dm_policy="allowlist"` the default is `ignore`
+  (`authz_mixin.py:853-854`). An explicit per-platform `unauthorized_dm_behavior`, or any global
+  value other than `pair`, wins first (`authz_mixin.py:836-844`). `decline` would then post the
+  decline text, and `pair` a pairing code, through `adapter.send(chat_id, text)` with no `reply_to`
+  and no metadata (`run_inbound.py:80-131`). Those sends resolve to no Linear session and are dropped
+  (Q1 rule).
 
 Decision: fallback — admit email/settings-only entries through `resolved_allowlist_user_ids()` (consulted when `LINEAR_ALLOWED_USERS` is set) plus `OwnAccessPolicyMixin` allowlist (consulted when it is not), with `chat_type="dm"` on every source
 
@@ -167,8 +226,12 @@ default?
 **Answer.** No. The gateway default is **interrupt**.
 
 - `gateway/run.py:3332-3333` `_busy_input_mode = _busy_text_mode = "interrupt"`.
-  `gateway/run_config_loaders.py:311-341`: only `display.busy_input_mode` (per profile, not per
-  platform) changes it. Probe `probe_busy_mode.py`: `_busy_modes_from_config({})` →
+  `gateway/run_runtime_init.py:16-17` then loads the process-wide modes from
+  `HERMES_GATEWAY_BUSY_INPUT_MODE` (env wins over `display.busy_input_mode`;
+  `gateway/run_config_loaders.py:310-314`), plus the legacy `HERMES_GATEWAY_BUSY_TEXT_MODE` /
+  `display.busy_text_mode` (`run_config_loaders.py:316-327`). Per-profile `display.busy_input_mode`
+  overrides that (`run_config_loaders.py:329-341,399`). None of these is per platform, and the adapter
+  cannot rely on any of them. Probe `probe_busy_mode.py`: `_busy_modes_from_config({})` →
   `('interrupt','interrupt')`.
 - With the shared runtime (always built: `gateway/run_runtime.py:198`), a non-command busy input
   skips the adapter's busy handler. `base.py:3982-3985` `_shared_runtime_owns_input` →
@@ -196,19 +259,34 @@ Decision: fallback — adapter-side per-session FIFO gated on `on_processing_com
 session's source interrupt the running turn, and does the gateway then emit a stop notice through
 `send()`?
 
-**Answer.** Yes for both, but the notice is fixed text with no partial output.
+**Answer.** Yes for both. The notice text varies by case and never carries partial output.
 
 - `/stop` is a command, so it bypasses the shared-runtime path (`base.py:3956-3958` requires
   `not event.get_command()`). `should_bypass_active_session` → `_dispatch_active_session_command`
   (`base.py:3996-4000`, `3892-3913`) runs the runner handler inline, sends its reply via
-  `_dispatch_inline_reply` (`base.py:3477-3490`), and then cancels the session task (pending
+  `_dispatch_inline_reply` (`base.py:3477-3492`), and then cancels the session task (pending
   input kept: `discard_pending=False`).
-- The runner's stop handler interrupts and clears the run and returns
-  `EphemeralReply(t("gateway.stop.stopped"))` (`gateway/run_busy.py:1181-1189`,
-  `gateway/slash_commands.py:430-460`). The text is `"⚡ Stopped. You can continue this session."`
-  (`locales/en.yaml:465`). With no running agent the reply is `"No active task to stop."`
-  (`en.yaml:466`). The plugin hook `agent_loop_stopped(session_key, platform, reason, …)` also
-  fires (`gateway/run_agent_cache.py:564-578`).
+- The runner's stop handler interrupts and clears the run (`gateway/run_busy.py:1181-1189`,
+  `gateway/slash_commands.py:430-496`). The plugin hook `agent_loop_stopped(session_key, platform,
+  reason, …)` also fires (`gateway/run_agent_cache.py:564-578`). The reply is one of these
+  (`locales/en.yaml:463-467`):
+  - `EphemeralReply(t("gateway.stop.stopped"))` "⚡ Stopped. You can continue this session." This
+    covers a running agent, a chat-scope/sibling run, or background delegations
+    (`slash_commands.py:455,478,485`).
+  - `EphemeralReply(t("gateway.stop.stopped_pending"))` when the agent was still a pending sentinel
+    (`slash_commands.py:449-452`).
+  - `EphemeralReply(t("gateway.stop.force_stopped_pending"))` from the runner's busy early intercept
+    on a pending sentinel (`gateway/run_inbound.py:825-828`).
+  - Plain `t("gateway.stop.no_active")` "No active task to stop." when nothing ran
+    (`slash_commands.py:496`).
+
+  The adapter must not match on text, only on `reply_to`.
+- `EphemeralReply` deletion: `_unwrap_ephemeral` keeps a TTL > 0 only when the adapter overrides
+  `delete_message` (`base.py:3463-3475`). `_dispatch_inline_reply` then schedules
+  `_schedule_ephemeral_delete` on the sent `message_id` (`base.py:3491-3492`). Contract: the adapter
+  **does not override `delete_message`** (base default `base.py:2652`), so the TTL is forced to 0 and
+  nothing tries to delete the Linear activity. The adapter task adds a test asserting
+  `LinearAdapter.delete_message is BasePlatformAdapter.delete_message`.
 - The notice arrives as `send(chat_id, text, reply_to=<stop event message_id>,
   metadata={…thread meta, "notify": True})`, with no `_interim_send`. The cancelled turn's own reply
   is never sent. Probe `probe_adapter.py`: handler saw `['first', '/stop']`; one send
@@ -345,9 +423,15 @@ timeouts reach the adapter?
 Contract:
 
 - `edit_message(chat_id, message_id, content, *, finalize=False) -> SendResult`: on an
-  `approval:<request_id>` id, post the expiry `thought`, clear the `pending_controls` row, and
-  return `SendResult(success=True, message_id=message_id)`. Any other id returns
-  `SendResult(success=False, error="Not supported")`.
+  `approval:<request_id>` id, post the adapter's **own** expiry `thought` (fixed text, e.g. "Approval
+  timed out; the command was not run."), clear the `pending_controls` row, and return
+  `SendResult(success=True, message_id=message_id)`. It never posts or echoes `content`. That body is
+  `_timed_out_card_body`, which is the localized notice plus the flagged reason (capped at 500) and
+  the redacted command in a code fence (`gateway/run_turn_runner_approval_settle.py:83-96`,
+  `locales/en.yaml:624`). Echoing it would re-publish the command into the ticket. Any other id
+  returns `SendResult(success=False, error="Not supported")`. This override coexists with
+  `SUPPORTS_MESSAGE_EDITING = False` (Q1): `_edit_card` calls it without reading the flag
+  (`approval_settle.py:99-110`).
 - `async def retire_clarify_card(self, clarify_id, notice)`: if the row is still pending, post the
   expiry `thought` and clear it.
 
