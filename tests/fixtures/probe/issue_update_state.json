@@ -1,0 +1,88 @@
+{
+  "action": "update",
+  "actor": {
+    "id": "00000000-0000-4000-8000-000000000006",
+    "name": "Test User",
+    "email": "user2@example.com",
+    "avatarUrl": "https://public.linear.app/00000000-0000-4000-8000-000000000006/00000000-0000-4000-8000-000000000009",
+    "url": "https://linear.app/example-workspace/profiles/testuser",
+    "type": "user"
+  },
+  "createdAt": "2026-11-21T21:00:51.807Z",
+  "updatedFrom": {
+    "updatedAt": "2026-11-21T21:00:32.222Z",
+    "sortOrder": -26058,
+    "startedAt": null,
+    "stateId": "00000000-0000-4000-8000-000000000016"
+  },
+  "url": "https://linear.app/example-workspace/issue/RET-62/second-test-ticket-for-neo",
+  "type": "Issue",
+  "organizationId": "00000000-0000-4000-8000-000000000003",
+  "data": {
+    "id": "00000000-0000-4000-8000-000000000021",
+    "createdAt": "2026-11-21T21:00:32.222Z",
+    "updatedAt": "2026-11-21T21:00:51.806Z",
+    "number": 62,
+    "title": "Second test ticket for neo",
+    "priority": 0,
+    "sortOrder": -3956.59,
+    "prioritySortOrder": -26018.76,
+    "startedAt": "2026-11-21T21:00:51.799Z",
+    "slaType": "all",
+    "addedToProjectAt": "2026-11-21T21:00:32.255Z",
+    "addedToTeamAt": "2026-11-21T21:00:32.255Z",
+    "labelIds": [],
+    "teamId": "00000000-0000-4000-8000-000000000007",
+    "projectId": "00000000-0000-4000-8000-000000000004",
+    "previousIdentifiers": [],
+    "creatorId": "00000000-0000-4000-8000-000000000006",
+    "assigneeId": "00000000-0000-4000-8000-000000000006",
+    "delegateId": "00000000-0000-4000-8000-000000000001",
+    "stateId": "00000000-0000-4000-8000-000000000023",
+    "reactionData": [],
+    "priorityLabel": "No priority",
+    "inheritsSharedAccess": false,
+    "botActor": null,
+    "identifier": "RET-62",
+    "url": "https://linear.app/example-workspace/issue/RET-62/second-test-ticket-for-neo",
+    "subscriberIds": [
+      "00000000-0000-4000-8000-000000000006",
+      "00000000-0000-4000-8000-000000000001"
+    ],
+    "assignee": {
+      "id": "00000000-0000-4000-8000-000000000006",
+      "name": "Test User",
+      "email": "user2@example.com",
+      "avatarUrl": "https://public.linear.app/00000000-0000-4000-8000-000000000006/00000000-0000-4000-8000-000000000009",
+      "url": "https://linear.app/example-workspace/profiles/testuser"
+    },
+    "delegate": {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "Hermes Test",
+      "email": "user1@example.com",
+      "url": "https://linear.app/example-workspace/profiles/hermestest"
+    },
+    "project": {
+      "id": "00000000-0000-4000-8000-000000000004",
+      "name": "Valkyrie",
+      "url": "https://linear.app/example-workspace/project/valkyrie-ccc0934644b5"
+    },
+    "state": {
+      "id": "00000000-0000-4000-8000-000000000023",
+      "color": "#f2c94c",
+      "name": "In Progress",
+      "type": "started"
+    },
+    "team": {
+      "id": "00000000-0000-4000-8000-000000000007",
+      "key": "RET",
+      "name": "Example Team"
+    },
+    "labels": [],
+    "releases": [],
+    "description": "",
+    "descriptionData": "{\"type\":\"doc\",\"content\":[{\"type\":\"paragraph\"}]}"
+  },
+  "webhookTimestamp": 1795294852080,
+  "webhookId": "00000000-0000-4000-8000-000000000008"
+}

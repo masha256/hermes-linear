@@ -1,0 +1,70 @@
+name: linear
+label: Linear
+kind: platform
+version: 0.1.0
+description: >
+  Linear channel for Hermes Agent. Receives Linear agent-session and
+  workspace webhooks on a shared listener and runs one Hermes session per
+  delegated ticket, reporting progress back as Linear agent activities.
+author: masha256
+requires_env:
+  - name: LINEAR_CLIENT_SECRET
+    description: "Linear OAuth app client secret (used for client-credentials tokens)"
+    prompt: "Linear client secret"
+    url: "https://linear.app/settings/api/applications"
+    password: true
+  - name: LINEAR_WEBHOOK_SECRET
+    description: "Linear app webhook signing secret (HMAC-SHA256 verification)"
+    prompt: "Linear webhook signing secret"
+    url: "https://linear.app/settings/api/applications"
+    password: true
+optional_env:
+  - name: LINEAR_ALLOWED_USERS
+    description: "Comma-separated Linear user UUIDs or emails allowed to drive the agent (* = anyone)"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: LINEAR_ALLOW_ALL_USERS
+    description: "Allow any Linear workspace member to drive the agent (true/false)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+config_schema:
+  client_id:
+    type: str
+    required: true
+    label: "Client ID"
+    description: "Linear OAuth app client id"
+  client_secret:
+    type: secret
+    env: LINEAR_CLIENT_SECRET
+    label: "Client secret"
+    description: "Linear OAuth app client secret"
+  webhook_secret:
+    type: secret
+    env: LINEAR_WEBHOOK_SECRET
+    label: "Webhook secret"
+    description: "Linear app webhook signing secret"
+  allowed_users:
+    type: list
+    default: []
+    description: "User UUIDs, emails, or *; list or comma-separated string. Union with LINEAR_ALLOWED_USERS"
+  allow_all_users:
+    type: bool
+    default: false
+    description: "Allow every workspace member (LINEAR_ALLOW_ALL_USERS=true also honoured)"
+  auto_start:
+    type: bool
+    default: true
+    description: "Start the agent automatically when a ticket is delegated"
+  session_url:
+    type: str
+    default: ""
+    label: "Session URL"
+    description: "Template with {session_id} for the Linear \"Open\" link"
+  listener_host:
+    type: str
+    default: "127.0.0.1"
+    description: "Webhook listener bind host (process-wide; read from the default profile only)"
+  listener_port:
+    type: int
+    default: 8650
+    description: "Webhook listener port (process-wide; read from the default profile only)"

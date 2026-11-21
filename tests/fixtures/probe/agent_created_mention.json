@@ -1,0 +1,113 @@
+{
+  "type": "AgentSessionEvent",
+  "action": "created",
+  "createdAt": "2026-11-21T20:56:05.200Z",
+  "organizationId": "00000000-0000-4000-8000-000000000003",
+  "oauthClientId": "00000000000000000000000000000001",
+  "appUserId": "00000000-0000-4000-8000-000000000001",
+  "agentSession": {
+    "id": "00000000-0000-4000-8000-000000000012",
+    "createdAt": "2026-11-21T20:56:04.853Z",
+    "updatedAt": "2026-11-21T20:56:04.853Z",
+    "archivedAt": null,
+    "creatorId": "00000000-0000-4000-8000-000000000006",
+    "appUserId": "00000000-0000-4000-8000-000000000001",
+    "commentId": "00000000-0000-4000-8000-000000000010",
+    "sourceCommentId": null,
+    "issueId": "00000000-0000-4000-8000-000000000011",
+    "pullRequestId": null,
+    "slugId": "2247dfd409183",
+    "status": "pending",
+    "startedAt": null,
+    "endedAt": null,
+    "lastAgentReplyAt": null,
+    "dismissedAt": null,
+    "dismissedById": null,
+    "externalLink": null,
+    "summary": null,
+    "sourceMetadata": {
+      "type": "comment",
+      "agentSessionMetadata": {
+        "sourceCommentId": "00000000-0000-4000-8000-000000000010"
+      }
+    },
+    "modelSelection": null,
+    "plan": null,
+    "workspaceDiff": null,
+    "context": [],
+    "url": "https://linear.app/example-workspace/agent-session/00000000-0000-4000-8000-000000000012",
+    "externalUrls": [],
+    "organizationId": "00000000-0000-4000-8000-000000000003",
+    "creator": {
+      "id": "00000000-0000-4000-8000-000000000006",
+      "name": "Test User",
+      "email": "user2@example.com",
+      "avatarUrl": "https://public.linear.app/00000000-0000-4000-8000-000000000006/00000000-0000-4000-8000-000000000009",
+      "url": "https://linear.app/example-workspace/profiles/testuser"
+    },
+    "comment": {
+      "id": "00000000-0000-4000-8000-000000000010",
+      "body": "@hermestest this is a top-level comment",
+      "userId": "00000000-0000-4000-8000-000000000006",
+      "issueId": "00000000-0000-4000-8000-000000000011"
+    },
+    "issue": {
+      "id": "00000000-0000-4000-8000-000000000011",
+      "title": "Test ticket for neo",
+      "teamId": "00000000-0000-4000-8000-000000000007",
+      "team": {
+        "id": "00000000-0000-4000-8000-000000000007",
+        "key": "RET",
+        "name": "Example Team"
+      },
+      "identifier": "RET-61",
+      "url": "https://linear.app/example-workspace/issue/RET-61/test-ticket-for-neo",
+      "description": ""
+    }
+  },
+  "agentActivity": {
+    "id": "00000000-0000-4000-8000-000000000013",
+    "createdAt": "2026-11-21T20:56:04.853Z",
+    "updatedAt": "2026-11-21T20:56:04.853Z",
+    "archivedAt": null,
+    "agentSessionId": "00000000-0000-4000-8000-000000000012",
+    "sourceCommentId": "00000000-0000-4000-8000-000000000010",
+    "userId": "00000000-0000-4000-8000-000000000006",
+    "sourceMetadata": {
+      "type": "comment",
+      "agentSessionMetadata": {
+        "sourceCommentId": "00000000-0000-4000-8000-000000000010"
+      }
+    },
+    "executionSkippedReason": null,
+    "signal": null,
+    "ephemeral": false,
+    "pushSummary": null,
+    "queued": false,
+    "sentAt": null,
+    "signalMetadata": null,
+    "content": {
+      "type": "prompt",
+      "body": "@hermestest this is a top-level comment"
+    },
+    "user": {
+      "id": "00000000-0000-4000-8000-000000000006",
+      "name": "Test User",
+      "email": "user2@example.com",
+      "avatarUrl": "https://public.linear.app/00000000-0000-4000-8000-000000000006/00000000-0000-4000-8000-000000000009",
+      "url": "https://linear.app/example-workspace/profiles/testuser"
+    }
+  },
+  "previousComments": [
+    {
+      "id": "00000000-0000-4000-8000-000000000010",
+      "body": "@hermestest this is a top-level comment",
+      "userId": "00000000-0000-4000-8000-000000000006",
+      "issueId": "00000000-0000-4000-8000-000000000011"
+    }
+  ],
+  "guidance": null,
+  "promptContext": "<issue identifier=\"RET-61\">\n<title>Test ticket for neo</title>\n<team name=\"Example Team\"/>\n<project name=\"Valkyrie\">Hermes Linear channel plugin: one Hermes session per delegated ticket.</project>\n</issue>\n\n<primary-directive-thread comment-id=\"00000000-0000-4000-8000-000000000010\"><comment author=\"Test User\" created-at=\"2026-11-21T20:56:04.672Z\"><user id=\"00000000-0000-4000-8000-000000000001\" label=\"hermestest\" notify /> this is a top-level comment</comment></primary-directive-thread>\n\n<user-request>\n@hermestest this is a top-level comment\n</user-request>",
+  "webhookTimestamp": 1795294565211,
+  "webhookId": "00000000-0000-4000-8000-000000000008"
+}
