@@ -1,0 +1,70 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 14 * * 1"   # Mondays: also test against hermes-agent main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest + validate (hermes-agent ${{ matrix.hermes.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: ${{ matrix.hermes.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes:
+          # Pinned: the Hermes commit the plugin was last verified against.
+          # Bump deliberately after checking the plugin API notes.
+          - { name: pinned, ref: 3b421578588243f920886e6fe79a6faa87ea026e, experimental: false }
+          # Early warning for public plugin-API drift; never blocks a merge.
+          - { name: main, ref: main, experimental: true }
+    steps:
+      - name: Check out plugin
+        uses: actions/checkout@v4
+        with:
+          path: plugin
+
+      - name: Check out hermes-agent
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes.ref }}
+          path: hermes-agent
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: hermes-agent/uv.lock
+
+      # Hermes pins its dependencies for Python 3.14; the plugin's runtime
+      # deps (aiohttp) come from the `messaging` extra.
+      - name: Install hermes-agent (locked)
+        working-directory: hermes-agent
+        run: uv sync --frozen --python 3.14 --extra messaging
+
+      - name: Install plugin + test tools
+        run: |
+          uv pip install --python hermes-agent/.venv/bin/python -e ./plugin pytest pytest-asyncio pyyaml
+
+      - name: pytest
+        working-directory: plugin
+        run: ../hermes-agent/.venv/bin/python -m pytest -q -rs
+
+      - name: hermes plugins validate
+        working-directory: plugin
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: ../hermes-agent/.venv/bin/hermes plugins validate .
