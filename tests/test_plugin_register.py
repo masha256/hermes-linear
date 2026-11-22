@@ -585,6 +585,25 @@ def test_test_event_delivery_id_carries_test_prefix():
 # ------------------------------------------------------------------ status
 
 
+def test_plugin_revision_reads_git_checkout(tmp_path, monkeypatch):
+    import subprocess
+
+    # tmp_path may sit inside another repo (e.g. a profile dir under git).
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+
+    assert setup_cli.plugin_revision(str(tmp_path)) is None  # not a checkout
+    run = lambda *a: subprocess.run(["git", "-C", str(tmp_path), *a], check=True,
+                                    capture_output=True)
+    run("init", "-q", "-b", "main")
+    (tmp_path / "f").write_text("x")
+    run("add", "f")
+    run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "first commit")
+    rev = setup_cli.plugin_revision(str(tmp_path))
+    assert rev.endswith(" first commit (main)") and len(rev.split()[0]) >= 7
+    run("switch", "-q", "--detach", "HEAD")
+    assert setup_cli.plugin_revision(str(tmp_path)).endswith("(detached)")
+
+
 def test_store_last_event_at():
     store = Store.open(":memory:")
     assert store.last_event_at() is None
