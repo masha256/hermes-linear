@@ -730,6 +730,10 @@ class Store:
 
         return self._write(go)
 
+    def drop_all_grants(self) -> None:
+        """Delete every grant (restart sweep: a grant never outlives its gateway process)."""
+        self._write(lambda: self.conn.execute("DELETE FROM approval_grants"))
+
     def drop_grants_for_turn(self, turn_mid: str) -> None:
         self._write(lambda: self.conn.execute(
             "DELETE FROM approval_grants WHERE turn_mid = ?", (turn_mid,)))

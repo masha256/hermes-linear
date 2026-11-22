@@ -390,3 +390,11 @@ def test_grant_not_offered_stays(store):
     assert store.take_grant("K", "c", offered=["deny"]) is None
     assert store.take_grant("K", "c", offered=["once", "deny"]) == ("once", "u1")
     assert store.take_grant("K", "c") is None
+
+
+def test_drop_all_grants(store):
+    store.put_grant("K", "c", "once", "u1", "m1")
+    store.put_grant("K2", "d", "always", "u2", "m2")
+    store.drop_all_grants()
+    assert store.take_grant("K", "c") is None and store.take_grant("K2", "d") is None
+    store.drop_all_grants()  # idempotent on an empty table

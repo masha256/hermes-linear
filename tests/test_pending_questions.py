@@ -19,15 +19,17 @@ from test_adapter_inbound import (
     deliver, prompted,
 )
 from test_adapter_outbound import (  # noqa: F401  (fixtures)
-    D_CHAT, approval_prompt, env, session_env, settle,
+    D_CHAT, approval_prompt, env, new_adapter, session_env, settle,
 )
 
+from hermes_linear import adapter as adapter_mod
 from hermes_linear import hooks
 from hermes_linear import outbound as outbound_mod
 from hermes_linear import questions
 from hermes_linear import sessions_open as sessions_open_mod
 from hermes_linear.models import SetMode
 from hermes_linear.router import message_id
+from hermes_linear.store import Store
 
 META = {"thread_id": None}
 BLOCKED = "lb-blocked"
@@ -790,3 +792,128 @@ async def test_grant_dropped_at_turn_end(env, session_env):
     await settle(a)
     assert store.take_grant("K", "ls") is None
     assert _grants(store) == [("K", RM, "once", "u1", "another-turn")]
+
+
+# ----------------------------------------------- T9: restart sweep at connect (spec §8)
+
+
+async def _before_restart(tmp_path, session_env, setup):
+    """A first gateway process: delegation, then ``setup(a, client, gw, store)``; then it dies."""
+    db = tmp_path / "linear.db"
+    a, client, gw, _, _ = new_adapter()
+    a._store = Store.open(db)
+    assert await a.connect()
+    await _delegated(a, gw, session_env)
+    await setup(a, client, gw, a._store)
+    await a.disconnect()  # closes the store; the Hermes waiters die with the process
+    return db
+
+
+async def _after_restart(db, *, new_process=True, is_reconnect=False):
+    if new_process:
+        adapter_mod._SWEPT_PROFILES.clear()
+    a, client, gw, _, _ = new_adapter()
+    a._store = Store.open(db)
+    assert await a.connect(is_reconnect=is_reconnect)
+    await settle(a)
+    return a, client, gw, a._store
+
+
+async def _live_clarify(a, client, gw, store):
+    await _clarify(a, client)
+    assert store.control("clar-1").state == "live"
+
+
+async def test_connect_marks_live_rows_pending(tmp_path, session_env):
+    db = await _before_restart(tmp_path, session_env, _live_clarify)
+    a, client, gw, store = await _after_restart(db)
+    try:
+        row = store.control("clar-1")
+        assert row.state == "pending" and row.ticket_id == D_ISSUE
+        assert row.question == "Which env?"
+        assert _added(client) == [(D_ISSUE, [BLOCKED])]  # one label write
+        assert client.activities == []  # nothing posted
+    finally:
+        await a.disconnect()
+
+
+async def test_restart_sweep_clears_grants(tmp_path, session_env):
+    async def setup(a, client, gw, store):
+        store.put_grant("K", RM, "once", "u1", "answer-mid")
+
+    db = await _before_restart(tmp_path, session_env, setup)
+    a, client, gw, store = await _after_restart(db)
+    try:
+        assert _grants(store) == []
+    finally:
+        await a.disconnect()
+
+
+async def test_restart_drops_live_row_without_question(tmp_path, session_env, caplog):
+    async def setup(a, client, gw, store):
+        # A row written by pre-RET-94 code: no question text, so it cannot be framed.
+        store.put_control("old-1", "clarify", D_SID, 1, ["a", "b"], session_key="sk")
+
+    db = await _before_restart(tmp_path, session_env, setup)
+    with caplog.at_level(logging.INFO, logger="hermes_linear.adapter"):
+        a, client, gw, store = await _after_restart(db)
+    try:
+        assert store.control("old-1") is None
+        assert client.issue_updates == [] and client.activities == []
+        assert any("old-1" in r.getMessage() for r in caplog.records)
+    finally:
+        await a.disconnect()
+
+
+async def test_reconnect_leaves_live_rows_live(tmp_path, session_env):
+    """In the same process the Hermes waiters are still alive: a reconnect must not orphan them."""
+    async def setup(a, client, gw, store):
+        await _live_clarify(a, client, gw, store)
+        store.put_grant("K", RM, "once", "u1", "answer-mid")
+
+    db = await _before_restart(tmp_path, session_env, setup)
+    a, client, gw, store = await _after_restart(db, new_process=False, is_reconnect=True)
+    try:
+        assert store.control("clar-1").state == "live"
+        assert len(_grants(store)) == 1
+        assert client.issue_updates == []
+    finally:
+        await a.disconnect()
+
+
+async def test_first_connect_of_process_sweeps_even_as_reconnect(tmp_path, session_env):
+    """The cold-boot connect failed before the store opened; the watcher's reconnect is the
+    process's first real connect and must sweep (no waiter of this process can exist)."""
+    db = await _before_restart(tmp_path, session_env, _live_clarify)
+    a, client, gw, store = await _after_restart(db, is_reconnect=True)
+    try:
+        assert store.control("clar-1").state == "pending"
+    finally:
+        await a.disconnect()
+
+
+async def test_restart_then_answer(tmp_path, session_env):
+    """Review Focus 3: after the sweep the answer starts the framed turn, and a later
+    response re-posts nothing (the row is gone)."""
+    db = await _before_restart(tmp_path, session_env, _live_clarify)
+    a, client, gw, store = await _after_restart(db)
+    try:
+        await deliver(a, prompted(D_SID, D_ISSUE, "staging", "act-ans"))
+        await settle(a)
+        assert len(gw.events) == 1
+        ev = gw.events[0]
+        assert ev.text.endswith('Answer to "Which env?": staging')
+        assert ev.message_id == message_id(D_SID, "act-ans")
+        assert store.control("clar-1") is None
+        assert _removed(client) == [(D_ISSUE, [BLOCKED])]
+        session_env(platform="linear", message_id=ev.message_id, chat_id=D_CHAT)
+        before = len(client.activities)
+        r = await a.send(D_CHAT, "Deploying to staging.", metadata=META)
+        await complete(a, ev)
+        await settle(a)
+        assert r.success
+        acts = _session_acts(client)[-1:]
+        assert acts[0][:2] == ("response", "Deploying to staging.")
+        assert not any(c["type"] == "elicitation" for _, c, *_ in client.activities[before:])
+    finally:
+        await a.disconnect()
