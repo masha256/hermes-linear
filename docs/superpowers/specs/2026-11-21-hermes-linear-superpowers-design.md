@@ -150,10 +150,16 @@ where hermes-linear is enabled. It is an overlay: it tells the agent to load the
 superpowers skill for each stage and lists only the differences in §3. It never
 edits superpowers itself.
 
-- **Description:** "Use when a Linear ticket says 'manage with hermes-linear', or
-  when working in a repo that has `.hermes-linear.yaml`."
-- **Platform hint:** the plugin's Linear platform hint gains one line: "If the repo
-  has `.hermes-linear.yaml`, load `linear:manage-superpowers` first."
+- **Description:** "Use when a repo has .hermes-linear.yaml or ticket says so."
+  The skill index cuts descriptions at 60 characters, so the trigger phrase
+  "manage with hermes-linear" lives in the platform hint and the skill body.
+- **Tool calls:** the `linear_*` tools are deferred behind tool search, so the skill
+  tells the agent to load them with `tool_describe` and call them with `tool_call`.
+  The skill is never gated on tools or toolsets, since a skill gated on deferred
+  tools would be hidden.
+- **Platform hint:** the plugin's Linear platform hint gains one line: "If the ticket
+  says 'manage with hermes-linear', or the repo has `.hermes-linear.yaml`, load
+  `linear:manage-superpowers` first."
 - **Rule:** Linear descriptions and plan comments are written only through the sync
   tools. To fix something in them, fix the file and sync again.
 

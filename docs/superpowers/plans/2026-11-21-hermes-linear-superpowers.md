@@ -359,8 +359,9 @@ This task also covers the RET-82 scope (project setup), which was canceled into 
     for each of the 7 tools, and
     `ctx.register_skill("manage-superpowers", <path>, description)`.
   - `plugin.yaml` gains `provides_tools`.
-  - `PLATFORM_HINT` gains this sentence, verbatim: "If the repo has
-    `.hermes-linear.yaml`, load `linear:manage-superpowers` first."
+  - `PLATFORM_HINT` gains this sentence, verbatim: "If the ticket says 'manage
+    with hermes-linear', or the repo has `.hermes-linear.yaml`, load
+    `linear:manage-superpowers` first."
 
 The SKILL.md frontmatter description, verbatim (58 chars; the skill index clips at
 60): "Use when a repo has .hermes-linear.yaml or ticket says so." The frontmatter
