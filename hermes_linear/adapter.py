@@ -106,8 +106,6 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._writer: renderer.ActivityWriter | None = None  # responses (degraded, §8.6)
         self._activity_writer: renderer.ActivityWriter | None = None  # thoughts, actions, …
         self.event_loop: asyncio.AbstractEventLoop | None = None  # for hooks.py, agent_tools.py
-        # Issue ids each gateway session created through agent tools (write scope, RET-80).
-        self.tool_created: dict[str, set[str]] = {}
         self._ack_writer: renderer.ActivityWriter | None = None  # acks, refusals, control replies
         self.delegation_wait_s: float | None = None  # override of AwaitDelegation.deadline_s
         self.turns = TurnEngine(  # callables late-bound: tests replace handle_message etc.
@@ -119,8 +117,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             session_key_of=self._base_session_key, base_owns=self._base_owns,
             base_busy=lambda sk: sk in getattr(self, "_active_sessions", {}),
             on_stop_unsettled=lambda t: self.outbound.stop_unsettled(t),
-            on_safety_expired=lambda t: self.outbound.safety_expired(t),
-            on_drained=lambda: self._forget_tool_created())
+            on_safety_expired=lambda t: self.outbound.safety_expired(t))
         self.opener = SessionOpener(
             store=lambda: self._store, client=lambda: self._client,
             settings=lambda: self._settings, post_ack=self._post_ack,
@@ -328,7 +325,6 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._store = None
         self.turns.reset()
         self.outbound.reset()
-        self.tool_created.clear()
         self.event_loop = None
         self._mark_disconnected()
 
@@ -499,10 +495,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         elif isinstance(d, Interrupt):
             # Drop pending questions first: the stop's own response must not re-post them.
             self.opener.drop_pending(self._session_controls(d.agent_session_id))
-            try:
-                self.turns.interrupt(d.agent_session_id)
-            finally:
-                self._forget_tool_created()  # dropped/freed turns may have been a session's last
+            self.turns.interrupt(d.agent_session_id)
         elif isinstance(d, Refuse):
             await self._post_ack(d.agent_session_id, renderer.error(d.text))
         elif isinstance(d, Reply):
@@ -568,19 +561,6 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 self.outbound.turn_finished(found, outcome)  # stop reply, fallback, heartbeat
             finally:
                 self.turns.complete(found)  # releases after this base task ends (Q5)
-                self._forget_tool_created(found[1] if found else None)
-
-    def _forget_tool_created(self, finished: Any = None) -> None:
-        """Gateway sessions with no turn left lose their tool-created issues (write scope).
-
-        ``tool_created`` is keyed by gateway session key, which several Linear keys (chat,
-        thread) can share, so a set is kept while ANY in-flight, draining or queued turn of
-        that session remains (``TurnEngine.has_session_turns``). ``finished`` is the turn
-        completing right now (already drained, so not counted).
-        """
-        for session_key in list(self.tool_created):
-            if not self.turns.has_session_turns(session_key, exclude=finished):
-                self.tool_created.pop(session_key, None)
 
     async def _fatal(self, reason: str) -> None:
         log.error("linear: fatal: %s", reason)

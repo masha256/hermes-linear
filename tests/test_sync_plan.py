@@ -17,6 +17,7 @@ from fake_workspace import HUMAN, VIEWER, FakeWorkspace, normalize_markdown
 from test_agent_tools_runtime import new_adapter
 
 from hermes_linear import agent_tools, sync
+from hermes_linear.store import Store
 from hermes_linear.agent_tools import TOOL_HANDLERS, TOOL_SCHEMAS, linear_sync_plan
 from hermes_linear.linear_client import LinearClient
 from hermes_linear.sync import (PLAN_COMMENT_MAX, TASK_DESC_MAX, PlanTask, footer, parse_plan,
@@ -91,7 +92,7 @@ def ws():
 
 @pytest.fixture
 def adapter(loop, ws):
-    return new_adapter(loop, client=ws)
+    return new_adapter(loop, client=ws, store=Store.open(":memory:"))
 
 
 @pytest.fixture
@@ -265,7 +266,7 @@ def test_sync_creates_children_in_order(pin_ctx, ws, plan, adapter):
     creates = [c[1] for c in ws.writes() if c[0] == "issue_create"]
     assert [c["subIssueSortOrder"] for c in creates] == [10, 20, 30]
     assert all(c["parentId"] == SELF for c in creates)
-    assert adapter.tool_created["sk"] >= {k["id"] for k in kids}  # UUIDs, on the loop
+    assert adapter._store.created_by(SELF) >= {k["id"] for k in kids}  # UUIDs
     text = plan.read_text(encoding="utf-8")
     assert text == write_ticket_ids(PLAN, {1: ids[0], 2: ids[1], 3: ids[2]})
     assert [t.ticket for t in parse_plan(text)] == ids

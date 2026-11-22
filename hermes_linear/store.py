@@ -133,6 +133,15 @@ CREATE TABLE IF NOT EXISTS labels (
     label_id TEXT PRIMARY KEY,
     name     TEXT NOT NULL
 );
+
+-- Issues the agent tools created, by the session ticket they were created from (RET-110):
+-- part of that ticket's write scope for good, across turns and restarts.
+CREATE TABLE IF NOT EXISTS created_issues (
+    issue_id       TEXT PRIMARY KEY,
+    owner_issue_id TEXT NOT NULL,
+    created_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS created_owner ON created_issues(owner_issue_id);
 """
 
 # Columns added to ``pending_controls`` after release; migrated in ``Store.__init__``.
@@ -746,6 +755,18 @@ class Store:
             "DELETE FROM approval_grants WHERE turn_mid = ?", (turn_mid,)))
 
     # name caches ---------------------------------------------------------
+
+    def record_created(self, owner_issue_id: str, issue_id: str) -> None:
+        """Record ``issue_id`` (a UUID) as created from session ticket ``owner_issue_id``."""
+        self._write(lambda: self.conn.execute(
+            "INSERT OR IGNORE INTO created_issues(issue_id, owner_issue_id, created_at) "
+            "VALUES (?, ?, ?)", (issue_id, owner_issue_id, time.time())))
+
+    def created_by(self, owner_issue_id: str) -> set[str]:
+        """UUIDs of the issues the agent tools created from session ticket ``owner_issue_id``."""
+        rows = self._all("SELECT issue_id FROM created_issues WHERE owner_issue_id = ?",
+                         (owner_issue_id,))
+        return {r["issue_id"] for r in rows}
 
     def cache_state(self, state_id: str, name: str) -> None:
         self._write(lambda: self.conn.execute(
