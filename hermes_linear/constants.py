@@ -14,6 +14,7 @@ SNAPSHOT_DESCRIPTION = 2_000
 RESULT_PREVIEW = 500
 USER_CACHE_TTL_S = 3_600
 TOKEN_RENEW_MARGIN_S = 86_400
+TEST_WEBHOOK_PREFIX = "hermes-linear-test-"  # webhookId prefix of `hermes linear test` probes
 WRITE_RETRIES = 3
 ACK_TIMEOUT_S = 8  # Linear calls on the event worker must finish inside Linear's 10 s window
 TURN_SAFETY_TIMEOUT_S = 3 * 3600  # a handed-off turn that never completes frees its FIFO

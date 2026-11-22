@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
-from .constants import DEDUP_TTL_S, MAX_PENDING_ITEMS, USER_CACHE_TTL_S
+from .constants import DEDUP_TTL_S, MAX_PENDING_ITEMS, TEST_WEBHOOK_PREFIX, USER_CACHE_TTL_S
 from .models import ContextItem
 
 SCHEMA_VERSION = 1
@@ -635,6 +635,15 @@ class Store:
         """Receive time of the newest webhook still in the dedup window (``hermes linear status``)."""
         with self._lock:
             r = self.conn.execute("SELECT MAX(at) FROM seen_webhooks").fetchone()
+        return None if r is None or r[0] is None else float(r[0])
+
+    def last_real_event_at(self) -> float | None:
+        """Like ``last_event_at`` but ignoring ``hermes linear test`` probes: the newest
+        webhook Linear itself delivered."""
+        with self._lock:
+            r = self.conn.execute(
+                "SELECT MAX(at) FROM seen_webhooks WHERE substr(webhook_id, 1, ?) != ?",
+                (len(TEST_WEBHOOK_PREFIX), TEST_WEBHOOK_PREFIX)).fetchone()
         return None if r is None or r[0] is None else float(r[0])
 
     # users ---------------------------------------------------------------

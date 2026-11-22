@@ -570,6 +570,16 @@ async def test_client_team_labels_pages(fake, client):
     assert [c.variables["after"] for c in fake.gql_calls("TeamLabels")] == [None, "cur-1"]
 
 
+async def test_client_viewer_teams_pages(fake, client):
+    fake.on("ViewerTeams",
+            {"data": {"viewer": {"teams": _page([{"id": "t1", "key": "ENG", "name": "Eng"}],
+                                                "cur-1")}}},
+            {"data": {"viewer": {"teams": _page([{"id": "t2", "key": "OPS", "name": "Ops"}])}}})
+    assert await client.viewer_teams() == [{"id": "t1", "key": "ENG", "name": "Eng"},
+                                           {"id": "t2", "key": "OPS", "name": "Ops"}]
+    assert [c.variables["after"] for c in fake.gql_calls("ViewerTeams")] == [None, "cur-1"]
+
+
 async def test_client_paging_stops_at_cap(fake, client):
     from hermes_linear.linear_client import QUERY_TEAM_LABELS
     n = iter(range(100))

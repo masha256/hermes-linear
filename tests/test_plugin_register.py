@@ -273,11 +273,28 @@ def test_skill_ships_as_package_data():
 
 
 class FakeClient:
-    def __init__(self, *, fail: Exception | None = None, expires_in: float = 30 * 86_400):
+    def __init__(self, *, fail: Exception | None = None, expires_in: float = 30 * 86_400,
+                 teams: list[dict] | None = None, labels: dict[str, list[dict]] | None = None,
+                 labels_fail: Exception | None = None):
         self.fail = fail
         self.expires_in = expires_in
         self.token_expires_at = None
         self.closed = False
+        self.teams = teams if teams is not None else [
+            {"id": "t1", "key": "ENG", "name": "Engineering"}]
+        self.labels = labels if labels is not None else {
+            "t1": [{"id": "l1", "name": "Blocked"}]}
+        self.labels_fail = labels_fail
+
+    async def viewer_teams(self):
+        if self.labels_fail:
+            raise self.labels_fail
+        return list(self.teams)
+
+    async def team_labels(self, team_id):
+        if self.closed:
+            raise AssertionError("team_labels after close")
+        return list(self.labels.get(team_id, []))
 
     async def token(self):
         if self.fail:
@@ -436,6 +453,43 @@ def test_setup_missing_client_id_nonzero_exit():
     assert h.saved == [] and h.clients_made == []
 
 
+BLOCKED_WARN = ('Team {key} has no "Blocked" label — create it in Linear (Settings → Labels) '
+                'so tasks can be marked blocked.')
+
+
+def test_setup_warns_missing_blocked_label():
+    client = FakeClient(
+        teams=[{"id": "t1", "key": "ENG", "name": "Engineering"},
+               {"id": "t2", "key": "OPS", "name": "Operations"},
+               {"id": "t3", "key": "RET", "name": "Retail"}],
+        labels={"t1": [{"id": "l1", "name": "Bug"}],
+                "t2": [{"id": "l2", "name": "blocked"}],  # case-insensitive match
+                "t3": [{"id": "l3", "name": "Bug"}, {"id": "w1", "name": "BLOCKED"}]})
+    h = Harness(answers=["", CLIENT_ID, UUID_A], hidden=[CLIENT_SECRET, WEBHOOK_SECRET],
+                client=client)
+    assert run_setup(h) == 0
+    assert BLOCKED_WARN.format(key="ENG") in h.lines
+    assert BLOCKED_WARN.format(key="OPS") not in h.text
+    assert BLOCKED_WARN.format(key="RET") not in h.text
+    assert client.closed
+
+
+def test_setup_no_blocked_warning_when_every_team_has_it():
+    h = Harness(answers=["", CLIENT_ID, UUID_A], hidden=[CLIENT_SECRET, WEBHOOK_SECRET])
+    assert run_setup(h) == 0
+    assert "has no \"Blocked\" label" not in h.text
+
+
+def test_setup_blocked_label_check_error_is_advisory():
+    client = FakeClient(labels_fail=LinearError("rate limited", code="RATELIMITED"))
+    h = Harness(answers=["", CLIENT_ID, UUID_A], hidden=[CLIENT_SECRET, WEBHOOK_SECRET],
+                client=client)
+    assert run_setup(h) == 0
+    warn = [ln for ln in h.lines if "Blocked" in ln]
+    assert len(warn) == 1 and warn[0].startswith("⚠") and "rate limited" in warn[0]
+    assert "Hermes Test" in h.text and client.closed
+
+
 # ------------------------------------------------------------------ test command
 
 
@@ -488,6 +542,37 @@ def test_store_last_event_at():
     store.seen_webhook("w1", 100.0)
     store.seen_webhook("w2", 250.0)
     assert store.last_event_at() == 250.0
+
+
+def test_last_real_event_ignores_test_probes():
+    store = Store.open(":memory:")
+    assert store.last_real_event_at() is None
+    store.seen_webhook(f"{setup_cli.TEST_WEBHOOK_PREFIX}probe-only", 50.0)
+    assert store.last_real_event_at() is None
+    store.seen_webhook("w1", 100.0)
+    store.seen_webhook(f"{setup_cli.TEST_WEBHOOK_PREFIX}abc", 300.0)
+    assert store.last_real_event_at() == 100.0
+    assert store.last_event_at() == 300.0
+
+
+def test_status_prints_last_linear_event():
+    now = time.time()
+    store = Store.open(":memory:")
+    store.seen_webhook("real-1", now - 7200)
+    store.seen_webhook(f"{setup_cli.TEST_WEBHOOK_PREFIX}x", now - 60)
+    h = _status_harness()
+    h.env.open_store = lambda: store
+    h.env.now = lambda: now
+    assert setup_cli.run_status(h.env) == 0
+    assert f"last event:    {setup_cli._fmt_ts(now - 60, now)}" in h.lines
+    assert f"last Linear event: {setup_cli._fmt_ts(now - 7200, now)}" in h.lines
+
+    probes_only = Store.open(":memory:")
+    probes_only.seen_webhook(f"{setup_cli.TEST_WEBHOOK_PREFIX}y", now - 60)
+    h2 = _status_harness()
+    h2.env.open_store = lambda: probes_only
+    setup_cli.run_status(h2.env)
+    assert "last Linear event: never" in h2.lines
 
 
 class FakeStatusAdapter:

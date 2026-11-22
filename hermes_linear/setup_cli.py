@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
+from .constants import TEST_WEBHOOK_PREFIX
 from .settings import (
     ALLOWED_USERS_ENV, CLIENT_SECRET_KEY, DEFAULT_LISTENER_HOST,
     DEFAULT_LISTENER_PORT, WEBHOOK_SECRET_KEY, SettingsError, load_scoped_settings,
@@ -39,7 +40,6 @@ WEBHOOK_CATEGORIES = (
 )
 FUNNEL_HTTPS_PORT = 8443
 SCOPES = "read, write, app:mentionable, app:assignable"
-TEST_WEBHOOK_PREFIX = "hermes-linear-test-"
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
@@ -145,6 +145,36 @@ async def _check_app(client) -> dict:
             await close()
 
 
+BLOCKED_LABEL = "Blocked"
+
+
+async def _missing_blocked(client) -> list[str]:
+    """Keys of the viewer's teams with no ``Blocked`` label (team or workspace, any case)."""
+    missing: list[str] = []
+    for team in await client.viewer_teams():
+        labels = await client.team_labels(team["id"])
+        if not any((lb.get("name") or "").strip().casefold() == BLOCKED_LABEL.casefold()
+                   for lb in labels):
+            missing.append(str(team.get("key") or team.get("name") or team["id"]))
+    return missing
+
+
+async def _check_setup(client) -> tuple[dict, list[str] | BaseException]:
+    """Token + viewer (raises on failure), then the advisory label check (error returned)."""
+    try:
+        await client.token()
+        viewer = await client.viewer()
+        try:
+            missing: list[str] | BaseException = await _missing_blocked(client)
+        except Exception as exc:  # noqa: BLE001 - advisory only
+            missing = exc
+        return viewer, missing
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            await close()
+
+
 def _viewer_text(viewer: Any) -> str:
     viewer = viewer or {}
     name = viewer.get("name") or "?"
@@ -231,7 +261,7 @@ def interactive_setup(ctx: Any = None, *, env: CliEnv | None = None) -> int:
     out("")
     out("Checking the app token and viewer…")
     try:
-        viewer = _run(_check_app(env.make_client(client_id, client_secret)))
+        viewer, missing = _run(_check_setup(env.make_client(client_id, client_secret)))
     except Exception as exc:  # noqa: BLE001
         out(f"✗ Linear check failed: {_err_text(exc)}")
         out("  Check the client ID/secret. If the app was never installed in this workspace,")
@@ -239,6 +269,12 @@ def interactive_setup(ctx: Any = None, *, env: CliEnv | None = None) -> int:
         out("  credentials work.")
         return 1
     out(f"✓ App user: {_viewer_text(viewer)}")
+    if isinstance(missing, BaseException):
+        out(f"⚠ Could not check team labels for \"{BLOCKED_LABEL}\": {_err_text(missing)}")
+    else:
+        for key in missing:
+            out(f"Team {key} has no \"{BLOCKED_LABEL}\" label — create it in Linear "
+                "(Settings → Labels) so tasks can be marked blocked.")
     out("Enable the platform for this profile and restart the gateway, then run")
     out(f"`hermes -p {env.profile} linear test` and `hermes -p {env.profile} linear status`.")
     return 0
@@ -301,14 +337,17 @@ def run_status(env: CliEnv) -> int:
         out(f"token:         FAILED: {_err_text(exc)}")
         out("app user:      unknown")
         rc = 1
-    last = None
+    last = last_real = None
     try:
         store = env.open_store()
-        last = store.last_event_at() if store is not None else None
+        if store is not None:
+            last = store.last_event_at()
+            last_real = store.last_real_event_at()
     except Exception as exc:  # noqa: BLE001
         out(f"last event:    unavailable ({type(exc).__name__})")
     else:
         out(f"last event:    {_fmt_ts(last, env.now())}")
+        out(f"last Linear event: {_fmt_ts(last_real, env.now())}")
     for line in _access_lines(settings):
         out(line)
     adapter = env.adapters.get(env.profile)
@@ -444,7 +483,7 @@ def default_env(ctx: Any) -> CliEnv:
 
 
 __all__ = [
-    "CliEnv", "FUNNEL_HTTPS_PORT", "WEBHOOK_CATEGORIES", "aiohttp_post", "default_env",
+    "BLOCKED_LABEL", "CliEnv", "FUNNEL_HTTPS_PORT", "TEST_WEBHOOK_PREFIX", "WEBHOOK_CATEGORIES", "aiohttp_post", "default_env",
     "funnel_command", "interactive_setup", "make_handler", "run_status", "run_test",
     "setup_parser", "signed_test_event", "tailscale_dns_name", "webhook_url",
 ]

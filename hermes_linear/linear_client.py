@@ -137,6 +137,13 @@ QUERY_TEAM_STATES = """query TeamStates($teamId: String!) {
 }"""
 
 # Team labels plus workspace labels (no team); group labels cannot be applied. Paged.
+QUERY_VIEWER_TEAMS = """query ViewerTeams($after: String) {
+  viewer { teams(first: 250, after: $after) {
+    nodes { id key name }
+    pageInfo { hasNextPage endCursor }
+  } }
+}"""
+
 QUERY_TEAM_LABELS = """query TeamLabels($teamId: ID!, $after: String) {
   issueLabels(first: 250, after: $after,
               filter: { or: [{ team: { id: { eq: $teamId } } }, { team: { null: true } }] }) {
@@ -528,6 +535,13 @@ class LinearClient:
                 {"id": s["id"], "name": s.get("name") or "", "type": s.get("type") or ""}
                 for s in nodes]
         return [dict(s) for s in self._team_states[team_id]]
+
+    async def viewer_teams(self) -> list[dict]:
+        """``[{id, key, name}]``: the teams the app user belongs to."""
+        nodes = await self._paged(QUERY_VIEWER_TEAMS, {},
+                                  lambda d: (d.get("viewer") or {}).get("teams"))
+        return [{"id": t["id"], "key": t.get("key") or "", "name": t.get("name") or ""}
+                for t in nodes]
 
     async def team_labels(self, team_id: str) -> list[dict]:
         """``[{id, name}]``: the team's and the workspace's labels, groups excluded."""
