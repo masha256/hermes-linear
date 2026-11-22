@@ -133,8 +133,8 @@ does no I/O.
 ### 4. `Blocked` target
 
 - `agent_tools` `linear_task_state` records open tasks under the session ticket:
-  `in_progress` / `in_review` → `set_open_task(session_issue_id, task_id, True)`; `done` /
-  `blocked` / `unblocked` → `False`.
+  `in_progress` / `in_review` / `unblocked` → `set_open_task(session_issue_id, task_id, True)`;
+  `done` / `blocked` → `False`.
 - At the switch to pending: exactly one open task → that issue; otherwise the session ticket.
   The id is stored as `row.ticket_id`.
 - Add and remove reuse `agent_tools._blocked_label` and the client's `issue_update`, bounded
