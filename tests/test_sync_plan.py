@@ -19,8 +19,9 @@ from test_agent_tools_runtime import new_adapter
 from hermes_linear import agent_tools, sync
 from hermes_linear.agent_tools import TOOL_HANDLERS, TOOL_SCHEMAS, linear_sync_plan
 from hermes_linear.linear_client import LinearClient
-from hermes_linear.sync import (PLAN_COMMENT_MAX, PlanTask, parse_plan, read_desc_hash,
-                                render_plan, task_title, with_desc_hash, write_ticket_ids)
+from hermes_linear.sync import (PLAN_COMMENT_MAX, TASK_DESC_MAX, PlanTask, footer, parse_plan,
+                                plan_header, read_desc_hash, task_title, with_desc_hash,
+                                write_ticket_ids)
 
 SELF = "uuid-self"
 FIXTURE = Path(__file__).parent / "fixtures" / "plans" / "channel-plan.md"
@@ -148,20 +149,41 @@ def test_parse_fixture_15_tasks():
     assert tasks[0].name == "Dev environment, skeleton, fixtures"
     assert tasks[7].name == "Router — agent session events and lifecycle"  # inner em dash
     assert tasks[0].line == 70
-    assert tasks[1].summary.startswith("Answers spec §12 items 1–2")
-    assert "**Files:**" not in tasks[1].summary
+    assert tasks[1].body.startswith("Answers spec §12 items 1–2")
+    assert "**Files:**" in tasks[1].body and "**Interfaces:**" in tasks[1].body
+    assert tasks[1].body.endswith("in the same commit.")  # up to the next task heading
     assert all(isinstance(t, PlanTask) for t in tasks)
 
 
-def test_parse_plan_summary_and_lines():
+def test_parse_plan_body_and_lines():
     tasks = parse_plan(PLAN)
     assert [(t.number, t.name, t.ticket) for t in tasks] == [
         (1, "Alpha", None), (2, "Beta", None), (3, "Gamma", None)]
-    assert tasks[0].summary == "Do alpha first."
-    assert tasks[1].summary == "Beta summary paragraph\ncontinues here."  # Files skipped
-    assert tasks[2].summary == "Gamma things."
+    assert tasks[0].body == "Do alpha first.\n\n**Files:**\n- Create: `a.py`\n\n- [ ] **Step 1:** write it."
+    assert tasks[1].body == ("**Files:**\n- Modify: `b.py`\n\n"
+                             "Beta summary paragraph\ncontinues here.")
+    assert tasks[2].body == "Gamma things."
     assert PLAN.splitlines()[tasks[0].line - 1] == "### Task 1: Alpha"
-    assert parse_plan("### Task 1: Empty\n\n**Files:**\n- x\n")[0].summary == ""
+    assert parse_plan("### Task 1: Empty\n")[0].body == ""
+
+
+def test_task_body_bounds():
+    text = ("### Task 1: A\r\n\r\nIntro.\r\n\r\n#### Detail\r\n\r\n```sh\r\n# a comment\r\n"
+            "## not a heading\r\n```\r\n\r\n---\r\n\r\n## Appendix\r\n\r\nNot task 1.\r\n"
+            "### Task 2: B\n\nB.\n\n---\n")
+    a, b = parse_plan(text)
+    assert a.body == ("Intro.\n\n#### Detail\n\n```sh\n# a comment\n## not a heading\n```")
+    assert b.body == "B."  # the trailing rule is dropped
+
+
+def test_plan_header():
+    assert plan_header(PLAN) == "# Thing — Implementation Plan\n\nLinear: RET-1\n\n**Goal:** build the thing."
+    fixture = plan_header(FIXTURE.read_text(encoding="utf-8"))
+    assert fixture.startswith("# Hermes Linear Channel Plugin") and "## File Structure" in fixture
+    assert "### Task" not in fixture and not fixture.endswith("---")
+    assert plan_header("```\n### Task 1: Fenced\n```\nHead\n### Task 1: Real\n") == (
+        "```\n### Task 1: Fenced\n```\nHead")
+    assert plan_header("### Task 1: A\n") == ""
 
 
 def test_parse_ignores_fenced_and_malformed_headings():
@@ -202,9 +224,14 @@ def test_task_title():
     assert task_title(PlanTask(3, "Gamma", None, "", 1)) == "T3 · Gamma"
 
 
-def test_render_plan_has_footer():
-    assert render_plan(PLAN, "docs/plan.md", "abc1234") == (
-        PLAN.rstrip() + "\n\n---\nSource: docs/plan.md @ abc1234 · edit by asking in this thread")
+def expected_comment(text: str, path: str, tickets: dict[int, str], commit=None) -> str:
+    items = "\n".join(f"- {task_title(t)} — {tickets[t.number]}" for t in parse_plan(text))
+    return (f"{plan_header(text)}\n\n## Tasks\n\n{items}\n\n---\n{footer(path, commit)}"
+            f"\n\n{MARKER}")
+
+
+def desc(p: Path, n: int, body: str) -> str:
+    return with_desc_hash(f"[Plan]({link(p)}) · Task {n}\n\n{body}")
 
 
 # ----------------------------------------------------------------- linear_sync_plan
@@ -229,10 +256,9 @@ def test_sync_creates_children_in_order(pin_ctx, ws, plan, adapter):
     assert out["tasks"] == {1: ids[0], 2: ids[1], 3: ids[2]}
     assert out["created"] == ids and out["canceled"] == []
     assert out["file_changed"] is True
-    assert kids[0]["description"] == with_desc_hash(
-        f"[Plan]({link(plan)}) · Task 1\n\nDo alpha first.")
-    assert kids[1]["description"] == with_desc_hash(
-        f"[Plan]({link(plan)}) · Task 2\n\nBeta summary paragraph\ncontinues here.")
+    tasks = parse_plan(PLAN)
+    assert [k["description"] for k in kids] == [desc(plan, t.number, t.body) for t in tasks]
+    assert "- [ ] **Step 1:** write it." in kids[0]["description"]  # the whole task section
     assert kids[0]["description"].splitlines()[-1].startswith("<!-- hermes-linear:h=")
     assert all(k["creator"] == VIEWER for k in kids)
     assert all(k["project"] is not None and k["team"] == "team-1" for k in kids)
@@ -514,30 +540,93 @@ def test_plan_comment_edited_in_place(pin_ctx, ws, plan):
     assert len(mine) == 1
     body = mine[0]["body"]
     synced = plan.read_text(encoding="utf-8")
-    assert body == f"{render_plan(synced, sync.source_info(plan).path, None)}\n\n{MARKER}"  # IDs included
+    assert out["comment_inline"] is True
+    assert body == expected_comment(synced, sync.source_info(plan).path, out["tasks"])
+    assert "Do alpha first." not in body and "Gamma things." not in body  # no task bodies
     plan.write_text(synced.replace("Gamma things.", "Gamma changed."), encoding="utf-8")
+    assert linear_sync_plan({"path": str(plan)})["comment"] == "unchanged"  # a task body only
+    plan.write_text(synced.replace("build the thing", "build it"), encoding="utf-8")
     out = linear_sync_plan({"path": str(plan)})
     assert out["comment"] == "edited"
     mine2 = [c for c in ws.comments.values() if c["issue"] == SELF and c["user"] != "human-1"]
     assert [c["id"] for c in mine2] == [mine[0]["id"]]
-    assert "Gamma changed." in mine2[0]["body"] and mine2[0]["body"].count(MARKER) == 1
+    assert "build it" in mine2[0]["body"] and mine2[0]["body"].count(MARKER) == 1
     human = [c for c in ws.comments.values() if c["user"] == "human-1"]
     assert human[0]["body"] == f"quoting {MARKER} by hand"
     assert linear_sync_plan({"path": str(plan)})["comment"] == "unchanged"
 
 
-def test_plan_comment_oversize_falls_back_to_task_list(pin_ctx, ws, tmp_path):
+def test_plan_comment_oversize_header_truncated(pin_ctx, ws, tmp_path):
     f = tmp_path / "plan.md"
-    f.write_text(PLAN + "\n" + "😀" * (PLAN_COMMENT_MAX // 2) + "\n", encoding="utf-8")
+    big = PLAN.replace("**Goal:** build the thing.", "😀" * (PLAN_COMMENT_MAX // 2))
+    f.write_text(big, encoding="utf-8")
     out = linear_sync_plan({"path": str(f)})
     assert out["ok"] is True and out["comment_inline"] is False
     (c,) = [c for c in ws.comments.values() if c["issue"] == SELF]
     body = c["body"]
     assert sync.utf16_len(body) <= PLAN_COMMENT_MAX
-    assert "😀" not in body and link(f) in body
+    assert body.startswith("# Thing — Implementation Plan") and "😀" in body
+    assert f"…\n\nFull plan (too long to show here): {link(f)}\n\n## Tasks\n\n" in body
     for n, ident in out["tasks"].items():
-        assert f"T{n} · " in body and ident in body
+        assert f"- T{n} · " in body and ident in body
     assert body.endswith(MARKER) and "edit by asking in this thread" in body
+
+
+def test_task_description_oversize_truncated_with_link(pin_ctx, ws, tmp_path):
+    f = tmp_path / "plan.md"
+    big = PLAN.replace("Gamma things.", "```\n" + "😀" * (TASK_DESC_MAX // 2) + "\n```")
+    f.write_text(big, encoding="utf-8")
+    out = linear_sync_plan({"path": str(f)})
+    d = ws.issue(out["tasks"][3])["description"]
+    assert sync.utf16_len(d) <= TASK_DESC_MAX
+    assert d.startswith(f"[Plan]({link(f)}) · Task 3\n\n```\n😀")
+    assert f"\n```\n\n…\n\nFull task (too long to show here): {link(f)}" in d  # fence closed
+    assert read_desc_hash(d) is not None
+    n = len(ws.writes())
+    linear_sync_plan({"path": str(f)})
+    assert ws.writes()[n:] == []  # stable
+
+
+def test_task_description_truncation_links_the_task_line():
+    info = sync.SourceInfo("docs/plan.md", "abc1234",
+                           "https://github.com/acme/w/blob/abc1234/docs/plan.md")
+    t = PlanTask(2, "B", None, "x" * TASK_DESC_MAX, 40)
+    d = sync.task_description(t, info)
+    assert sync.utf16_len(with_desc_hash(d)) <= TASK_DESC_MAX
+    assert d.endswith("x\n\n…\n\nFull task (too long to show here): "
+                      "https://github.com/acme/w/blob/abc1234/docs/plan.md#L40")
+    t2 = PlanTask(2, "B", None, "x" * (TASK_DESC_MAX - 200), 40)
+    assert sync.utf16_len(with_desc_hash(sync.task_description(t2, info))) <= TASK_DESC_MAX
+    assert sync.task_description(PlanTask(1, "A", None, "", 3), info) == f"[Plan]({info.link}) · Task 1"
+
+
+def test_resync_migrates_old_shapes_once(pin_ctx, ws, plan):
+    """Tickets and the comment written by the first-paragraph/whole-plan sync are rewritten
+    once on the next sync; Done tickets keep the old description."""
+    first = linear_sync_plan({"path": str(plan)})["tasks"]
+    synced = plan.read_text(encoding="utf-8")
+    old = {1: "Do alpha first.", 2: "Beta summary paragraph\ncontinues here.", 3: "Gamma things."}
+    for n, summary in old.items():
+        ws.issue(first[n])["description"] = desc(plan, n, summary)
+    ws.issue(first[1])["state"] = "st-done"
+    (mine,) = [c for c in ws.comments.values() if c["issue"] == SELF]
+    path = sync.source_info(plan).path
+    mine["body"] = f"{synced.rstrip()}\n\n---\n{footer(path, None)}\n\n{MARKER}"
+    n = len(ws.writes())
+    out = linear_sync_plan({"path": str(plan)})
+    assert out["comment"] == "edited" and out["created"] == [] and out["canceled"] == []
+    updates = {c[1][0]: c[1][1] for c in ws.writes()[n:] if c[0] == "issue_update"}
+    # Task 3's first paragraph is its whole section: already current, no write.
+    assert set(updates) == {ws.issue(first[2])["id"]}
+    assert all(set(inp) == {"description"} for inp in updates.values())
+    tasks = parse_plan(PLAN)
+    assert ws.issue(first[2])["description"] == desc(plan, 2, tasks[1].body)
+    assert ws.issue(first[1])["description"] == desc(plan, 1, old[1])  # Done: untouched
+    (mine,) = [c for c in ws.comments.values() if c["issue"] == SELF]
+    assert mine["body"] == expected_comment(synced, path, first)
+    n = len(ws.writes())
+    linear_sync_plan({"path": str(plan)})
+    assert ws.writes()[n:] == []
 
 
 def test_order_uses_sub_issue_sort_order(pin_ctx, ws, plan):

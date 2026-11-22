@@ -254,7 +254,12 @@ MANAGED_TITLE_RE = re.compile(r"^T\d+ ·")
 DESC_HASH_RE = re.compile(r"<!--\s*hermes-linear:h=([0-9a-f]{12})\s*-->\s*\Z")
 DESC_HASH_LEN = 12
 _PLAN_FENCE_RE = re.compile(r"^ {0,3}(```|~~~)")
-_FILES_RE = re.compile(r"^\*\*Files:\*\*")
+#: A heading that ends a task section (levels 1-3); ``####`` and deeper stay inside it.
+_SECTION_END_RE = re.compile(r"^#{1,3}(?:\s|$)")
+#: A thematic break line (``---`` between tasks).
+_RULE_RE = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$")
+#: Limit for a task ticket description, hash marker included (probe P1).
+TASK_DESC_MAX = SPEC_INLINE_MAX
 
 
 @dataclass(frozen=True)
@@ -262,7 +267,7 @@ class PlanTask:
     number: int
     name: str
     ticket: str | None
-    summary: str
+    body: str  # the task section after its heading: Files, Interfaces, steps
     line: int  # 1-based line of the heading
 
 
@@ -278,21 +283,21 @@ def _plan_lines(text: str):
         yield i, line, raw, fenced
 
 
-def _summary(body: list[tuple[str, bool]]) -> str:
-    """The first paragraph of ``body`` (lines, fenced flag) that is not a ``**Files:**`` block."""
-    para: list[str] = []
-    for line, fenced in [*body, ("", False)]:
-        if fenced or not line.strip():
-            if para and not _FILES_RE.match(para[0]):
-                return "\n".join(para).strip()
-            para = []
-            continue
-        para.append(line)
-    return ""
+def _section(lines: list[str]) -> str:
+    """``lines`` joined with ``\n``, without leading blank lines or trailing rules/blanks."""
+    lo, hi = 0, len(lines)
+    while lo < hi and not lines[lo].strip():
+        lo += 1
+    while hi > lo and (not lines[hi - 1].strip() or _RULE_RE.match(lines[hi - 1])):
+        hi -= 1
+    return "\n".join(lines[lo:hi]).rstrip()
 
 
 def parse_plan(text: str) -> list[PlanTask]:
-    """The ``### Task N: <name>[ — <ID>]`` headings outside code fences, in file order."""
+    """The ``### Task N: <name>[ — <ID>]`` headings outside code fences, in file order.
+
+    A task's body runs to the next level 1-3 heading outside a fence (or the end of file).
+    """
     heads: list[tuple[int, re.Match]] = []
     lines: list[tuple[str, bool]] = []
     for i, line, _raw, fenced in _plan_lines(text or ""):
@@ -303,12 +308,22 @@ def parse_plan(text: str) -> list[PlanTask]:
     for i, m in heads:
         end = len(lines)
         for j in range(i + 1, len(lines)):
-            if not lines[j][1] and lines[j][0].startswith("#"):
+            if not lines[j][1] and _SECTION_END_RE.match(lines[j][0]):
                 end = j
                 break
         out.append(PlanTask(number=int(m.group(1)), name=m.group(2).strip(), ticket=m.group(3),
-                            summary=_summary(lines[i + 1:end]), line=i + 1))
+                            body=_section([ln for ln, _f in lines[i + 1:end]]), line=i + 1))
     return out
+
+
+def plan_header(text: str) -> str:
+    """Everything before the first task heading (outside fences), trailing rules dropped."""
+    out: list[str] = []
+    for _i, line, _raw, fenced in _plan_lines(text or ""):
+        if not fenced and TASK_HEADING_RE.match(line):
+            break
+        out.append(line)
+    return _section(out)
 
 
 def write_ticket_ids(text: str, mapping: dict[int, str]) -> str:
@@ -333,10 +348,42 @@ def task_title(t: PlanTask) -> str:
     return f"T{t.number} · {t.name}"
 
 
+def _cut(text: str, units: int) -> str:
+    """``text`` cut to fit ``units`` (``…`` and a closing fence included when cut)."""
+    if utf16_len(text) <= units:
+        return text
+    cut = utf16_truncate(text, units - utf16_len(TRUNCATED) - 4).rstrip()
+    open_fence = False
+    for _i, _line, _raw, fenced in _plan_lines(cut + "\n."):
+        open_fence = fenced  # the probe line "." is fenced only if a fence is left open
+    if open_fence:
+        cut += "\n```"  # never leave the rest of the ticket inside an open code block
+    return cut + TRUNCATED
+
+
+def _anchor(info: SourceInfo, line: int) -> str:
+    return f"{info.link}#L{line}" if info.link.startswith("https://") else info.link
+
+
+#: Length of the hash marker ``with_desc_hash`` appends.
+_DESC_HASH_UNITS = len("\n\n<!-- hermes-linear:h= -->") + DESC_HASH_LEN
+
+
 def task_description(t: PlanTask, info: SourceInfo) -> str:
-    """The rendered description, without the hash marker (``with_desc_hash`` adds it)."""
+    """``[Plan](link) · Task N`` then the task's whole section, without the hash marker.
+
+    Over ``TASK_DESC_MAX`` (marker included) the section is cut and a link to the task in
+    the file follows.
+    """
     head = f"[Plan]({info.link}) · Task {t.number}"
-    return f"{head}\n\n{t.summary}" if t.summary else head
+    if not t.body:
+        return head
+    full = f"{head}\n\n{t.body}"
+    if utf16_len(full) + _DESC_HASH_UNITS <= TASK_DESC_MAX:
+        return full
+    tail = f"\n\nFull task (too long to show here): {_anchor(info, t.line)}"
+    room = TASK_DESC_MAX - _DESC_HASH_UNITS - utf16_len(head) - 2 - utf16_len(tail)
+    return f"{head}\n\n{_cut(t.body, room)}{tail}"
 
 
 def desc_hash(rendered: str) -> str:
@@ -355,36 +402,33 @@ def read_desc_hash(description: str | None) -> str | None:
     return m.group(1) if m else None
 
 
-def render_plan(text: str, path: str, short_commit: str | None) -> str:
-    """The plan file, a rule, then the spec footer."""
-    return render_spec(text, path, short_commit)
-
-
 def plan_comment(text: str, info: SourceInfo, tasks: list[PlanTask], marker_tag: str,
                  tickets: dict[int, str]) -> tuple[str, bool]:
-    """The plan comment body ending in ``marker_tag`` and whether it is the whole plan.
+    """The plan comment body ending in ``marker_tag`` and whether the header is whole.
 
-    The whole plan when it fits ``PLAN_COMMENT_MAX`` UTF-16 units; otherwise a link to the
-    file, the task list (``T<n> · <name> — <ID>``), then the footer.
+    The plan header (``plan_header``), the task list (``T<n> · <name> — <ID>``), then the
+    footer: task bodies live in the task tickets. A header that would not fit
+    ``PLAN_COMMENT_MAX`` UTF-16 units is cut and followed by a link to the file.
     """
-    full = f"{render_plan(text, info.path, info.commit)}\n\n{marker_tag}"
-    if utf16_len(full) <= PLAN_COMMENT_MAX:
-        return full, True
-    head = f"Full plan (too long to show here): {info.link}\n\n"
-    tail = f"\n\n---\n{footer(info.path, info.commit)}\n\n{marker_tag}"
     items = "\n".join(f"- {task_title(t)}" + (f" — {tickets[t.number]}"
                                               if tickets.get(t.number) else "")
                       for t in tasks)
-    room = PLAN_COMMENT_MAX - utf16_len(head) - utf16_len(tail)
-    if utf16_len(items) > room:
-        items = utf16_truncate(items, room - utf16_len(TRUNCATED)).rstrip() + TRUNCATED
-    return head + items + tail, False
+    tail = f"\n\n---\n{footer(info.path, info.commit)}\n\n{marker_tag}"
+    header = plan_header(text)
+    full = f"{header}\n\n## Tasks\n\n{items}{tail}".lstrip()
+    if utf16_len(full) <= PLAN_COMMENT_MAX:
+        return full, True
+    note = f"\n\nFull plan (too long to show here): {info.link}\n\n## Tasks\n\n"
+    room = PLAN_COMMENT_MAX - utf16_len(note) - utf16_len(tail)
+    items = _cut(items, room - min(utf16_len(header), room // 2))  # the list keeps half
+    header = _cut(header, room - utf16_len(items))
+    return f"{header}{note}{items}{tail}".lstrip(), False
 
 
 __all__ = ["DESC_HASH_RE", "MANAGED_TITLE_RE", "desc_hash", "read_desc_hash",
            "with_desc_hash", "MAX_SOURCE_BYTES", "PLAN_COMMENT_MAX", "PlanTask",
-           "SPEC_INLINE_MAX", "SourceInfo", "TASK_HEADING_RE", "footer", "git_short_commit",
+           "SPEC_INLINE_MAX", "SourceInfo", "TASK_DESC_MAX", "TASK_HEADING_RE", "footer", "git_short_commit",
            "github_repo", "parse_plan", "plan_comment", "read_linear_header", "read_source",
-           "render_plan", "render_spec", "run_git", "source_info", "source_path",
+           "plan_header", "render_spec", "run_git", "source_info", "source_path",
            "spec_description", "spec_summary", "task_description", "task_title", "utf16_len",
            "utf16_truncate", "write_source", "write_ticket_ids"]
