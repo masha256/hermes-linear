@@ -355,12 +355,65 @@ async def test_duplicate_webhook_200_not_delivered(make_client):
     ep, rec = make_ep()
     client, _ = await make_client(ep)
     body = encode(payload())
-    r1 = await post(client, "neo", body)
-    r2 = await post(client, "neo", body)
+    hdr = {"Linear-Delivery": "d-1"}
+    r1 = await post(client, "neo", body, headers=hdr)
+    r2 = await post(client, "neo", body, headers=hdr)
     assert r1.status == 200 and r2.status == 200
     await settle()
     assert len(rec.delivered) == 1
-    assert rec.seen_calls == [payload()["webhookId"]] * 2
+    assert rec.seen_calls == ["d-1"] * 2
+
+
+async def test_same_webhook_id_distinct_deliveries_all_delivered(make_client):
+    # Regression: payload webhookId is the webhook *config* id, identical on
+    # every delivery. Deduping on it dropped every event after the first.
+    ep, rec = make_ep()
+    client, _ = await make_client(ep)
+    p1 = payload(webhookId="cfg-1", action="created")
+    p2 = payload(webhookId="cfg-1", action="prompted")
+    r1 = await post(client, "neo", encode(p1), headers={"Linear-Delivery": "d-1"})
+    r2 = await post(client, "neo", encode(p2), headers={"Linear-Delivery": "d-2"})
+    assert r1.status == 200 and r2.status == 200
+    await settle()
+    assert rec.delivered == [p1, p2]
+
+
+async def test_same_delivery_id_dropped_even_if_body_differs(make_client):
+    ep, rec = make_ep()
+    client, _ = await make_client(ep)
+    p1 = payload(action="created")
+    p2 = payload(action="prompted")
+    hdr = {"Linear-Delivery": "d-same"}
+    assert (await post(client, "neo", encode(p1), headers=hdr)).status == 200
+    assert (await post(client, "neo", encode(p2), headers=hdr)).status == 200
+    await settle()
+    assert rec.delivered == [p1]
+
+
+async def test_without_delivery_header_dedups_on_body(make_client):
+    ep, rec = make_ep()
+    client, _ = await make_client(ep)
+    p1 = payload(webhookId="cfg-1", action="created")
+    p2 = payload(webhookId="cfg-1", action="prompted")
+    for p in (p1, p2, p1):
+        assert (await post(client, "neo", encode(p))).status == 200
+    await settle()
+    assert rec.delivered == [p1, p2]
+    assert rec.seen_calls[0] == "sha256:" + hashlib.sha256(encode(p1)).hexdigest()
+
+
+async def test_duplicate_drop_logged_at_info(make_client, caplog):
+    caplog.set_level(logging.INFO, logger="hermes_linear.listener")
+    ep, _ = make_ep()
+    client, _ = await make_client(ep)
+    body = encode(payload())
+    hdr = {"Linear-Delivery": "d-dup"}
+    await post(client, "neo", body, headers=hdr)
+    await post(client, "neo", body, headers=hdr)
+    assert any(
+        r.levelno == logging.INFO and "duplicate" in r.getMessage() and "d-dup" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 async def test_seen_raising_500_and_not_delivered(make_client):
@@ -490,17 +543,18 @@ async def test_two_profiles_isolated(make_client):
     p1 = payload(webhookId="w-neo")
     p2 = payload(webhookId="w-ray")
     b1, b2 = encode(p1), encode(p2)
+    d1, d2 = {"Linear-Delivery": "d-neo"}, {"Linear-Delivery": "d-ray"}
 
     # Cross-signed requests are rejected.
-    assert (await post(client, "neo", b1, secret=OTHER_SECRET)).status == 401
-    assert (await post(client, "raymond", b2, secret=SECRET)).status == 401
+    assert (await post(client, "neo", b1, secret=OTHER_SECRET, headers=d1)).status == 401
+    assert (await post(client, "raymond", b2, secret=SECRET, headers=d2)).status == 401
     # Own signatures accepted.
-    assert (await post(client, "neo", b1, secret=SECRET)).status == 200
-    assert (await post(client, "raymond", b2, secret=OTHER_SECRET)).status == 200
+    assert (await post(client, "neo", b1, secret=SECRET, headers=d1)).status == 200
+    assert (await post(client, "raymond", b2, secret=OTHER_SECRET, headers=d2)).status == 200
     await settle()
     assert rec_neo.delivered == [p1]
     assert rec_ray.delivered == [p2]
-    assert rec_neo.seen_calls == ["w-neo"] and rec_ray.seen_calls == ["w-ray"]
+    assert rec_neo.seen_calls == ["d-neo"] and rec_ray.seen_calls == ["d-ray"]
 
 
 async def test_no_secret_or_body_logged(make_client, caplog):

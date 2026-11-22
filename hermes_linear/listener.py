@@ -8,7 +8,8 @@ Checks run in this exact order:
 3. bad ``Linear-Signature`` -> 401
    (invalid JSON after a valid signature -> 400)
 4. ``webhookTimestamp`` outside +/- REPLAY_WINDOW_S of the clock -> 401
-5. already-seen ``webhookId`` -> 200, not delivered
+5. already-seen delivery (``Linear-Delivery`` header, else SHA-256 of the raw
+   body) -> 200, not delivered. Never payload ``webhookId`` (config id, constant).
 6. payload ``oauthClientId`` present and != endpoint client_id -> 401
 7. 200, then ``deliver(payload)`` via ``loop.call_soon``
 
@@ -232,16 +233,18 @@ class WebhookListener:
             logger.warning("Linear webhook for %r: timestamp outside replay window", profile)
             return _json(401, error="stale")
 
-        # 5. Dedup.
-        if isinstance(wid, str) and wid:
-            try:
-                dup = ep.seen(wid)
-            except Exception as exc:
-                logger.error("Linear webhook dedup failed for %r: %s", profile, type(exc).__name__)
-                return _json(500, error="internal")
-            if dup:
-                logger.debug("Linear webhook %r: duplicate %s dropped", profile, wid)
-                return _json(200, ok=True)
+        # 5. Dedup on the per-delivery id. NOT payload ``webhookId``: that is
+        # the webhook *config* id, identical on every delivery.
+        delivery = request.headers.get("Linear-Delivery", "").strip()
+        dedup_key = delivery or "sha256:" + hashlib.sha256(body).hexdigest()
+        try:
+            dup = ep.seen(dedup_key)
+        except Exception as exc:
+            logger.error("Linear webhook dedup failed for %r: %s", profile, type(exc).__name__)
+            return _json(500, error="internal")
+        if dup:
+            logger.info("Linear webhook %r: duplicate delivery %s dropped", profile, dedup_key)
+            return _json(200, ok=True)
 
         # 6. App identity, where the payload carries one.
         cid = payload.get("oauthClientId")
