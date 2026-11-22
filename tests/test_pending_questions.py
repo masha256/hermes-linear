@@ -1,0 +1,230 @@
+"""Timed-out Linear questions become pending (RET-94 T3, spec "States", §2, §4).
+
+Hermes's own timeout callbacks (``retire_clarify_card``, the approval-timeout ``edit_message``)
+switch a live control row to ``pending``: nothing is posted and the ``Blocked`` label goes on
+the target issue (the one open task, else the session ticket). A plugin-issued stop or a stale
+generation keeps the old expiry (row dropped, expiry thought posted).
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import logging
+
+import pytest
+
+from test_adapter_inbound import D_ISSUE, D_SID, DELEGATION, M_ISSUE, MENTION, deliver
+from test_adapter_outbound import (  # noqa: F401  (fixtures)
+    D_CHAT, approval_prompt, env, session_env, settle,
+)
+
+from hermes_linear import outbound as outbound_mod
+from hermes_linear import questions
+
+META = {"thread_id": None}
+BLOCKED = "lb-blocked"
+
+
+async def _delegated(a, gw, session_env):
+    await deliver(a, DELEGATION)
+    mid = gw.events[0].message_id
+    session_env(platform="linear", message_id=mid, chat_id=D_CHAT)
+    return mid
+
+
+async def _clarify(a, client, cid="clar-1", question="Which env?"):
+    res = await a.send_clarify(D_CHAT, question, ["staging", "prod"], cid, "sk", metadata=META)
+    assert res.success and client.activities[-1][1]["type"] == "elicitation"
+    return len(client.activities)
+
+
+def _approval(rid="req-1"):
+    return dataclasses.replace(approval_prompt(rid), chat_id=D_CHAT, metadata=META)
+
+
+def _added(client):
+    return [(i, u["addedLabelIds"]) for i, u in client.issue_updates if "addedLabelIds" in u]
+
+
+async def test_clarify_timeout_defers(env, session_env):
+    a, client, gw, store, order = env
+    mid = await _delegated(a, gw, session_env)
+    n = await _clarify(a, client)
+    row = store.control("clar-1")
+    assert (row.question, row.turn_mid) == ("Which env?", mid)
+    await a.retire_clarify_card("clar-1", "expired")
+    await settle(a)
+    row = store.control("clar-1")
+    assert row is not None and row.state == "pending"
+    assert store.session(D_SID).issue_id == D_ISSUE
+    assert row.ticket_id == D_ISSUE
+    assert len(client.activities) == n  # nothing posted, no "This request expired."
+    assert _added(client) == [(D_ISSUE, [BLOCKED])]
+    # A second retire (run end after the timeout) leaves the pending row alone.
+    await a.retire_clarify_card("clar-1", "run ended")
+    await settle(a)
+    assert store.control("clar-1").state == "pending" and len(client.activities) == n
+
+
+async def test_pending_row_still_gates_while_turn_in_flight(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    n = await _clarify(a, client)
+    await a.retire_clarify_card("clar-1", "expired")
+    r = await a.send(D_CHAT, "progress", metadata={**META, "_interim_send": True})
+    await settle(a)
+    assert r.success and len(client.activities) == n  # the thought would hide the select
+
+
+async def test_clarify_timeout_during_stop_expires(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    n = await _clarify(a, client)
+    a.turns.stop_message_ids["x"] = D_SID
+    await a.retire_clarify_card("clar-1", "cancelled")
+    await settle(a)
+    assert store.control("clar-1") is None
+    assert [c["body"] for _, c, *_ in client.activities[n:]] == [outbound_mod.EXPIRED_TEXT]
+    assert client.issue_updates == []
+
+
+async def test_clarify_timeout_stale_generation_expires(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    n = await _clarify(a, client)
+    store.set_mode(D_ISSUE, "delegated", store.ticket(D_ISSUE).generation + 1)
+    await a.retire_clarify_card("clar-1", "stale")
+    await settle(a)
+    assert store.control("clar-1") is None
+    assert [c["body"] for _, c, *_ in client.activities[n:]] == [outbound_mod.EXPIRED_TEXT]
+    assert client.issue_updates == []
+
+
+async def test_approval_timeout_defers(env, session_env):
+    a, client, gw, store, order = env
+    mid = await _delegated(a, gw, session_env)
+    res = await a._send_exec_approval_prompt(_approval())
+    assert res.success
+    n = len(client.activities)
+    row = store.control("req-1")
+    assert (row.question, row.command, row.turn_mid) == ("Run `ls`?", "ls", mid)
+    res = await a.edit_message(D_CHAT, "approval:req-1", "timed out\n```ls```")
+    await settle(a)
+    assert res.success and res.message_id == "approval:req-1"
+    row = store.control("req-1")
+    assert row.state == "pending" and row.command == "ls" and row.ticket_id == D_ISSUE
+    assert len(client.activities) == n
+    assert _added(client) == [(D_ISSUE, [BLOCKED])]
+
+
+async def test_approval_timeout_during_stop_expires(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    await a._send_exec_approval_prompt(_approval())
+    n = len(client.activities)
+    a.turns.stop_message_ids["x"] = D_SID
+    await a.edit_message(D_CHAT, "approval:req-1", "x")
+    await settle(a)
+    assert store.control("req-1") is None
+    assert [c["body"] for _, c, *_ in client.activities[n:]] == [
+        outbound_mod.APPROVAL_EXPIRED_TEXT]
+
+
+@pytest.mark.parametrize("ticket_generation", [None, 3])
+async def test_mention_approval_timeout_defers(env, ticket_generation):
+    """A mention thread's chat id carries no generation (row generation 0); a ticket that was
+    delegated before (generation >= 1, mode mention now) must not make it look stale."""
+    a, client, gw, store, order = env
+    await deliver(a, MENTION)
+    if ticket_generation is not None:
+        store.set_mode(M_ISSUE, "mention", ticket_generation)
+    await a._send_exec_approval_prompt(approval_prompt())
+    n = len(client.activities)
+    await a.edit_message(M_ISSUE, "approval:req-1", "x")
+    await settle(a)
+    assert store.control("req-1").state == "pending" and len(client.activities) == n
+    assert _added(client) == [(M_ISSUE, [BLOCKED])]
+
+
+async def test_blocked_target_open_task(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    store.set_open_task(D_ISSUE, "T1", True)
+    await _clarify(a, client)
+    await a.retire_clarify_card("clar-1", "expired")
+    await settle(a)
+    assert store.control("clar-1").ticket_id == "T1"
+    assert _added(client) == [("T1", [BLOCKED])]
+    store.set_open_task(D_ISSUE, "T2", True)
+    assert questions.blocked_target(store, store.control("clar-1")) == D_ISSUE
+
+
+async def test_blocked_target_unknown_session(env):
+    a, client, gw, store, order = env
+    store.put_control("r", "clarify", "no-such-session", 1, [])
+    assert questions.blocked_target(store, store.control("r")) is None
+
+
+async def test_label_missing_still_defers(env, session_env, caplog):
+    a, client, gw, store, order = env
+    client.team_label_list = [{"id": "lb-bug", "name": "Bug"}]
+    await _delegated(a, gw, session_env)
+    n = await _clarify(a, client)
+    with caplog.at_level(logging.DEBUG, logger="hermes_linear.questions"):
+        await a.retire_clarify_card("clar-1", "expired")
+        await settle(a)
+    assert store.control("clar-1").state == "pending"
+    assert len(client.activities) == n and client.issue_updates == []
+
+
+async def test_set_blocked_adds_and_removes_only_on_change(env, caplog):
+    a, client, gw, store, order = env
+    client.team_label_list = [{"id": BLOCKED, "name": "bLoCkEd"}]  # case-insensitive
+    assert await questions.set_blocked(client, "I", True)
+    assert await questions.set_blocked(client, "I", True)  # already carried: no write
+    assert client.issue_updates == [("I", {"addedLabelIds": [BLOCKED]})]
+    assert await questions.set_blocked(client, "I", False)
+    assert await questions.set_blocked(client, "I", False)
+    assert client.issue_updates[1:] == [("I", {"removedLabelIds": [BLOCKED]})]
+
+
+async def test_set_blocked_failure_and_missing_label_return_false(env, caplog, monkeypatch):
+    a, client, gw, store, order = env
+
+    async def boom(issue_id):
+        raise RuntimeError("linear down")
+
+    monkeypatch.setattr(client, "issue_get", boom)
+    assert await questions.set_blocked(client, "I", True) is False
+    monkeypatch.undo()
+    client.team_label_list = []
+    questions._warned_teams.clear()
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="hermes_linear.questions"):
+        assert await questions.set_blocked(client, "I", True) is False
+        assert await questions.set_blocked(client, "J", True) is False
+    levels = [r.levelno for r in caplog.records if "label" in r.getMessage()]
+    assert levels == [logging.WARNING, logging.DEBUG]  # warned once per team
+
+
+async def test_new_question_replaces_pending(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    await _clarify(a, client)
+    await a.retire_clarify_card("clar-1", "expired")
+    await settle(a)
+    assert store.control("clar-1").state == "pending"
+    await _clarify(a, client, "clar-2", "Second?")
+    assert store.control("clar-1") is None
+    rows = store.controls_for_issue(D_ISSUE)
+    assert [(r.request_id, r.state) for r in rows] == [("clar-2", "live")]
+    assert not any("removedLabelIds" in u for _, u in client.issue_updates)  # Blocked stays
+
+
+def test_copy_verbatim():
+    assert questions.PENDING_NOTICE == (
+        "Not answered. The question stays open in the Linear ticket; the answer arrives as the "
+        "next message. End this turn now; do not assume an answer.")
+    assert questions.APPROVAL_PENDING_TEXT == (
+        "Command not run: approval is pending in Linear. End this turn. If it is approved, the "
+        "next message says so, and re-running this exact command is pre-approved once.")

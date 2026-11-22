@@ -16,7 +16,7 @@ import time
 import pytest
 
 from test_adapter_inbound import (  # noqa: F401  (also registers the linear platform)
-    D_ISSUE, D_SID, DELEGATION, HUMAN, ISSUE_DELEGATED, M_ISSUE, M_SID, MENTION, FakeClient,
+    D_ISSUE, D_SID, DELEGATION, HUMAN, ISSUE_DELEGATED, M_ISSUE, M_SID, MENTION, TEAM, FakeClient,
     FakeListener, Gateway, complete, deliver, make_settings, prompted,
 )
 from gateway.config import PlatformConfig
@@ -44,6 +44,27 @@ class OutClient(FakeClient):
         self.fail_types: set[str] = set()
         self.app_delay = 0.0
         self.create_delay = 0.0
+        # Labels (pending questions add / remove Blocked): one team, per-issue label ids.
+        self.team_label_list: list[dict] = [{"id": "lb-blocked", "name": "Blocked"}]
+        self.issue_labels: dict[str, list[str]] = {}
+        self.issue_updates: list[tuple[str, dict]] = []
+
+    async def issue_get(self, issue_id):
+        labels = [lb for lb in self.team_label_list
+                  if lb["id"] in self.issue_labels.get(issue_id, [])]
+        return {"id": issue_id, "team": {"id": TEAM}, "labels": labels}
+
+    async def team_labels(self, team_id):
+        return [dict(lb) for lb in self.team_label_list]
+
+    async def issue_update(self, issue_id, inp):
+        self.issue_updates.append((issue_id, dict(inp)))
+        carried = self.issue_labels.setdefault(issue_id, [])
+        carried.extend(lid for lid in inp.get("addedLabelIds", []) if lid not in carried)
+        for lid in inp.get("removedLabelIds", []):
+            if lid in carried:
+                carried.remove(lid)
+        return {"id": issue_id}
 
     async def create_activity(self, sid, content, **kw):
         if content["type"] in self.fail_types:
@@ -480,9 +501,12 @@ async def test_approval_prompt_elicitation_select(env):
 
 
 async def test_approval_timeout_edit_posts_expiry_and_drops_control(env):
+    """The cancel path (a plugin stop in flight); a plain timeout goes pending (RET-94,
+    test_pending_questions)."""
     a, client, gw, store, order = env
     await deliver(a, MENTION)
     await a._send_exec_approval_prompt(approval_prompt())
+    a.turns.stop_message_ids["stop-1"] = M_SID
     res = await a.edit_message(M_ISSUE, "approval:req-1", "timed out\n```ls```")
     assert res.success and res.message_id == "approval:req-1"
     last = client.activities[-1][1]
@@ -527,6 +551,7 @@ async def test_expired_clarify_posts_thought_and_drops_control(env):
     await deliver(a, MENTION)
     await a.send_clarify(M_ISSUE, "Which env?", None, "clar-1", "sk",
                          metadata={"thread_id": M_SID})
+    a.turns.stop_message_ids["stop-1"] = M_SID  # cancel path; a timeout goes pending (RET-94)
     await a.retire_clarify_card("clar-1", "⏳ This prompt expired — please send a new request.")
     await a.wait_idle()
     assert bodies(client, "thought")[-1] == (M_SID, "This request expired.")

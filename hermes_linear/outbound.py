@@ -20,8 +20,12 @@ Q8, Q10).
   interrupted by ``/stop``, …) is dropped once nothing is in flight for that session.
 * Typing / heartbeat: spawned ephemeral thoughts, bounded by ``ACK_TIMEOUT_S``; never awaited by
   the caller.
-* Approvals / clarify: ``elicitation`` (+ ``select``) and a ``pending_controls`` row; expiry
-  posts a fixed ``thought`` and drops the row (Q10).
+* Approvals / clarify: ``elicitation`` (+ ``select``) and a ``pending_controls`` row. When
+  Hermes's wait ends unanswered (``retire_clarify``, the approval-timeout ``edit_message``) the
+  live row becomes *pending* (RET-94): nothing is posted and ``Blocked`` is added to the
+  target issue. A plugin-issued stop for the session or a stale generation keeps the expiry:
+  a fixed ``thought`` and the row dropped (Q10). A new elicitation drops the session's pending
+  rows (their ``Blocked`` stays).
 * Pending elicitation: Linear shows a select input only while the elicitation is the agent
   session's latest activity. While a control this adapter elicited is pending (row present,
   its turn in flight), ``_post`` drops every ``thought`` / ``action`` for that session
@@ -52,8 +56,9 @@ from urllib.parse import unquote, urlparse
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import ProcessingOutcome
 
-from . import renderer
+from . import questions, renderer
 from .constants import ACK_TIMEOUT_S, FAST_TOOL_SKIP_S, HEARTBEAT_S, TYPING_MIN_INTERVAL_S
+from .router import _session_key as router_session_key  # the chat id a session routes to
 from .turns import STOPPED_TEXT, Key, Turn
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -239,8 +244,9 @@ class Outbound:
         return content.get("type") in ("thought", "action") and bool(self._live_controls(sid))
 
     def _live_controls(self, sid: str) -> dict[str, str]:
-        """The controls elicited for ``sid`` that are still pending (row present: not
-        answered, expired or dropped) for a turn still in flight; forgets the rest."""
+        """The controls elicited for ``sid`` that are still pending (row present in either
+        state, ``live`` or ``pending``: not answered, expired or dropped) for a turn still in
+        flight; forgets the rest."""
         pending = self.elicited.get(sid)
         if not pending:
             return {}
@@ -476,12 +482,24 @@ class Outbound:
 
     # ------------------------------------------------------------ approvals / clarify
 
-    def _put_control(self, rid: str, kind: str, t: Target, choices: list, session_key: str):
+    def _put_control(self, rid: str, kind: str, t: Target, choices: list, session_key: str,
+                     *, question: str, command: Optional[str] = None):
         store = self.a._store
         assert store is not None
+        self._drop_pending(t.sid)  # a new question replaces a pending one (Blocked stays)
         store.put_control(rid, kind, t.sid, _generation(t.key[0]), choices,
-                          session_key=session_key)
+                          session_key=session_key, question=question, command=command,
+                          turn_mid=t.mid)
         self.elicited.setdefault(t.sid, {})[rid] = t.mid  # gates _post until resolved
+
+    def _drop_pending(self, sid: str) -> None:
+        store = self.a._store
+        session = store.session(sid) if store is not None else None
+        if session is None:
+            return
+        for row in store.controls_for_issue(session.issue_id):
+            if row.agent_session_id == sid and row.state == "pending":
+                self._drop_control(row.request_id)
 
     def _drop_control(self, rid: str) -> None:
         for pending in self.elicited.values():
@@ -497,7 +515,8 @@ class Outbound:
         choices = [c for c in _APPROVAL_CHOICES if c in prompt.choices]  # Q8: keep narrowing
         options = [o for o in renderer.approval_options() if o["value"] in choices]
         rid = str(prompt.request_id)
-        self._put_control(rid, "approval", target, choices, prompt.session_key)
+        self._put_control(rid, "approval", target, choices, prompt.session_key,
+                          question=prompt.text, command=prompt.command)
         ok = await self._post(target.sid, renderer.elicitation(prompt.text), signal="select",
                               signal_metadata={"options": options}, timeout_s=ACK_TIMEOUT_S)
         if not ok:
@@ -512,7 +531,8 @@ class Outbound:
             log.warning("linear: clarify %s dropped, no linear session", clarify_id)
             return SendResult(success=False, error=NO_SESSION)
         values = [str(c) for c in (choices or [])]
-        self._put_control(str(clarify_id), "clarify", target, values, session_key)
+        self._put_control(str(clarify_id), "clarify", target, values, session_key,
+                          question=str(question))
         kw: dict[str, Any] = {}
         if values:
             kw = {"signal": "select",
@@ -527,8 +547,8 @@ class Outbound:
     async def _expire(self, rid: str, kind: str, text: str) -> bool:
         store = self.a._store
         row = store.control(rid) if store is not None else None
-        if row is None or row.kind != kind:
-            return False  # already answered or dropped
+        if row is None or row.kind != kind or row.state != "live":
+            return False  # already answered, dropped or pending
         self._drop_control(rid)
         await self._post(row.agent_session_id, renderer.thought(text), timeout_s=ACK_TIMEOUT_S)
         return True
@@ -537,11 +557,46 @@ class Outbound:
         """Q10: only the approval-timeout edit; its body is never echoed."""
         if not str(message_id).startswith("approval:"):
             return SendResult(success=False, error="Not supported")
-        await self._expire(str(message_id).split(":", 1)[1], "approval", APPROVAL_EXPIRED_TEXT)
+        rid = str(message_id).split(":", 1)[1]
+        if not await self.defer(rid, "approval"):
+            await self._expire(rid, "approval", APPROVAL_EXPIRED_TEXT)
         return SendResult(success=True, message_id=message_id)
 
     async def retire_clarify(self, clarify_id: str) -> None:
-        await self._expire(str(clarify_id), "clarify", EXPIRED_TEXT)
+        if not await self.defer(str(clarify_id), "clarify"):
+            await self._expire(str(clarify_id), "clarify", EXPIRED_TEXT)
+
+    def _cancelled(self, row: Any) -> bool:
+        """The wait ended because the plugin stopped the session, or the row is stale: its
+        generation is not the one the session's chat id carries now (re-delegation, or a
+        mention thread now routed to the delegated ticket). Such a question must not stay
+        pending."""
+        if row.agent_session_id in self.a.turns.stop_message_ids.values():
+            return True
+        store = self.a._store
+        session = store.session(row.agent_session_id) if store is not None else None
+        ticket = store.ticket(session.issue_id) if session is not None else None
+        if ticket is None:
+            return False
+        # The generation the session's chat id carries now (a mention thread's: none, 0).
+        current = _generation(router_session_key(session, ticket)[0])
+        return row.execution_generation != current
+
+    async def defer(self, rid: str, kind: str) -> bool:
+        """Hermes's wait for ``rid`` ended unanswered: a live, not cancelled row becomes
+        pending (nothing posted) and ``Blocked`` is spawned onto its target. True if deferred."""
+        store = self.a._store
+        row = store.control(rid) if store is not None else None
+        if row is None or row.kind != kind or row.state != "live" or self._cancelled(row):
+            return False
+        ticket = questions.blocked_target(store, row)
+        if not store.mark_control_pending(rid, ticket):
+            return False
+        client = self.a._client
+        if ticket is not None and client is not None:
+            self.a._spawn(questions.set_blocked(client, ticket, True))
+        log.info("linear: %s %s pending (target %s)", kind, rid, ticket)
+        return True
 
     # ------------------------------------------------------------ tool events (hooks.py)
 

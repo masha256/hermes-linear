@@ -114,6 +114,7 @@ async def test_pending_control_allows_error_response_and_expiry(env, session_env
     a.outbound.safety_expired(a.turns.find(mid)[1])  # an error activity
     await settle(a)
     assert kinds(client, n) == [(D_SID, "error", outbound_mod.TIMED_OUT_TEXT)]
+    a.turns.stop_message_ids["stop-1"] = D_SID  # cancel path: expiry (a timeout goes pending)
     await a.retire_clarify_card("clar-1", "x")
     await settle(a)
     assert kinds(client, n)[-1] == (D_SID, "thought", outbound_mod.EXPIRED_TEXT)
