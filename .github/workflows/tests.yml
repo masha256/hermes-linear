@@ -2,8 +2,9 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
+    branches: [main]
   workflow_dispatch:
   schedule:
     - cron: "17 14 * * 1"   # Mondays: also test against hermes-agent main
