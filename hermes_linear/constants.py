@@ -18,3 +18,4 @@ WRITE_RETRIES = 3
 ACK_TIMEOUT_S = 8  # Linear calls on the event worker must finish inside Linear's 10 s window
 TURN_SAFETY_TIMEOUT_S = 3 * 3600  # a handed-off turn that never completes frees its FIFO
 STOP_SETTLE_S = 30  # a stopped turn the gateway never completes is answered and freed (Q6)
+TOOL_TIMEOUT_S = 30.0  # agent tool bridge: bounded wait for a Linear call on the adapter loop

@@ -97,7 +97,9 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._tasks: set[asyncio.Task] = set()
         self._writer: renderer.ActivityWriter | None = None  # responses (degraded, §8.6)
         self._activity_writer: renderer.ActivityWriter | None = None  # thoughts, actions, …
-        self.event_loop: asyncio.AbstractEventLoop | None = None  # for hooks.py
+        self.event_loop: asyncio.AbstractEventLoop | None = None  # for hooks.py, agent_tools.py
+        # Issue ids each gateway session created through agent tools (write scope, RET-80).
+        self.tool_created: dict[str, set[str]] = {}
         self._ack_writer: renderer.ActivityWriter | None = None  # acks, refusals, control replies
         self.delegation_wait_s: float | None = None  # override of AwaitDelegation.deadline_s
         self.turns = TurnEngine(  # callables late-bound: tests replace handle_message etc.
@@ -118,6 +120,11 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self.outbound = Outbound(self)
 
     last_outcome = property(lambda self: self.turns.last_outcome)
+
+    @property
+    def client(self) -> LinearClient | None:
+        """The Linear client (agent tools; use only on ``event_loop``)."""
+        return self._client
 
     stop_message_ids = property(lambda self: self.turns.stop_message_ids)
 
@@ -263,6 +270,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._store = None
         self.turns.reset()
         self.outbound.reset()
+        self.tool_created.clear()
         self.event_loop = None
         self._mark_disconnected()
 
@@ -482,6 +490,15 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 self.outbound.turn_finished(found, outcome)  # stop reply, fallback, heartbeat
             finally:
                 self.turns.complete(found)  # releases after this base task ends (Q5)
+                self._forget_tool_created(found)
+
+    def _forget_tool_created(self, found: Any) -> None:
+        """A session's last turn finished: its tool-created issues leave the write scope."""
+        if found is None:
+            return
+        key, turn = found
+        if turn.session_key and not self.turns.queues.get(key):
+            self.tool_created.pop(turn.session_key, None)
 
     async def _fatal(self, reason: str) -> None:
         log.error("linear: fatal: %s", reason)
