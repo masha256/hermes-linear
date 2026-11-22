@@ -162,8 +162,11 @@ state. `SessionOpener.resolve_control`:
   option click arrives as its label).
 - **pending, approval**: parse the answer with `renderer.parse_approval_answer`. An
   unrecognised answer is re-asked as today (`REASK_TEXT`). For `once` / `session`: run the
-  refusal check (`approval_refusal` with the replying actor); on refusal post the refusal text
-  and keep the row. Otherwise store a grant `(session_key, command, choice, actor_id)`, drop
+  answer check against the approval's authority captured when it was asked
+  (`tools.approval.list_gateway_approval_authority`, stored on the row; checked with
+  `gateway.approval_actor.may_answer`). `approval_refusal` cannot be used here: once Hermes
+  timed the approval out it is no longer pending, and nothing pending is never refused. On
+  refusal post the refusal text and keep the row; a row with no stored authority is refused. Otherwise store a grant `(session_key, command, choice, actor_id)`, drop
   the row, remove `Blocked`, and start the turn `Answer to approval for \`<command>\`: approved
   (<choice>)`. For `deny`: drop the row, remove `Blocked`, and start the turn `Answer to approval
   for \`<command>\`: denied`.
