@@ -14,12 +14,13 @@ API contracts (``docs/hermes-integration-notes.md``; Hermes ``hermes_cli/plugins
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any, Callable
 
 from gateway.config import Platform
 from gateway.platforms._shared import get_scoped_secret
 
-from . import hooks
+from . import agent_tools, hooks
 from .adapter import PLATFORM, LinearAdapter, set_config_getter
 from .settings import (
     ALLOW_ALL_USERS_ENV, ALLOWED_USERS_ENV, CLIENT_SECRET_KEY, WEBHOOK_SECRET_KEY, SettingsError,
@@ -30,9 +31,18 @@ log = logging.getLogger(__name__)
 
 PLATFORM_HINT = (
     "You are working inside Linear. Your final reply is posted as a comment in the thread that "
-    "asked. Linear issue/user URLs in markdown render as mentions."
+    "asked. Linear issue/user URLs in markdown render as mentions. If the ticket says 'manage "
+    "with hermes-linear', or the repo has `.hermes-linear.yaml`, load "
+    "`linear:manage-superpowers` first."
 )
 EMOJI = "📐"
+#: Plugin toolset for the agent tools. Not ``linear``: that name hides the Linear MCP server's
+#: tools (integration notes Q1); not ``hermes-*``: those are platform bundles.
+TOOLSET = "hermes_linear"
+SKILL_NAME = "manage-superpowers"
+#: The skill index clips at 60 chars (notes Q4); the trigger phrase lives in PLATFORM_HINT.
+SKILL_DESCRIPTION = "Use when a repo has .hermes-linear.yaml or ticket says so."
+SKILL_PATH = Path(__file__).parent / "skills" / SKILL_NAME / "SKILL.md"
 REQUIRED_ENV = [CLIENT_SECRET_KEY, WEBHOOK_SECRET_KEY]
 INSTALL_HINT = "run `hermes linear setup` to store the Linear client and webhook secrets"
 
@@ -84,7 +94,7 @@ def _pin_platform_member() -> None:
 
 
 def register(ctx) -> None:
-    """Register the Linear platform, the tool hooks and ``hermes linear``."""
+    """Register the Linear platform, agent tools, skill, tool hooks and ``hermes linear``."""
     from . import setup_cli  # deferred: keeps CLI helpers out of the adapter import path
 
     get_config = ctx.get_config
@@ -124,6 +134,11 @@ def register(ctx) -> None:
         max_message_length=0,
     )
     _pin_platform_member()
+    for name, schema in agent_tools.TOOL_SCHEMAS.items():
+        ctx.register_tool(name, toolset=TOOLSET, schema=schema,
+                          handler=agent_tools.TOOL_HANDLERS[name],
+                          description=schema["description"], emoji=EMOJI)
+    ctx.register_skill(SKILL_NAME, SKILL_PATH, description=SKILL_DESCRIPTION)
     ctx.register_hook("pre_tool_call", hooks.on_pre_tool_call)
     ctx.register_hook("post_tool_call", hooks.on_post_tool_call)
     ctx.register_cli_command(

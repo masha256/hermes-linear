@@ -7,6 +7,14 @@ description: >
   workspace webhooks on a shared listener and runs one Hermes session per
   delegated ticket, reporting progress back as Linear agent activities.
 author: masha256
+provides_tools:
+  - linear_issue_get
+  - linear_issue_create
+  - linear_issue_update
+  - linear_comment
+  - linear_sync_spec
+  - linear_sync_plan
+  - linear_task_state
 provides_hooks:
   - pre_tool_call
   - post_tool_call

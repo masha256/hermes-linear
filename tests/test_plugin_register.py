@@ -41,8 +41,16 @@ UUID_A = "00000000-0000-4000-8000-000000000001"
 
 EXPECTED_HINT = (
     "You are working inside Linear. Your final reply is posted as a comment in the thread that "
-    "asked. Linear issue/user URLs in markdown render as mentions."
+    "asked. Linear issue/user URLs in markdown render as mentions. If the ticket says 'manage "
+    "with hermes-linear', or the repo has `.hermes-linear.yaml`, load "
+    "`linear:manage-superpowers` first."
 )
+MARKER_SENTENCE = ("If the ticket says 'manage with hermes-linear', or the repo has "
+                   "`.hermes-linear.yaml`, load `linear:manage-superpowers` first.")
+SKILL_DESCRIPTION = "Use when a repo has .hermes-linear.yaml or ticket says so."
+SKILL_MD = REPO_ROOT / "hermes_linear" / "skills" / "manage-superpowers" / "SKILL.md"
+TOOL_NAMES = ["linear_issue_get", "linear_issue_create", "linear_issue_update", "linear_comment",
+              "linear_sync_spec", "linear_sync_plan", "linear_task_state"]
 
 
 class FakeCtx:
@@ -53,6 +61,8 @@ class FakeCtx:
         self.hooks: list[tuple[str, object]] = []
         self.cli: list[dict] = []
         self.set_calls: list[tuple[str, object]] = []
+        self.tools: list[dict] = []
+        self.skills: list[dict] = []
 
     def get_config(self, key, default=None):
         return self.config.get(key, default)
@@ -66,6 +76,15 @@ class FakeCtx:
 
     def register_hook(self, name, cb, **kw):
         self.hooks.append((name, cb))
+
+    def register_tool(self, name, toolset, schema, handler, check_fn=None, requires_env=None,
+                      is_async=False, description="", emoji="", override=False):
+        self.tools.append({"name": name, "toolset": toolset, "schema": schema, "handler": handler,
+                           "is_async": is_async, "description": description, "emoji": emoji,
+                           "override": override})
+
+    def register_skill(self, name, path, description="", frontmatter=None):
+        self.skills.append({"name": name, "path": Path(path), "description": description})
 
     def register_cli_command(self, name, help, setup_fn, handler_fn=None, description=""):
         self.cli.append({"name": name, "help": help, "setup_fn": setup_fn,
@@ -173,6 +192,81 @@ def test_cli_registered(ctx):
         args = parser.parse_args([sub])
         assert args.linear_command == sub
     assert callable(entry["handler_fn"])
+
+
+# ------------------------------------------------------------------ agent tools and skill (RET-81)
+
+
+def test_tools_registered_in_hermes_linear_toolset(ctx):
+    from hermes_linear import agent_tools
+
+    assert [t["name"] for t in ctx.tools] == TOOL_NAMES
+    for t in ctx.tools:
+        assert t["toolset"] == "hermes_linear", t["name"]
+        assert t["schema"] is agent_tools.TOOL_SCHEMAS[t["name"]]
+        assert t["schema"]["name"] == t["name"] and t["schema"]["parameters"]["properties"]
+        assert t["handler"] is agent_tools.TOOL_HANDLERS[t["name"]]
+        assert t["description"] == t["schema"]["description"]
+        assert t["emoji"] == "📐"
+        assert t["is_async"] is False and t["override"] is False
+
+
+def test_manifest_declares_every_tool():
+    import yaml
+
+    manifest = yaml.safe_load((REPO_ROOT / "plugin.yaml").read_text())
+    assert manifest["provides_tools"] == TOOL_NAMES
+    assert manifest["provides_hooks"] == ["pre_tool_call", "post_tool_call"]
+
+
+def test_skill_registered(ctx):
+    assert len(ctx.skills) == 1
+    skill = ctx.skills[0]
+    assert skill["name"] == "manage-superpowers"
+    assert skill["path"] == Path(plugin.__file__).parent / "skills" / "manage-superpowers" / "SKILL.md"
+    assert skill["path"].is_file() and skill["path"].resolve() == SKILL_MD.resolve()
+    assert skill["description"] == SKILL_DESCRIPTION
+
+
+def test_platform_hint_mentions_marker():
+    assert MARKER_SENTENCE in plugin.PLATFORM_HINT
+    assert plugin.PLATFORM_HINT.startswith("You are working inside Linear.")
+
+
+def _frontmatter(text: str) -> dict:
+    import yaml
+
+    assert text.startswith("---\n")
+    head, _, _ = text[4:].partition("\n---\n")
+    return yaml.safe_load(head)
+
+
+def test_skill_frontmatter_valid():
+    meta = _frontmatter(SKILL_MD.read_text())
+    assert meta["name"] == "manage-superpowers"
+    assert meta["description"] == SKILL_DESCRIPTION
+    assert len(meta["description"]) <= 60
+    for key in ("requires_tools", "requires_toolsets", "fallback_for_tools",
+                "fallback_for_toolsets"):
+        assert key not in meta, key
+        assert key not in (meta.get("metadata") or {}).get("hermes", {}), key
+
+
+def test_skill_body_is_a_short_overlay_naming_every_tool():
+    text = SKILL_MD.read_text()
+    assert len(text.splitlines()) <= 150
+    assert "manage with hermes-linear" in text
+    for name in TOOL_NAMES:
+        assert f"`{name}`" in text, name
+    assert "tool_describe" in text and "tool_call" in text
+    for stage in ("brainstorming", "writing-plans", "subagent-driven-development"):
+        assert f"superpowers:{stage}" in text, stage
+
+
+def test_skill_ships_as_package_data():
+    meta = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
+    data = meta["tool"]["setuptools"]["package-data"]["hermes_linear"]
+    assert "skills/*/SKILL.md" in data
 
 
 # ------------------------------------------------------------------ fakes for the CLI
