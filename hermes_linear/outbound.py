@@ -9,6 +9,9 @@ Q8, Q10).
   addressed to it by ``reply_to`` / ``reply_to_message_id`` (attachment fallback, late final)
   is another ``response``; a status/interim notice is dropped unless another turn of the
   agent session is in flight. A cancelled caller never unqueues a response write (shielded).
+* Media (Ruling 35): ``media_text`` renders attachments as markdown; a remote http(s) URL is
+  linked/embedded, a local file is named by its basename only (never uploaded, never its path).
+  The base sends every attachment of a final reply with ``notify`` metadata and no reply_to.
 * Stop (Q6): the gateway's ``/stop`` acknowledgement is recognised by ``reply_to`` and never
   forwarded; a stopped turn with no response gets ``Stopped.`` as its ``response`` when it
   completes (CANCELLED or FAILURE), or after ``STOP_SETTLE_S`` if the gateway never completes it.
@@ -33,11 +36,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from collections import deque
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
+from urllib.parse import unquote, urlparse
 
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import ProcessingOutcome
@@ -62,7 +67,7 @@ _NOTICE_KEYS = frozenset({"thread_id", "hermes_profile"})  # turn-error notice m
 _APPROVAL_CHOICES = ("once", "session", "deny")  # spec §8.4 omits "always" (Q8)
 _TODO_TOOLS = frozenset({"todo", "todo_list"})  # tools/todo_tool.py: name + legacy alias
 _REMEMBER = 1024  # bound of every per-turn / per-session memory below (LRU)
-__all__ = ["Outbound", "Target"]
+__all__ = ["Outbound", "Target", "media_text"]
 
 
 @dataclass(frozen=True)
@@ -142,6 +147,38 @@ def _done(value: bool) -> asyncio.Future:
     fut = asyncio.get_running_loop().create_future()
     fut.set_result(value)
     return fut
+
+
+def _md_label(text: str) -> str:
+    return " ".join(str(text).split()).replace("[", "\\[").replace("]", "\\]")
+
+
+def _md_url(url: str) -> str:
+    return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+
+def media_text(kind: str, ref: str, caption: Optional[str] = None,
+               file_name: Optional[str] = None) -> str:
+    """Markdown for an attachment (Ruling 35). ``kind`` is ``"image"`` or ``"file"``.
+
+    Remote http(s): an image is embedded (``![alt](url)``, caption on its own line), a file is a
+    link (``[caption or name](url)``). Anything else is a local file Linear never receives: only
+    its basename is shown, never the host path."""
+    ref = str(ref or "")
+    parsed = urlparse(ref)
+    remote = parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    path = unquote(parsed.path) if (remote or parsed.scheme == "file") else ref
+    name = os.path.basename(str(file_name or "").rstrip("/\\")) or os.path.basename(
+        path.rstrip("/\\")) or kind
+    caption = str(caption).strip() if caption else ""
+    if remote and kind == "image":
+        text = f"![{_md_label(caption or 'image')}]({_md_url(ref)})"
+    elif remote:
+        return f"[{_md_label(caption or name)}]({_md_url(ref)})"
+    else:
+        label = "image" if kind == "image" else "file"
+        text = f"Attached {label}: {name} (not uploaded to Linear)"
+    return f"{text}\n\n{caption}" if caption else text
 
 
 def _generation(chat_id: str) -> int:
@@ -224,7 +261,11 @@ class Outbound:
             log.warning("linear: streamed preview (expect_edits) posted as a thought; text "
                         "streaming is not supported on Linear")
             return "thought"
-        if t.via == "chat" and self.a.turns.current_turn_for(*t.key) is None:
+        # Ruling 35: ``notify`` marks the base's user-visible final content (final text and
+        # every attachment of it, which never carry reply_to); it is anchored like reply_to.
+        # Heartbeat / stuck-warning (interim, above) and the turn-error notice never carry it.
+        anchored = t.via != "chat" or bool(md.get("notify"))
+        if not anchored and self.a.turns.current_turn_for(*t.key) is None:
             # T1 deferral: the first anchorless send after a turn consumes its outcome.
             outcome = self.a.turns.last_outcome.pop(t.key, None)
             if (reply_to is None and set(md) <= _NOTICE_KEYS
@@ -234,10 +275,10 @@ class Outbound:
                      "(session %s)", t.sid)
             return "thought"
         if t.mid in self.responded:
-            if t.via == "chat":
+            if not anchored:
                 return "thought"  # a status notice: dropped by send() (Ruling 33)
-            # Ruling 33: real content addressed to the answered turn (the base attachment
-            # fallback, a late final) is an additional response, never a thought after it.
+            # Rulings 33/35: real content for the answered turn (attachments of the final,
+            # a late final) is an additional response, never a thought after it.
             log.info("linear: turn %s already has its response; posting another", t.mid)
             return "more"
         return "response"

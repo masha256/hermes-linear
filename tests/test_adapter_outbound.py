@@ -20,6 +20,7 @@ from test_adapter_inbound import (  # noqa: F401  (also registers the linear pla
     FakeListener, Gateway, complete, deliver, make_settings, prompted,
 )
 from gateway.config import PlatformConfig
+from gateway.platforms import base as base_mod
 from gateway.platforms.base import ExecApprovalPrompt
 from gateway.platforms.event import ProcessingOutcome
 
@@ -964,23 +965,116 @@ def test_outbound_memory_bounded():
 # ------------------------------------------------------------- fix round 2
 
 
-async def test_attachment_after_response_posted_as_response(env):
+def _final_metadata(ev):
+    """The metadata ``_process_message_background`` gives the final text and attachments."""
+    return base_mod._mark_notify_metadata(base_mod._thread_metadata_for_event(ev))
+
+
+async def _base_final(a, ev, text, *, images=(), media_files=(), local_files=()):
+    """Drive the base's own final-reply delivery: final text, then ``_deliver_attachments``."""
+    md = _final_metadata(ev)
+    results: list = []
+    if text:
+        results.append(await a.send(ev.source.chat_id, text,
+                                    reply_to=base_mod._reply_anchor_for_event(ev), metadata=md))
+    extracted = base_mod._ExtractedResponse(
+        text_content=text, images=list(images), media_files=list(media_files),
+        local_files=list(local_files), force_document_attachments=False, pre_extract=text)
+    await a._deliver_attachments(ev, extracted, md, anything_sent=bool(text),
+                                 record_delivery=results.append)
+    return md, results
+
+
+async def test_attachment_after_response_posted_as_response(env, tmp_path):
     a, client, gw, store, order = env
     await deliver(a, DELEGATION)
-    mid = gw.events[0].message_id
-    await a.send(D_CHAT, "looking", metadata={"reply_to_message_id": mid, "_interim_send": True})
-    await a.send(D_CHAT, "Here is the chart", reply_to=mid, metadata={"notify": True})
-    # The base attachment fallback (_deliver_attachments -> send_image -> send) runs after
-    # the final text, while the turn is still in flight.
-    res = await a.send_image(D_CHAT, "https://x.example/chart.png", caption="chart",
-                             reply_to=mid, metadata={"thread_id": None})
-    assert res.success
-    await complete(a, gw.events[0])
+    ev = gw.events[0]
+    await a.send(D_CHAT, "looking", metadata={"reply_to_message_id": ev.message_id,
+                                              "_interim_send": True})
+    report = tmp_path / "secret-dir" / "report.pdf"
+    md, results = await _base_final(a, ev, "Here is the chart",
+                                    images=[("https://x.example/chart.png", "chart")],
+                                    local_files=[str(report)])
+    assert md.get("notify") is True and "reply_to_message_id" not in md  # the real base shape
+    assert [r.success for r in results] == [True, True, True]
+    await complete(a, ev)
     kinds = [c["type"] for _s, c, *_ in client.activities]
     first = kinds.index("response")
-    assert kinds[first:] == ["response", "response"]  # no thought after the first response
-    assert bodies(client, "response") == [(D_SID, "Here is the chart"),
-                                          (D_SID, "chart\nhttps://x.example/chart.png")]
+    assert kinds[first:] == ["response", "response", "response"]  # final, image, document
+    got = [b for _s, b in bodies(client, "response")]
+    assert got[0] == "Here is the chart"
+    assert got[1].startswith("![chart](https://x.example/chart.png)")
+    assert got[2] == "Attached file: report.pdf (not uploaded to Linear)"
+    assert not any(str(tmp_path) in b for b in got)  # never a local path
+
+
+async def test_media_only_and_local_media_rendered(env, tmp_path):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    ev = gw.events[0]
+    img, vid, aud = (str(tmp_path / n) for n in ("plot.png", "clip.mp4", "note.mp3"))
+    _md, results = await _base_final(a, ev, "", local_files=[img, vid],
+                                     media_files=[(aud, False)])
+    assert all(r.success for r in results)
+    await complete(a, ev)
+    got = sorted(b for _s, b in bodies(client, "response"))
+    assert got == sorted(["Attached image: plot.png (not uploaded to Linear)",
+                          "Attached file: clip.mp4 (not uploaded to Linear)",
+                          "Attached file: note.mp3 (not uploaded to Linear)"])
+    assert [c["type"] for _s, c, *_ in client.activities][-3:] == ["response"] * 3
+
+
+async def test_media_rendering_direct(env):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    ev = gw.events[0]
+    md = _final_metadata(ev)
+    await a.send_image(D_CHAT, "https://x.example/a.png", metadata=md)
+    await a.send_image(D_CHAT, "file:///home/u/private/b%20c.png", caption="pic", metadata=md)
+    await a.send_document(D_CHAT, "https://x.example/r.pdf", metadata=md)
+    await a.send_document(D_CHAT, "https://x.example/r.pdf", caption="Report", metadata=md)
+    await a.send_document(D_CHAT, "/home/u/private/x.bin", file_name="nice.bin",
+                          caption="the file", metadata=md)
+    got = [b for _s, b in bodies(client, "response")]
+    assert got == ["![image](https://x.example/a.png)",
+                   "Attached image: b c.png (not uploaded to Linear)\n\npic",
+                   "[r.pdf](https://x.example/r.pdf)",
+                   "[Report](https://x.example/r.pdf)",
+                   "Attached file: nice.bin (not uploaded to Linear)\n\nthe file"]
+    assert not any("/home/u" in b for b in got)
+
+
+async def test_heartbeat_after_response_still_dropped(env, caplog):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    ev = gw.events[0]
+    await _base_final(a, ev, "All done")
+    n = len(client.activities)
+    thread_md = base_mod._thread_metadata_for_event(ev)  # what heartbeat/stuck/error use
+    with caplog.at_level(logging.DEBUG, logger="hermes_linear.outbound"):
+        # gateway heartbeat / stuck warning: _interim_metadata(thread metadata), no notify
+        r1 = await a.send(D_CHAT, "⏳ Still working...", metadata={**(thread_md or {}),
+                                                                 "_interim_send": True})
+        # an unmarked status send with thread metadata only (no notify) is still dropped
+        r2 = await a.send(D_CHAT, "status", metadata=thread_md)
+        # notify never rescues an interim send
+        r3 = await a.send(D_CHAT, "interim", metadata={"notify": True, "_interim_send": True})
+    await a.wait_idle()
+    assert r1.success and r2.success and r3.success
+    assert len(client.activities) == n
+    await complete(a, ev)
+    assert client.activities[-1][1]["type"] == "response"
+
+
+async def test_turn_error_notice_metadata_has_no_notify(env):
+    """Pin the base: ``_notify_turn_error`` sends bare thread metadata (no notify)."""
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    ev = gw.events[0]
+    await complete(a, ev, ProcessingOutcome.FAILURE)
+    used = await a._notify_turn_error(ev, RuntimeError("boom"))
+    assert not (used or {}).get("notify")
+    assert [c["type"] for _s, c, *_ in client.activities][-1] == "error"
 
 
 async def test_status_notice_after_response_dropped_while_turn_still_in_flight(env, caplog):

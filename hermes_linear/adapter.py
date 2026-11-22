@@ -34,7 +34,7 @@ from .access import AccessPolicy, gateway_allow_from
 from .constants import ACK_TIMEOUT_S
 from .linear_client import LinearClient
 from .listener import ProfileEndpoint, get_listener
-from .outbound import Outbound
+from .outbound import Outbound, media_text
 from .models import (AddContext, AwaitDelegation, Fatal, Ignore, Interrupt, OpenSessionOnComment,
                      Refuse, ResolveControl, SetMode, StartTurn)
 from .router import RouterContext, route
@@ -268,6 +268,42 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
         return await self.outbound.send(chat_id, content, reply_to, metadata)
+
+    # Media (Ruling 35): rendered as markdown and sent through ``send`` with the caller's
+    # metadata, so a final reply's attachments (notify, no reply_to) classify as content.
+    # send_animation / send_multiple_images reach these through the base defaults.
+
+    async def _send_media(self, kind: str, chat_id: str, ref: str, caption: Optional[str],
+                          reply_to: Optional[str], metadata: Optional[dict[str, Any]],
+                          file_name: Optional[str] = None) -> SendResult:
+        text = media_text(kind, ref, caption, file_name)
+        return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+
+    async def send_image(self, chat_id: str, image_url: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None,
+                         metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        return await self._send_media("image", chat_id, image_url, caption, reply_to, metadata)
+
+    async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
+                              reply_to: Optional[str] = None,
+                              metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
+        return await self._send_media("image", chat_id, image_path, caption, reply_to, metadata)
+
+    async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None,
+                            file_name: Optional[str] = None, reply_to: Optional[str] = None,
+                            metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
+        return await self._send_media("file", chat_id, file_path, caption, reply_to, metadata,
+                                      file_name)
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None,
+                         metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
+        return await self._send_media("file", chat_id, video_path, caption, reply_to, metadata)
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None,
+                         metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
+        return await self._send_media("file", chat_id, audio_path, caption, reply_to, metadata)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         self.outbound.typing(chat_id, metadata)  # spawns the write; never waits on Linear
