@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Coroutine
 
@@ -271,4 +272,314 @@ async def _walk_scope(client: Any, issue_id: str, allowed: set[str]) -> str | No
     return "OUT_OF_SCOPE"
 
 
-__all__ = ["ToolContext", "check_write_scope", "resolve_context", "run_on_adapter"]
+# ----------------------------------------------------------------- generic tools (RET-76)
+#
+# Handlers are sync ``handler(args, **kw) -> dict`` and never raise. Arguments are validated
+# before anything else (``BAD_ARGS``); every Linear call, scope check and ``tool_created``
+# update then runs in one coroutine on the adapter loop (``run_on_adapter``). Issue
+# references may be identifiers or UUIDs; each is resolved with ``issue_get`` first so scope
+# checks and ``tool_created`` see the UUID Linear returns.
+
+MARKER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+
+
+class _Refusal(Exception):
+    """Raised inside a tool coroutine to answer ``{"ok": False, "error": code}``."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def resolve_state(states: list[dict], name_or_type: str) -> str | None:
+    """The state id named ``name_or_type`` (case-insensitive), else the first of that type."""
+    want = (name_or_type or "").strip().casefold()
+    if not want:
+        return None
+    for s in states:
+        if (s.get("name") or "").casefold() == want:
+            return s.get("id")
+    for s in states:
+        if (s.get("type") or "").casefold() == want:
+            return s.get("id")
+    return None
+
+
+def _marker_tag(marker: str) -> str:
+    return f"<!-- hermes-linear:{marker} -->"
+
+
+def _opt_str(args: dict, key: str) -> str | None:
+    val = args.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        raise _Refusal("BAD_ARGS")
+    return val
+
+
+def _req_str(args: dict, key: str) -> str:
+    val = _opt_str(args, key)
+    if val is None or not val.strip():
+        raise _Refusal("BAD_ARGS")
+    return val.strip() if key in {"id", "parent"} else val
+
+
+def _opt_names(args: dict, key: str) -> list[str]:
+    val = args.get(key)
+    if val is None:
+        return []
+    if not isinstance(val, list) or not all(isinstance(v, str) and v.strip() for v in val):
+        raise _Refusal("BAD_ARGS")
+    return [v.strip() for v in val]
+
+
+def _tool(parse: Callable[[dict], dict],
+          body: Callable[[ToolContext, dict], Coroutine[Any, Any, dict]]) -> Callable[..., dict]:
+    """Wrap ``parse`` (sync arg validation) and ``body`` (loop coroutine) into a handler."""
+    def handler(args: Any = None, **kw: Any) -> dict:
+        try:
+            if not isinstance(args, dict):
+                return _err("BAD_ARGS")
+            try:
+                parsed = parse(args)
+            except _Refusal as r:
+                return _err(r.code)
+            ctx = resolve_context(kw.get("session_id"))
+            if ctx.client is None:
+                return _err("NOT_CONNECTED")
+
+            async def run() -> dict:
+                try:
+                    return await body(ctx, parsed)
+                except _Refusal as r:
+                    return _err(r.code)
+            return run_on_adapter(ctx, run)
+        except Exception as exc:  # noqa: BLE001 - Q3.4: a tool never raises
+            log.warning("linear: tool failed: %s", type(exc).__name__)
+            return _err(type(exc).__name__)
+    return handler
+
+
+async def _writable(ctx: ToolContext, ref: str) -> dict:
+    """``issue_get(ref)`` if the session may write it (by its UUID), else ``_Refusal``."""
+    if not ctx.is_linear or not ctx.session_issue_id:
+        raise _Refusal("NOT_LINEAR_SESSION")
+    issue = await ctx.client.issue_get(ref)
+    code = await check_write_scope(ctx, issue["id"])
+    if code is not None:
+        raise _Refusal(code)
+    return issue
+
+
+async def _state_id(ctx: ToolContext, team_id: str, name: str) -> str:
+    sid = resolve_state(await ctx.client.team_states(team_id), name)
+    if sid is None:
+        raise _Refusal("BAD_ARGS")
+    return sid
+
+
+async def _label_ids(ctx: ToolContext, team_id: str, *groups: list[str]) -> list[list[str]]:
+    """Label ids for each list of names (case-insensitive); an unknown name: LABEL_MISSING."""
+    if not any(groups):
+        return [[] for _ in groups]
+    by_name: dict[str, str] = {}
+    for lb in await ctx.client.team_labels(team_id):
+        by_name.setdefault((lb.get("name") or "").casefold(), lb["id"])
+    out = []
+    for names in groups:
+        ids = []
+        for n in names:
+            lid = by_name.get(n.casefold())
+            if lid is None:
+                raise _Refusal("LABEL_MISSING")  # probe P3: the app cannot create labels
+            if lid not in ids:
+                ids.append(lid)
+        out.append(ids)
+    return out
+
+
+def _team_of(issue: dict) -> str:
+    team = (issue.get("team") or {}).get("id")
+    if not team:
+        raise _Refusal("LINEAR_ERROR")
+    return team
+
+
+# -- linear_issue_get
+
+
+def _parse_get(args: dict) -> dict:
+    return {"id": _req_str(args, "id")}
+
+
+async def _get(ctx: ToolContext, a: dict) -> dict:
+    return {"ok": True, "issue": await ctx.client.issue_get(a["id"])}
+
+
+# -- linear_issue_create
+
+
+def _parse_create(args: dict) -> dict:
+    return {"title": _req_str(args, "title"), "description": _opt_str(args, "description"),
+            "parent": _opt_str(args, "parent"), "labels": _opt_names(args, "labels"),
+            "state": _opt_str(args, "state")}
+
+
+async def _create(ctx: ToolContext, a: dict) -> dict:
+    if not ctx.is_linear or not ctx.session_issue_id:
+        raise _Refusal("NOT_LINEAR_SESSION")
+    home = await ctx.client.issue_get(ctx.session_issue_id)
+    team = _team_of(home)
+    inp: dict[str, Any] = {"teamId": team, "title": a["title"]}
+    if (home.get("project") or {}).get("id"):
+        inp["projectId"] = home["project"]["id"]
+    if a["description"] is not None:
+        inp["description"] = a["description"]
+    if a["parent"] and a["parent"].strip():
+        inp["parentId"] = (await _writable(ctx, a["parent"].strip()))["id"]
+    if a["state"] is not None:
+        inp["stateId"] = await _state_id(ctx, team, a["state"])
+    (labels,) = await _label_ids(ctx, team, a["labels"])
+    if labels:
+        inp["labelIds"] = labels
+    issue = await ctx.client.issue_create(inp)
+    # On the loop (this coroutine): record the UUID Linear returned, never the identifier.
+    ctx.adapter.tool_created.setdefault(ctx.session_key or "", set()).add(issue["id"])
+    return {"ok": True, "issue": issue}
+
+
+# -- linear_issue_update
+
+
+def _parse_update(args: dict) -> dict:
+    a = {"id": _req_str(args, "id"), "title": _opt_str(args, "title"),
+         "description": _opt_str(args, "description"), "state": _opt_str(args, "state"),
+         "add_labels": _opt_names(args, "add_labels"),
+         "remove_labels": _opt_names(args, "remove_labels")}
+    if a["title"] is not None and not a["title"].strip():
+        raise _Refusal("BAD_ARGS")
+    if not (a["title"] is not None or a["description"] is not None or a["state"] is not None
+            or a["add_labels"] or a["remove_labels"]):
+        raise _Refusal("BAD_ARGS")
+    return a
+
+
+async def _update(ctx: ToolContext, a: dict) -> dict:
+    issue = await _writable(ctx, a["id"])
+    team = _team_of(issue)
+    inp: dict[str, Any] = {}
+    for key in ("title", "description"):
+        if a[key] is not None:
+            inp[key] = a[key]
+    if a["state"] is not None:
+        inp["stateId"] = await _state_id(ctx, team, a["state"])
+    added, removed = await _label_ids(ctx, team, a["add_labels"], a["remove_labels"])
+    if added:
+        inp["addedLabelIds"] = added
+    if removed:
+        inp["removedLabelIds"] = removed
+    return {"ok": True, "issue": await ctx.client.issue_update(issue["id"], inp)}
+
+
+# -- linear_comment
+
+
+def _parse_comment(args: dict) -> dict:
+    a = {"id": _req_str(args, "id"), "body": _req_str(args, "body"),
+         "edit_marker": _opt_str(args, "edit_marker")}
+    if a["edit_marker"] is not None and not MARKER_RE.match(a["edit_marker"]):
+        raise _Refusal("BAD_ARGS")
+    return a
+
+
+async def _comment(ctx: ToolContext, a: dict) -> dict:
+    issue = await _writable(ctx, a["id"])
+    body, marker = a["body"], a["edit_marker"]
+    if marker is None:
+        return {"ok": True, "comment_id": await ctx.client.comment_create(issue["id"], body),
+                "edited": False}
+    tag = _marker_tag(marker)
+    text = body if tag in body else f"{body.rstrip()}\n\n{tag}"
+    # Only the app's own comments: a human quoting the marker is never edited.
+    for c in await ctx.client.app_comments(issue["id"]):
+        if tag in (c.get("body") or ""):
+            await ctx.client.comment_update(c["id"], text)
+            return {"ok": True, "comment_id": c["id"], "edited": True}
+    return {"ok": True, "comment_id": await ctx.client.comment_create(issue["id"], text),
+            "edited": False}
+
+
+linear_issue_get = _tool(_parse_get, _get)
+linear_issue_create = _tool(_parse_create, _create)
+linear_issue_update = _tool(_parse_update, _update)
+linear_comment = _tool(_parse_comment, _comment)
+
+_ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
+
+TOOL_SCHEMAS: dict[str, dict] = {
+    "linear_issue_get": {
+        "name": "linear_issue_get",
+        "description": ("Read a Linear issue as the Linear app: state, team, project and links, "
+                        "parent, labels and sub-issues."),
+        "parameters": {"type": "object", "properties": {"id": {"type": "string",
+                                                               "description": _ISSUE_REF}},
+                       "required": ["id"]},
+    },
+    "linear_issue_create": {
+        "name": "linear_issue_create",
+        "description": ("Create a Linear issue as the Linear app, in the session issue's team "
+                        "and project. Set parent to make it a sub-issue (parent must be the "
+                        "session issue, a descendant, or an issue you created)."),
+        "parameters": {"type": "object", "properties": {
+            "title": {"type": "string"},
+            "description": {"type": "string", "description": "Markdown."},
+            "parent": {"type": "string", "description": _ISSUE_REF},
+            "labels": {"type": "array", "items": {"type": "string"},
+                       "description": "Existing label names."},
+            "state": {"type": "string",
+                      "description": "Workflow state name, or a type such as started."},
+        }, "required": ["title"]},
+    },
+    "linear_issue_update": {
+        "name": "linear_issue_update",
+        "description": ("Update a Linear issue as the Linear app: title, description, state, "
+                        "labels. Only the session issue, its descendants, or issues you "
+                        "created."),
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "string", "description": _ISSUE_REF},
+            "title": {"type": "string"},
+            "description": {"type": "string", "description": "Markdown; replaces the body."},
+            "state": {"type": "string",
+                      "description": "Workflow state name, or a type such as completed."},
+            "add_labels": {"type": "array", "items": {"type": "string"},
+                           "description": "Existing label names to add."},
+            "remove_labels": {"type": "array", "items": {"type": "string"},
+                              "description": "Label names to remove."},
+        }, "required": ["id"]},
+    },
+    "linear_comment": {
+        "name": "linear_comment",
+        "description": ("Comment on a Linear issue as the Linear app. With edit_marker, edit "
+                        "the app's earlier comment carrying that marker instead of adding a "
+                        "new one."),
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "string", "description": _ISSUE_REF},
+            "body": {"type": "string", "description": "Markdown."},
+            "edit_marker": {"type": "string",
+                            "description": "Stable key, e.g. status (letters, digits, _.:-)."},
+        }, "required": ["id", "body"]},
+    },
+}
+
+TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
+    "linear_issue_get": linear_issue_get,
+    "linear_issue_create": linear_issue_create,
+    "linear_issue_update": linear_issue_update,
+    "linear_comment": linear_comment,
+}
+
+
+__all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
+           "linear_comment", "linear_issue_create", "linear_issue_get", "linear_issue_update",
+           "resolve_context", "resolve_state", "run_on_adapter"]

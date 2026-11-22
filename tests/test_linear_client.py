@@ -376,3 +376,108 @@ async def test_viewer_returns_handle_and_caches_id(fake, client):
     assert "displayName" in fake.gql_calls("Viewer")[0].json["query"]
     assert await client.viewer_id() == APP_USER
     assert len(fake.gql_calls("Viewer")) == 1
+
+
+# -- agent tool operations (RET-76) --------------------------------------
+
+ISSUE_NODE = {
+    "id": "uuid-1", "identifier": "RET-1", "title": "T", "description": "D",
+    "url": "https://linear.app/x/issue/RET-1",
+    "state": {"id": "s1", "name": "Todo", "type": "unstarted"},
+    "team": {"id": "t1"},
+    "project": {"id": "p1", "name": "P",
+                "externalLinks": {"nodes": [{"label": "Spec", "url": "https://e.test/s"}]}},
+    "parent": {"id": "uuid-0", "identifier": "RET-0"},
+    "labels": {"nodes": [{"id": "l1", "name": "Bug"}]},
+    "children": {"nodes": [{"id": "uuid-2", "identifier": "RET-2", "title": "C",
+                            "subIssueSortOrder": 1.5, "state": {"type": "started"}}]},
+}
+
+
+async def test_client_issue_get_shape(fake, client):
+    fake.on("IssueGet", {"data": {"issue": ISSUE_NODE}})
+    i = await client.issue_get("RET-1")
+    (call,) = fake.gql_calls("IssueGet")
+    assert call.variables == {"id": "RET-1"}
+    for field in ("subIssueSortOrder", "externalLinks", "children", "parent", "url"):
+        assert field in call.json["query"]
+    assert i["id"] == "uuid-1" and i["state"]["type"] == "unstarted"
+    assert i["labels"] == [{"id": "l1", "name": "Bug"}]
+    assert i["children"] == ISSUE_NODE["children"]["nodes"]
+    assert i["project"]["externalLinks"] == [{"label": "Spec", "url": "https://e.test/s"}]
+    assert i["parent"] == {"id": "uuid-0", "identifier": "RET-0"}
+
+
+async def test_client_issue_get_null_is_not_found(fake, client):
+    fake.on("IssueGet", {"data": {"issue": None}})
+    with pytest.raises(LinearError) as ei:
+        await client.issue_get("RET-404")
+    assert ei.value.code == "NOT_FOUND"
+
+
+async def test_client_issue_create(fake, client):
+    created = {"id": "uuid-9", "identifier": "RET-9", "title": "N", "url": "u"}
+    fake.on("IssueCreate", {"data": {"issueCreate": {"success": True, "issue": created}}})
+    inp = {"teamId": "t1", "title": "N", "parentId": "uuid-1"}
+    assert await client.issue_create(inp) == created
+    assert fake.gql_calls("IssueCreate")[0].variables == {"input": inp}
+
+
+async def test_client_issue_create_unsuccessful(fake, client):
+    fake.on("IssueCreate", {"data": {"issueCreate": {"success": False, "issue": None}}})
+    with pytest.raises(LinearError):
+        await client.issue_create({"teamId": "t1", "title": "N"})
+
+
+async def test_client_issue_update(fake, client):
+    out = {"id": "uuid-1", "identifier": "RET-1", "title": "T", "url": "u"}
+    fake.on("IssueUpdate", {"data": {"issueUpdate": {"success": True, "issue": out}}})
+    assert await client.issue_update("uuid-1", {"addedLabelIds": ["l1"]}) == out
+    assert fake.gql_calls("IssueUpdate")[0].variables == {"id": "uuid-1",
+                                                          "input": {"addedLabelIds": ["l1"]}}
+
+
+async def test_client_comment_create_and_update(fake, client):
+    fake.on("CommentCreate", {"data": {"commentCreate": {"success": True, "comment": {"id": "c1"}}}})
+    fake.on("CommentUpdate", {"data": {"commentUpdate": {"success": True, "comment": {"id": "c1"}}}})
+    assert await client.comment_create("uuid-1", "hi") == "c1"
+    assert fake.gql_calls("CommentCreate")[0].variables == {
+        "input": {"issueId": "uuid-1", "body": "hi"}}
+    assert await client.comment_update("c1", "edited") is None
+    assert fake.gql_calls("CommentUpdate")[0].variables == {"id": "c1",
+                                                            "input": {"body": "edited"}}
+
+
+async def test_client_app_comments_only_viewer(fake, client):
+    fake.on("IssueAppComments", {"data": {"issue": {"comments": {"nodes": [
+        {"id": "c1", "body": "mine", "user": {"id": APP_USER}},
+        {"id": "c2", "body": "human", "user": {"id": "human-1"}},
+        {"id": "c3", "body": "bot?", "user": None},
+    ]}}}})
+    assert await client.app_comments("uuid-1") == [{"id": "c1", "body": "mine"}]
+    call = fake.gql_calls("IssueAppComments")[0]
+    assert call.variables == {"id": "uuid-1", "userId": APP_USER}
+
+
+async def test_client_team_states_cached(fake, client):
+    fake.on("TeamStates", {"data": {"team": {"states": {"nodes": [
+        {"id": "s2", "name": "Done", "type": "completed", "position": 5},
+        {"id": "s1", "name": "Todo", "type": "unstarted", "position": 1},
+    ]}}}})
+    want = [{"id": "s1", "name": "Todo", "type": "unstarted"},
+            {"id": "s2", "name": "Done", "type": "completed"}]
+    assert await client.team_states("t1") == want
+    assert await client.team_states("t1") == want
+    assert len(fake.gql_calls("TeamStates")) == 1
+    assert fake.gql_calls("TeamStates")[0].variables == {"teamId": "t1"}
+
+
+async def test_client_team_labels_team_and_workspace(fake, client):
+    fake.on("TeamLabels", {"data": {"issueLabels": {"nodes": [
+        {"id": "l1", "name": "Bug", "isGroup": False},
+        {"id": "g1", "name": "Area", "isGroup": True},
+        {"id": "l2", "name": "superpowers:plan", "isGroup": False},
+    ]}}})
+    assert await client.team_labels("t1") == [{"id": "l1", "name": "Bug"},
+                                              {"id": "l2", "name": "superpowers:plan"}]
+    assert fake.gql_calls("TeamLabels")[0].variables == {"teamId": "t1"}

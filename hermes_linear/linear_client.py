@@ -74,7 +74,54 @@ QUERY_TEAM_STARTED = """query TeamStartedStates($teamId: String!) {
 }"""
 
 MUTATION_ISSUE_UPDATE = """mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
-  issueUpdate(id: $id, input: $input) { success }
+  issueUpdate(id: $id, input: $input) { success issue { id identifier title url } }
+}"""
+
+# -- agent tool operations (RET-76) ---------------------------------------
+
+QUERY_ISSUE_GET = """query IssueGet($id: String!) {
+  issue(id: $id) {
+    id identifier title description url
+    state { id name type }
+    team { id }
+    project { id name externalLinks { nodes { label url } } }
+    parent { id identifier }
+    labels { nodes { id name } }
+    children { nodes { id identifier title subIssueSortOrder state { type } } }
+  }
+}"""
+
+MUTATION_ISSUE_CREATE = """mutation IssueCreate($input: IssueCreateInput!) {
+  issueCreate(input: $input) { success issue { id identifier title url } }
+}"""
+
+MUTATION_COMMENT_CREATE = """mutation CommentCreate($input: CommentCreateInput!) {
+  commentCreate(input: $input) { success comment { id } }
+}"""
+
+MUTATION_COMMENT_UPDATE = """mutation CommentUpdate($id: String!, $input: CommentUpdateInput!) {
+  commentUpdate(id: $id, input: $input) { success comment { id } }
+}"""
+
+# Server-side filter on the app user; ``user.id`` is re-checked client-side.
+QUERY_ISSUE_APP_COMMENTS = """query IssueAppComments($id: String!, $userId: ID!) {
+  issue(id: $id) {
+    comments(first: 250, filter: { user: { id: { eq: $userId } } }) {
+      nodes { id body user { id } }
+    }
+  }
+}"""
+
+QUERY_TEAM_STATES = """query TeamStates($teamId: String!) {
+  team(id: $teamId) { states(first: 250) { nodes { id name type position } } }
+}"""
+
+# Team labels plus workspace labels (no team); group labels cannot be applied.
+QUERY_TEAM_LABELS = """query TeamLabels($teamId: ID!) {
+  issueLabels(first: 250, filter: { or: [{ team: { id: { eq: $teamId } } },
+                                         { team: { null: true } }] }) {
+    nodes { id name isGroup }
+  }
 }"""
 
 
@@ -132,6 +179,7 @@ class LinearClient:
         self._token: str | None = None
         self._renew_at = 0.0
         self._viewer_id: str | None = None
+        self._team_states: dict[str, list[dict]] = {}
         #: Wall-clock expiry of the cached token (status display only; renewal uses ``clock``).
         self.token_expires_at: float | None = None
 
@@ -355,3 +403,72 @@ class LinearClient:
         upd = await self.gql(MUTATION_ISSUE_UPDATE, {"id": issue_id, "input": {"stateId": first["id"]}})
         self._require_success(upd, "issueUpdate")
         return True
+
+    # -- agent tool operations (RET-76) -----------------------------------
+
+    @staticmethod
+    def _nodes(conn: Any) -> list[dict]:
+        return list((conn or {}).get("nodes") or []) if isinstance(conn, dict) else []
+
+    async def issue_get(self, issue_id: str) -> dict:
+        """An issue by UUID or identifier, connections flattened to lists
+        (``labels``, ``children``, ``project.externalLinks``). Null issue: ``NOT_FOUND``."""
+        data = await self.gql(QUERY_ISSUE_GET, {"id": issue_id})
+        i = data.get("issue")
+        if not isinstance(i, dict) or not i.get("id"):
+            raise LinearError("issue not found", code="NOT_FOUND")
+        out = dict(i)
+        out["labels"] = self._nodes(i.get("labels"))
+        out["children"] = self._nodes(i.get("children"))
+        if isinstance(i.get("project"), dict):
+            out["project"] = {**i["project"],
+                              "externalLinks": self._nodes(i["project"].get("externalLinks"))}
+        return out
+
+    async def issue_create(self, input: dict) -> dict:  # noqa: A002 - SDL argument name
+        """``issueCreate``; returns ``{id, identifier, title, url}`` of the new issue."""
+        data = await self.gql(MUTATION_ISSUE_CREATE, {"input": input})
+        issue = self._require_success(data, "issueCreate").get("issue")
+        if not isinstance(issue, dict) or not issue.get("id"):
+            raise LinearError("issueCreate returned no issue")
+        return issue
+
+    async def issue_update(self, issue_id: str, input: dict) -> dict:  # noqa: A002
+        """``issueUpdate``; returns ``{id, identifier, title, url}``."""
+        data = await self.gql(MUTATION_ISSUE_UPDATE, {"id": issue_id, "input": input})
+        return self._require_success(data, "issueUpdate").get("issue") or {"id": issue_id}
+
+    async def comment_create(self, issue_id: str, body: str) -> str:
+        data = await self.gql(MUTATION_COMMENT_CREATE,
+                              {"input": {"issueId": issue_id, "body": body}})
+        return self._require_success(data, "commentCreate")["comment"]["id"]
+
+    async def comment_update(self, comment_id: str, body: str) -> None:
+        data = await self.gql(MUTATION_COMMENT_UPDATE, {"id": comment_id, "input": {"body": body}})
+        self._require_success(data, "commentUpdate")
+
+    async def app_comments(self, issue_id: str) -> list[dict]:
+        """``[{id, body}]`` of the comments on ``issue_id`` authored by the app (viewer)."""
+        me = await self.viewer_id()
+        data = await self.gql(QUERY_ISSUE_APP_COMMENTS, {"id": issue_id, "userId": me})
+        issue = data.get("issue") or {}
+        return [{"id": c["id"], "body": c.get("body") or ""}
+                for c in self._nodes(issue.get("comments"))
+                if (c.get("user") or {}).get("id") == me]
+
+    async def team_states(self, team_id: str) -> list[dict]:
+        """``[{id, name, type}]`` in workflow position order; cached per client."""
+        if team_id not in self._team_states:
+            data = await self.gql(QUERY_TEAM_STATES, {"teamId": team_id})
+            nodes = self._nodes((data.get("team") or {}).get("states"))
+            nodes.sort(key=lambda s: s.get("position") or 0)
+            self._team_states[team_id] = [
+                {"id": s["id"], "name": s.get("name") or "", "type": s.get("type") or ""}
+                for s in nodes]
+        return [dict(s) for s in self._team_states[team_id]]
+
+    async def team_labels(self, team_id: str) -> list[dict]:
+        """``[{id, name}]``: the team's and the workspace's labels, groups excluded."""
+        data = await self.gql(QUERY_TEAM_LABELS, {"teamId": team_id})
+        return [{"id": lb["id"], "name": lb.get("name") or ""}
+                for lb in self._nodes(data.get("issueLabels")) if not lb.get("isGroup")]
