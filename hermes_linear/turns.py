@@ -59,6 +59,7 @@ class Turn:
     session_key: Optional[str] = None  # the base's session key (busy-guard lookups)
     safety: Optional[asyncio.TimerHandle] = None  # TURN_SAFETY_TIMEOUT_S watchdog
     stop_settle: Optional[asyncio.TimerHandle] = None  # STOP_SETTLE_S watchdog after /stop
+    finished: bool = False  # on_processing_complete ran (complete()); its agent run is over
 
     def disarm(self) -> None:
         for handle in (self.safety, self.stop_settle):
@@ -156,6 +157,38 @@ class TurnEngine:
 
     def owns_session_key(self, session_key: str | None) -> bool:
         return self.turn_for_session_key(session_key) is not None
+
+    def _queued_session_key(self, turn: Turn) -> Optional[str]:
+        """The gateway session key ``turn`` will get at hand-off (``None`` if unknown)."""
+        if turn.session_key:
+            return turn.session_key
+        d = turn.decision
+        try:
+            source = self._build_source(chat_id=d.chat_id, chat_type="dm", user_id=d.user_id,
+                                        user_name=d.user_name, thread_id=d.thread_id,
+                                        message_id=turn.mid)
+            return self._session_key_of(MessageEvent(
+                text="", source=source, message_id=turn.mid, user_id=d.user_id,
+                user_name=d.user_name, allow_gateway_control=False))
+        except Exception:  # noqa: BLE001 - unknown: does not count as that session
+            return None
+
+    def has_session_turns(self, session_key: str | None, *,
+                          exclude: Optional[Turn] = None) -> bool:
+        """True while any in-flight, draining (not yet finished) or queued turn, on any
+        Linear key, belongs to gateway session ``session_key``.
+
+        Draining turns freed by the stop-settle / safety nets count (the gateway may still be
+        running them); draining turns whose ``on_processing_complete`` ran do not.
+        """
+        if not session_key:
+            return False
+        live = [*self.inflight.values(),
+                *(t for t, _h in self._drain_deadlines.values() if not t.finished)]
+        if any(t is not exclude and t.session_key == session_key for t in live):
+            return True
+        return any(t is not exclude and self._queued_session_key(t) == session_key
+                   for q in self.queues.values() for t in q)
 
     def busy(self, key: Key) -> bool:
         return key in self.inflight or key in self.draining or bool(self.queues.get(key))
@@ -329,6 +362,7 @@ class TurnEngine:
         if found is None:
             return
         key, turn = found
+        turn.finished = True
         self._drain(key, turn, after_current_task=True)
 
     def _drain(self, key: Key, turn: Turn, *, after_current_task: bool = False) -> None:

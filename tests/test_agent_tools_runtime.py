@@ -306,3 +306,136 @@ async def test_tool_created_cleared_on_disconnect(env):
     a.tool_created["k"] = {"x"}
     await a.disconnect()
     assert a.tool_created == {}
+
+
+# ----------------------------------------------------------------- fix round 1
+
+
+class RaisingClient:
+    """``gql`` raises ``LinearError(code)`` on call ``fail_at`` (1-based), else walks TREE."""
+
+    def __init__(self, code, fail_at=1):
+        self.code, self.fail_at, self.n = code, fail_at, 0
+
+    async def gql(self, query, variables):
+        self.n += 1
+        if self.n >= self.fail_at:
+            raise LinearError("boom", code=self.code)
+        return {"issue": TREE.get(variables["id"])}
+
+
+async def test_scope_walk_linear_error_returns_code():
+    a = new_adapter()
+    for client, want in ((RaisingClient("NOT_FOUND"), "NOT_FOUND"),
+                         (RaisingClient(None), "LINEAR_ERROR"),
+                         (RaisingClient("RATELIMITED", fail_at=2), "RATELIMITED")):  # in the walk
+        ctx = agent_tools.ToolContext(adapter=a, client=client, session_issue_id="ISSUE-SELF",
+                                      session_key="sk", is_linear=True)
+        assert await agent_tools.check_write_scope(ctx, "grandchild") == want
+
+
+def test_cancelled_maps_to_not_connected(bg_loop):
+    a = new_adapter(bg_loop)
+
+    async def gets_cancelled():
+        asyncio.current_task().cancel()  # as disconnect() cancelling the adapter's tasks
+        await asyncio.sleep(1)
+
+    assert agent_tools.run_on_adapter(ctx_for(a), gets_cancelled) == {
+        "ok": False, "error": "NOT_CONNECTED"}
+
+
+class _Boom:
+    @property
+    def event_loop(self):
+        raise RuntimeError("broken adapter")
+
+
+def test_resolve_context_never_raises(bg_loop, registry, session, monkeypatch):
+    registry["x"] = _Boom()
+    session(platform="linear", key="sk")
+    ctx = agent_tools.resolve_context()
+    assert ctx.adapter is None and ctx.session_issue_id is None
+    assert agent_tools.run_on_adapter(ctx, lambda: None) == {"ok": False, "error": "NOT_CONNECTED"}
+
+    def broken_env(name, default=""):
+        raise LookupError(name)
+
+    monkeypatch.setattr(agent_tools, "get_session_env", broken_env)
+    ctx = agent_tools.resolve_context()
+    assert ctx.adapter is None and ctx.is_linear is False
+
+
+def test_resolve_context_checks_every_loop_before_blocking(bg_loop, registry, session):
+    """On adapter B's loop, A's (wedged) loop is never waited on: WRONG_THREAD at once."""
+    wedged = asyncio.new_event_loop()
+    release = threading.Event()
+    t = threading.Thread(target=wedged.run_forever, daemon=True)
+    t.start()
+    wedged.call_soon_threadsafe(release.wait, 5)  # A's loop is stuck
+    first, second = new_adapter(wedged), new_adapter(bg_loop)
+    registry["a"], registry["b"] = first, second
+    session(platform="linear", key="sk")
+    result: concurrent.futures.Future = concurrent.futures.Future()
+
+    def on_loop():
+        start = time.monotonic()
+        c = agent_tools.resolve_context()
+        result.set_result((c, agent_tools.run_on_adapter(c, lambda: None),
+                           time.monotonic() - start))
+
+    try:
+        bg_loop.call_soon_threadsafe(on_loop)
+        c, out, took = result.result(3)
+        assert c.adapter is second and out == {"ok": False, "error": "WRONG_THREAD"}
+        assert took < 1
+    finally:
+        release.set()
+        wedged.call_soon_threadsafe(wedged.stop)
+        t.join(5)
+        wedged.close()
+
+
+def test_fallback_prefers_session_profile(bg_loop, registry, session, monkeypatch):
+    first, second = new_adapter(bg_loop), new_adapter(bg_loop)
+    registry["a"], registry["b"] = first, second
+    names = {"HERMES_SESSION_PLATFORM": "slack", "HERMES_SESSION_PROFILE": "b"}
+    monkeypatch.setattr(agent_tools, "get_session_env", lambda n, d="": names.get(n, d))
+    assert agent_tools.resolve_context().adapter is second  # non-Linear read
+    names["HERMES_SESSION_PLATFORM"] = "linear"
+    names["HERMES_SESSION_KEY"] = "agent:gone"
+    c = agent_tools.resolve_context()  # Linear, no owning turn
+    assert c.adapter is second and c.session_issue_id is None
+    names["HERMES_SESSION_PROFILE"] = "nope"
+    assert agent_tools.resolve_context().adapter is first  # unknown profile: the first
+
+
+async def test_tool_created_survives_other_key_finishing(env):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    key = (f"{D_ISSUE}:1", None)
+    sk = a.turns.inflight[key].session_key
+    a.tool_created[sk] = {"x"}
+    # Another Linear key (e.g. a thread) whose turn runs in the same gateway session.
+    other = Turn(decision=a.turns.inflight[key].decision, mid="m-other", session_key=sk)
+    a.turns.inflight[(f"{D_ISSUE}:1", "thread-b")] = other
+    await asyncio.create_task(a.on_processing_complete(gw.events[0], ProcessingOutcome.SUCCESS))
+    assert a.tool_created[sk] == {"x"}  # the session still runs on the other key
+    del a.turns.inflight[(f"{D_ISSUE}:1", "thread-b")]
+    a._forget_tool_created()
+    assert sk not in a.tool_created
+
+
+async def test_tool_created_cleared_after_stop_drops_queue(env):
+    from hermes_linear.models import Interrupt
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    sk = a.turns.inflight[(f"{D_ISSUE}:1", None)].session_key
+    a.tool_created[sk] = {"x"}
+    await deliver(a, prompted(D_SID, D_ISSUE, "more", "act-2"))  # queued behind the first
+    await asyncio.create_task(a.on_processing_complete(gw.events[0], ProcessingOutcome.SUCCESS))
+    assert a.tool_created[sk] == {"x"}  # queued turn of the same session
+    await a._execute(Interrupt(agent_session_id=D_SID), {})  # stop drops the queued turn
+    assert not a.turns.queues
+    assert sk not in a.tool_created
+    await a.wait_idle()

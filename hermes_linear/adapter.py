@@ -434,7 +434,10 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         elif isinstance(d, ResolveControl):
             await self.opener.resolve_control(d)
         elif isinstance(d, Interrupt):
-            self.turns.interrupt(d.agent_session_id)
+            try:
+                self.turns.interrupt(d.agent_session_id)
+            finally:
+                self._forget_tool_created()  # dropped/freed turns may have been a session's last
         elif isinstance(d, Refuse):
             await self._post_ack(d.agent_session_id, renderer.error(d.text))
         elif isinstance(d, AwaitDelegation):
@@ -490,15 +493,19 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 self.outbound.turn_finished(found, outcome)  # stop reply, fallback, heartbeat
             finally:
                 self.turns.complete(found)  # releases after this base task ends (Q5)
-                self._forget_tool_created(found)
+                self._forget_tool_created(found[1] if found else None)
 
-    def _forget_tool_created(self, found: Any) -> None:
-        """A session's last turn finished: its tool-created issues leave the write scope."""
-        if found is None:
-            return
-        key, turn = found
-        if turn.session_key and not self.turns.queues.get(key):
-            self.tool_created.pop(turn.session_key, None)
+    def _forget_tool_created(self, finished: Any = None) -> None:
+        """Gateway sessions with no turn left lose their tool-created issues (write scope).
+
+        ``tool_created`` is keyed by gateway session key, which several Linear keys (chat,
+        thread) can share, so a set is kept while ANY in-flight, draining or queued turn of
+        that session remains (``TurnEngine.has_session_turns``). ``finished`` is the turn
+        completing right now (already drained, so not counted).
+        """
+        for session_key in list(self.tool_created):
+            if not self.turns.has_session_turns(session_key, exclude=finished):
+                self.tool_created.pop(session_key, None)
 
     async def _fatal(self, reason: str) -> None:
         log.error("linear: fatal: %s", reason)

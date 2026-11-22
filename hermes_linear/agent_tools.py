@@ -68,6 +68,7 @@ def _session() -> dict:
         "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID") or None,
         "chat_id": get_session_env("HERMES_SESSION_CHAT_ID") or None,
         "thread_id": get_session_env("HERMES_SESSION_THREAD_ID") or None,
+        "profile": get_session_env("HERMES_SESSION_PROFILE") or None,
     }
 
 
@@ -107,17 +108,36 @@ async def _lookup(ad: Any, env: dict) -> list[str | None]:
     return out
 
 
+def _fallback(registry: dict, profile: str | None) -> Any:
+    """The adapter for reads without an owning turn: the session's profile's, else the first."""
+    if profile and registry.get(profile) is not None:
+        return registry[profile]
+    return next(iter(registry.values()), None)
+
+
 def resolve_context(session_id: str | None = None) -> ToolContext:
-    """The adapter and Linear session (if any) of the calling tool.
+    """The adapter and Linear session (if any) of the calling tool. Never raises.
 
     In a Linear session the owning adapter is the one whose in-flight turn has the bound
     ``HERMES_SESSION_KEY``, else the one whose store has the message id, else the chat (the
     ``hooks._route`` order). Outside Linear, or when no turn is found, reads still work on the
-    first adapter in ``ADAPTERS``, with no session issue (writes are refused).
+    adapter of the session's profile (``HERMES_SESSION_PROFILE``), else the first in
+    ``ADAPTERS``, with no session issue (writes are refused). Any unexpected failure yields a
+    context with no adapter: ``run_on_adapter`` answers ``NOT_CONNECTED``, writes are refused.
     """
+    try:
+        return _resolve(session_id)
+    except Exception as exc:  # noqa: BLE001 - Q3.4: tools never see a runtime exception
+        log.warning("linear: tool context resolution failed: %s", type(exc).__name__)
+        return ToolContext(adapter=None, client=None, session_issue_id=None, session_key=None,
+                           is_linear=False)
+
+
+def _resolve(session_id: str | None) -> ToolContext:
     env = _session()
-    adapters = list(adapter_mod.ADAPTERS.values())
-    first = adapters[0] if adapters else None
+    registry = dict(adapter_mod.ADAPTERS)
+    adapters = list(registry.values())
+    fallback = _fallback(registry, env["profile"])
     is_linear = env["platform"] == PLATFORM
     log.debug("linear: tool context (session_id=%s, key=%s, linear=%s)",
               session_id, env["session_key"], is_linear)
@@ -129,16 +149,20 @@ def resolve_context(session_id: str | None = None) -> ToolContext:
                            is_linear=is_linear)
 
     if not is_linear:
-        return ctx(first, None)
-    found: list[tuple[Any, list[str | None]]] = []
-    for ad in adapters:
-        loop = _live_loop(ad)
-        if loop is None:
-            continue
+        return ctx(fallback, None)
+    live = [(ad, loop) for ad in adapters if (loop := _live_loop(ad)) is not None]
+    for ad, loop in live:  # before blocking on any loop
         if _on_loop(loop):
             # Q3 dispatch_tool path: never block the loop; run_on_adapter refuses next.
             return ctx(ad, None)
-        fut = asyncio.run_coroutine_threadsafe(_lookup(ad, env), loop)
+    found: list[tuple[Any, list[str | None]]] = []
+    for ad, loop in live:
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_lookup(ad, env), loop)
+        except Exception as exc:  # noqa: BLE001 - loop closed since the check
+            log.debug("linear: tool context lookup on %r not scheduled: %s", ad,
+                      type(exc).__name__)
+            continue
         try:
             found.append((ad, fut.result(RESOLVE_TIMEOUT_S)))
         except Exception as exc:  # noqa: BLE001 - incl. timeout: that adapter does not claim it
@@ -148,7 +172,7 @@ def resolve_context(session_id: str | None = None) -> ToolContext:
         for ad, hits in found:
             if hits[rule]:
                 return ctx(ad, hits[rule])
-    return ctx(first, None)
+    return ctx(fallback, None)
 
 
 def run_on_adapter(ctx: ToolContext, coro_factory: Callable[[], Coroutine[Any, Any, Any]], *,
@@ -180,7 +204,7 @@ def run_on_adapter(ctx: ToolContext, coro_factory: Callable[[], Coroutine[Any, A
     except LinearError as exc:
         return _err(exc.code or "LINEAR_ERROR")
     except concurrent.futures.CancelledError:
-        return _err("CANCELLED")
+        return _err("NOT_CONNECTED")  # task cancelled on the loop: the adapter disconnected
     except Exception as exc:  # noqa: BLE001
         log.debug("linear: tool call failed: %s", type(exc).__name__)
         return _err(type(exc).__name__)
@@ -193,7 +217,15 @@ async def check_write_scope(ctx: ToolContext, issue_id: str) -> str | None:
     Allowed: the session issue, an issue this session created through a tool
     (``adapter.tool_created[session_key]``), or an issue with the session issue among its
     first ``SCOPE_PARENT_DEPTH`` ancestors. Ids may be identifiers or UUIDs; the UUIDs Linear
-    returns are compared. A ``LinearError`` from the walk propagates (``run_on_adapter`` maps it).
+    returns are compared. Never raises: a ``LinearError`` from the parent walk returns its
+    ``code`` (``LINEAR_ERROR`` if none). Fail-closed: any non-``None`` result is a refusal.
+
+    Contract for write tools:
+    - Add the UUID Linear returns for an issue you create (``issueCreate.issue.id``), never
+      its identifier (``RET-12``), to ``ctx.adapter.tool_created[ctx.session_key]``, on the
+      loop; the parent walk compares UUIDs.
+    - A tool taking a second issue reference (a parent, a relation target, …) must
+      scope-check that issue too, not only the issue it writes.
     """
     if not ctx.is_linear or not ctx.session_issue_id:
         return "NOT_LINEAR_SESSION"
@@ -203,9 +235,15 @@ async def check_write_scope(ctx: ToolContext, issue_id: str) -> str | None:
         return None
     if ctx.client is None:
         return "OUT_OF_SCOPE"
+    try:
+        return await _walk_scope(ctx.client, issue_id, allowed)
+    except LinearError as exc:
+        return exc.code or "LINEAR_ERROR"
 
+
+async def _walk_scope(client: Any, issue_id: str, allowed: set[str]) -> str | None:
     async def fetch(ident: str) -> dict | None:
-        data = await ctx.client.gql(QUERY_ISSUE_PARENT, {"id": ident})
+        data = await client.gql(QUERY_ISSUE_PARENT, {"id": ident})
         node = data.get("issue") if isinstance(data, dict) else None
         return node if isinstance(node, dict) and node.get("id") else None
 
