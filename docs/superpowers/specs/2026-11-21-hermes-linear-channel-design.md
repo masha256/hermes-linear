@@ -150,7 +150,7 @@ Inbound `message_id = <agentSessionId>:<activityId>`; the renderer resolves `rep
 2. Body > 1 MB → **413**. Read the raw body.
 3. Verify `Linear-Signature` (constant-time) with the profile's webhook secret → **401** on failure.
 4. `webhookTimestamp` older than 60 s → **401**.
-5. Seen `webhookId` → **200**, drop.
+5. Seen delivery (`Linear-Delivery` header; SHA-256 of the raw body if absent) → **200**, drop, INFO log. Never key on payload `webhookId`: it is the webhook config id, constant across deliveries.
 6. Payload `oauthClientId` present and ≠ the profile's `client_id` → **401**.
 7. **200**, then enqueue to the profile's adapter.
 
