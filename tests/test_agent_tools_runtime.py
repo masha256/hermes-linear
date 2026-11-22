@@ -27,6 +27,7 @@ from hermes_linear.adapter import LinearAdapter
 from hermes_linear.constants import TOOL_TIMEOUT_S
 from hermes_linear.linear_client import LinearClient, LinearError
 from hermes_linear.models import StartTurn
+from hermes_linear.store import Store
 from hermes_linear.turns import Turn
 
 
@@ -67,8 +68,9 @@ def registry(monkeypatch):
     return adapters
 
 
-def new_adapter(loop=None, client=None) -> LinearAdapter:
-    a = LinearAdapter(PlatformConfig(enabled=True), settings=make_settings(), client=client)
+def new_adapter(loop=None, client=None, store=None) -> LinearAdapter:
+    a = LinearAdapter(PlatformConfig(enabled=True), settings=make_settings(), client=client,
+                      store=store)
     a.event_loop = loop
     return a
 
@@ -127,16 +129,22 @@ async def test_writes_refused_outside_linear_session(session, registry, linear):
 
 async def test_scope_allows_self_descendant_created(linear):
     _fake, client = linear
-    a = new_adapter(client=client)
-    a.tool_created["sk"] = {"made"}
+    store = Store.open(":memory:")
+    store.record_created("ISSUE-SELF", "made")
+    a = new_adapter(client=client, store=store)
     ctx = ctx_for(a)
     assert await agent_tools.check_write_scope(ctx, "ISSUE-SELF") is None
     assert await agent_tools.check_write_scope(ctx, "child") is None
     assert await agent_tools.check_write_scope(ctx, "grandchild") is None
     assert await agent_tools.check_write_scope(ctx, "RET-9") is None  # identifier form
     assert await agent_tools.check_write_scope(ctx, "made") is None
-    # created issues are per session key
-    assert await agent_tools.check_write_scope(ctx_for(a, key="other"), "made") == "OUT_OF_SCOPE"
+    # created issues belong to the session ticket, whatever the gateway session key
+    assert await agent_tools.check_write_scope(ctx_for(a, key="other"), "made") is None
+    assert await agent_tools.check_write_scope(ctx_for(a, issue="unrelated"), "made") \
+        == "OUT_OF_SCOPE"
+    a._store = None  # disconnected: only the tree scope is left
+    assert await agent_tools.check_write_scope(ctx, "made") == "OUT_OF_SCOPE"
+    assert await agent_tools.check_write_scope(ctx, "child") is None
 
 
 async def test_scope_refuses_unrelated_issue(linear):
@@ -305,27 +313,17 @@ def test_resolve_context_unknown_linear_turn_has_no_ticket(bg_loop, registry, se
     assert ctx.adapter is a and ctx.is_linear is True and ctx.session_issue_id is None
 
 
-# ----------------------------------------------------------------- tool_created lifecycle
+# ------------------------------------------------- created-issue scope lifecycle (RET-110)
 
 
-async def test_tool_created_cleared_when_session_turns_finish(env):
+async def test_created_scope_survives_turns_finishing_and_disconnect(env):
     a, client, gw, store, order = env
     await deliver(a, DELEGATION)
-    key = a.turns.inflight[(f"{D_ISSUE}:1", None)].session_key
-    a.tool_created[key] = {"x"}
-    await deliver(a, prompted(D_SID, D_ISSUE, "more", "act-2"))  # queued behind the first
+    store.record_created(D_ISSUE, "x")
     await asyncio.create_task(a.on_processing_complete(gw.events[0], ProcessingOutcome.SUCCESS))
-    assert a.tool_created[key] == {"x"}  # the session still has a queued turn
     await a.wait_idle()
-    await asyncio.create_task(a.on_processing_complete(gw.events[1], ProcessingOutcome.SUCCESS))
-    assert key not in a.tool_created
-
-
-async def test_tool_created_cleared_on_disconnect(env):
-    a, *_ = env
-    a.tool_created["k"] = {"x"}
-    await a.disconnect()
-    assert a.tool_created == {}
+    assert store.created_by(D_ISSUE) == {"x"}  # no per-turn sweep any more
+    assert not hasattr(a, "tool_created")
 
 
 # ----------------------------------------------------------------- fix round 1
@@ -430,73 +428,7 @@ def test_fallback_prefers_session_profile(bg_loop, registry, session, monkeypatc
     assert agent_tools.resolve_context().adapter is first  # unknown profile: the first
 
 
-async def test_tool_created_survives_other_key_finishing(env):
-    a, client, gw, store, order = env
-    await deliver(a, DELEGATION)
-    key = (f"{D_ISSUE}:1", None)
-    sk = a.turns.inflight[key].session_key
-    a.tool_created[sk] = {"x"}
-    # Another Linear key (e.g. a thread) whose turn runs in the same gateway session.
-    other = Turn(decision=a.turns.inflight[key].decision, mid="m-other", session_key=sk)
-    a.turns.inflight[(f"{D_ISSUE}:1", "thread-b")] = other
-    await asyncio.create_task(a.on_processing_complete(gw.events[0], ProcessingOutcome.SUCCESS))
-    assert a.tool_created[sk] == {"x"}  # the session still runs on the other key
-    del a.turns.inflight[(f"{D_ISSUE}:1", "thread-b")]
-    a._forget_tool_created()
-    assert sk not in a.tool_created
-
-
-async def test_tool_created_cleared_after_stop_drops_queue(env):
-    from hermes_linear.models import Interrupt
-    a, client, gw, store, order = env
-    await deliver(a, DELEGATION)
-    sk = a.turns.inflight[(f"{D_ISSUE}:1", None)].session_key
-    a.tool_created[sk] = {"x"}
-    await deliver(a, prompted(D_SID, D_ISSUE, "more", "act-2"))  # queued behind the first
-    await asyncio.create_task(a.on_processing_complete(gw.events[0], ProcessingOutcome.SUCCESS))
-    assert a.tool_created[sk] == {"x"}  # queued turn of the same session
-    await a._execute(Interrupt(agent_session_id=D_SID), {})  # stop drops the queued turn
-    assert not a.turns.queues
-    assert sk not in a.tool_created
-    await a.wait_idle()
-
-
 # ----------------------------------------------------------------- fix round 2
-
-
-async def test_tool_created_survives_turn_not_yet_handed_off(env):
-    """A turn in ``_hand_off`` (ack wait, snapshot) has no ``session_key`` yet and is no
-    longer queued; it still counts as its gateway session's."""
-    a, client, gw, store, order = env
-    await deliver(a, DELEGATION)
-    key = (f"{D_ISSUE}:1", None)
-    first = a.turns.inflight[key]
-    sk = first.session_key
-    a.tool_created[sk] = {"x"}
-    pending = Turn(decision=first.decision, mid=f"{D_SID}:act-9")  # session_key still None
-    a.turns.inflight[(f"{D_ISSUE}:1", "thread-b")] = pending
-    await asyncio.create_task(a.on_processing_complete(gw.events[0], ProcessingOutcome.SUCCESS))
-    assert a.tool_created[sk] == {"x"}  # the pre-hand-off turn belongs to the same session
-    del a.turns.inflight[(f"{D_ISSUE}:1", "thread-b")]
-    a._forget_tool_created()
-    assert sk not in a.tool_created
-
-
-async def test_tool_created_cleared_after_safety_release(env, monkeypatch):
-    """A safety-freed turn never completes (its late on_processing_complete finds no turn);
-    the set is swept once its drain ends."""
-    from hermes_linear import constants
-    a, client, gw, store, order = env
-    monkeypatch.setattr(constants, "TURN_SAFETY_TIMEOUT_S", 0.05)
-    await deliver(a, DELEGATION)
-    sk = a.turns.inflight[(f"{D_ISSUE}:1", None)].session_key
-    a.tool_created[sk] = {"x"}
-    for _ in range(100):
-        await asyncio.sleep(0.02)
-        if not a.turns.inflight and not a.turns.draining:
-            break
-    assert not a.turns.inflight and not a.turns.draining
-    assert sk not in a.tool_created
 
 
 def test_fallback_default_profile_empty_env(bg_loop, registry, session, monkeypatch):

@@ -430,6 +430,16 @@ async def test_client_issue_update(fake, client):
                                                           "input": {"addedLabelIds": ["l1"]}}
 
 
+async def test_client_issue_update_parent_passes_through(fake, client):
+    """Reparent and detach (RET-110): ``parentId`` reaches Linear as given, null included."""
+    out = {"id": "uuid-1", "identifier": "RET-1", "title": "T", "url": "u"}
+    fake.on("IssueUpdate", {"data": {"issueUpdate": {"success": True, "issue": out}}})
+    await client.issue_update("uuid-1", {"parentId": "uuid-p"})
+    await client.issue_update("uuid-1", {"parentId": None})
+    sent = [c.variables["input"] for c in fake.gql_calls("IssueUpdate")]
+    assert sent == [{"parentId": "uuid-p"}, {"parentId": None}]
+
+
 async def test_client_comment_create_and_update(fake, client):
     fake.on("CommentCreate", {"data": {"commentCreate": {"success": True, "comment": {"id": "c1"}}}})
     fake.on("CommentUpdate", {"data": {"commentUpdate": {"success": True, "comment": {"id": "c1"}}}})

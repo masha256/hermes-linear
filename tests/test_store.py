@@ -412,3 +412,28 @@ def test_drop_all_grants(store):
     store.drop_all_grants()
     assert store.take_grant("K", "c") is None and store.take_grant("K2", "d") is None
     store.drop_all_grants()  # idempotent on an empty table
+
+
+# ------------------------------------------------------------- created issues (RET-110)
+
+
+def test_created_issues_keyed_by_owner_ticket(store):
+    assert store.created_by("T1") == set()
+    store.record_created("T1", "i1")
+    store.record_created("T1", "i2")
+    store.record_created("T1", "i1")  # idempotent
+    store.record_created("T2", "i3")
+    assert store.created_by("T1") == {"i1", "i2"}
+    assert store.created_by("T2") == {"i3"}
+
+
+def test_created_issues_survive_reopen(tmp_path):
+    path = tmp_path / "db.sqlite"
+    s = Store.open(path)
+    s.record_created("T1", "i1")
+    s.close()
+    s = Store.open(path)
+    try:
+        assert s.created_by("T1") == {"i1"}
+    finally:
+        s.close()

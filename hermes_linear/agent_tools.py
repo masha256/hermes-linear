@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 
 PLATFORM = "linear"
 SCOPE_PARENT_DEPTH = 5  # parent levels walked by check_write_scope
+CYCLE_WALK_DEPTH = 50  # ancestor levels walked before a reparent; deeper fails closed
 RESOLVE_TIMEOUT_S = 5.0  # per-adapter turn lookup (pure in-memory/store work on the loop)
 
 QUERY_ISSUE_PARENT = """
@@ -227,27 +228,26 @@ def run_on_adapter(ctx: ToolContext, coro_factory: Callable[[], Coroutine[Any, A
 async def check_write_scope(ctx: ToolContext, issue_id: str) -> str | None:
     """On the loop: ``None`` if the session may write ``issue_id``, else the refusal code.
 
-    Allowed: the session issue, an issue this session created through a tool
-    (``adapter.tool_created[session_key]``), or an issue with the session issue among its
-    first ``SCOPE_PARENT_DEPTH`` ancestors. Ids may be identifiers or UUIDs; the UUIDs Linear
-    returns are compared. Never raises: a ``LinearError`` from the parent walk returns its
-    ``code`` (``LINEAR_ERROR`` if none). Fail-closed: any non-``None`` result is a refusal.
+    Allowed: the session issue, an issue the tools created from this session issue (the
+    store's ``created_issues``, kept across turns and restarts; RET-110), or an issue with
+    one of those among its first ``SCOPE_PARENT_DEPTH`` ancestors. Ids may be identifiers or
+    UUIDs; the UUIDs Linear returns are compared. Never raises: a ``LinearError`` from the
+    parent walk returns its ``code`` (``LINEAR_ERROR`` if none). Fail-closed: any non-``None``
+    result is a refusal.
 
     Descendants: an issue fetched through the ``children`` connection of an issue that
     passed this check is in scope (it has that issue as its parent), so callers such as
     ``linear_sync_plan`` write such children without a per-child check.
 
     Contract for write tools:
-    - Add the UUID Linear returns for an issue you create (``issueCreate.issue.id``), never
-      its identifier (``RET-12``), to ``ctx.adapter.tool_created[ctx.session_key]``, on the
-      loop; the parent walk compares UUIDs.
+    - Record the UUID Linear returns for an issue you create (``issueCreate.issue.id``),
+      never its identifier (``RET-12``), with ``_record_created``; the walk compares UUIDs.
     - A tool taking a second issue reference (a parent, a relation target, …) must
       scope-check that issue too, not only the issue it writes.
     """
     if not ctx.is_linear or not ctx.session_issue_id:
         return "NOT_LINEAR_SESSION"
-    created = getattr(ctx.adapter, "tool_created", {}).get(ctx.session_key or "", set())
-    allowed = {ctx.session_issue_id, *created}
+    allowed = {ctx.session_issue_id, *_created(ctx)}
     if issue_id in allowed:
         return None
     if ctx.client is None:
@@ -256,6 +256,25 @@ async def check_write_scope(ctx: ToolContext, issue_id: str) -> str | None:
         return await _walk_scope(ctx.client, issue_id, allowed)
     except LinearError as exc:
         return exc.code or "LINEAR_ERROR"
+
+
+def _created(ctx: ToolContext) -> set[str]:
+    """The issues the tools created from ``ctx``'s session issue (none without a store)."""
+    store = getattr(ctx.adapter, "_store", None)
+    return store.created_by(ctx.session_issue_id) if store is not None else set()
+
+
+def _record_created(ctx: ToolContext, issue_id: str) -> None:
+    """Put the new issue ``issue_id`` (a UUID) in the session issue's write scope for good.
+
+    Without a store (a disconnect racing the call) the issue is created but not recorded:
+    it stays writable only through the tree scope.
+    """
+    store = getattr(ctx.adapter, "_store", None)
+    if store is None or not ctx.session_issue_id:
+        log.warning("linear: created issue %s not recorded (no store)", issue_id)
+        return
+    store.record_created(ctx.session_issue_id, issue_id)
 
 
 async def _walk_scope(client: Any, issue_id: str, allowed: set[str]) -> str | None:
@@ -287,10 +306,10 @@ async def _walk_scope(client: Any, issue_id: str, allowed: set[str]) -> str | No
 # ----------------------------------------------------------------- generic tools (RET-76)
 #
 # Handlers are sync ``handler(args, **kw) -> dict`` and never raise. Arguments are validated
-# before anything else (``BAD_ARGS``); every Linear call, scope check and ``tool_created``
-# update then runs in one coroutine on the adapter loop (``run_on_adapter``). Issue
+# before anything else (``BAD_ARGS``); every Linear call, scope check and created-issue
+# record then runs in one coroutine on the adapter loop (``run_on_adapter``). Issue
 # references may be identifiers or UUIDs; each is resolved with ``issue_get`` first so scope
-# checks and ``tool_created`` see the UUID Linear returns.
+# checks and created-issue records see the UUID Linear returns.
 
 MARKER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 #: Any hermes-linear marker, stripped from agent-supplied bodies before ours is appended.
@@ -500,8 +519,7 @@ async def _create(ctx: ToolContext, a: dict) -> dict:
     if labels:
         inp["labelIds"] = labels
     issue = await ctx.client.issue_create(inp)
-    # On the loop (this coroutine): record the UUID Linear returned, never the identifier.
-    ctx.adapter.tool_created.setdefault(ctx.session_key or "", set()).add(issue["id"])
+    _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
     return {"ok": True, "issue": issue}
 
 
@@ -512,13 +530,26 @@ def _parse_update(args: dict) -> dict:
     a = {"id": _req_str(args, "id"), "title": _opt_str(args, "title"),
          "description": _opt_str(args, "description"), "state": _opt_str(args, "state"),
          "add_labels": _opt_names(args, "add_labels"),
-         "remove_labels": _opt_names(args, "remove_labels")}
+         "remove_labels": _opt_names(args, "remove_labels"), "parent": _parse_parent(args)}
     if a["title"] is not None and not a["title"].strip():
         raise _Refusal("BAD_ARGS")
     if not (a["title"] is not None or a["description"] is not None or a["state"] is not None
-            or a["add_labels"] or a["remove_labels"]):
+            or a["add_labels"] or a["remove_labels"] or a["parent"] is not None):
         raise _Refusal("BAD_ARGS")
     return a
+
+
+def _parse_parent(args: dict) -> str | None:
+    """``None``: leave the parent alone (key absent). ``""``: detach (null, empty or blank).
+    Else the new parent's reference, stripped."""
+    if "parent" not in args:
+        return None
+    val = args["parent"]
+    if val is None:
+        return ""
+    if not isinstance(val, str):
+        raise _Refusal("BAD_ARGS")
+    return val.strip()
 
 
 async def _update(ctx: ToolContext, a: dict) -> dict:
@@ -530,6 +561,12 @@ async def _update(ctx: ToolContext, a: dict) -> dict:
             inp[key] = a[key]
     if a["state"] is not None:
         inp["stateId"] = await _state_id(ctx, team, a["state"])
+    if a["parent"] == "":
+        inp["parentId"] = None  # detach: top-level
+    elif a["parent"] is not None:
+        parent = await _writable(ctx, a["parent"])  # both ends in scope (RET-110)
+        await _refuse_cycle(ctx, issue["id"], parent)
+        inp["parentId"] = parent["id"]
     added, removed = await _label_ids(ctx, team, a["add_labels"], a["remove_labels"])
     carried = _carried(issue)
     removed = [lid for lid in removed if lid in carried]  # removing an absent label: no-op
@@ -540,6 +577,24 @@ async def _update(ctx: ToolContext, a: dict) -> dict:
     if not inp:  # only no-op removals: never send an empty issueUpdate (Task 2 minor N1)
         return {"ok": True, "issue": _summary(issue)}
     return {"ok": True, "issue": await ctx.client.issue_update(issue["id"], inp)}
+
+
+async def _refuse_cycle(ctx: ToolContext, issue_id: str, parent: dict) -> None:
+    """``PARENT_CYCLE`` if ``parent`` (an ``issue_get`` result) is ``issue_id`` or one of its
+    descendants, i.e. ``issue_id`` is among ``parent``'s ancestors. Fail-closed: an ancestry
+    deeper than ``CYCLE_WALK_DEPTH`` is refused too."""
+    if parent["id"] == issue_id:
+        raise _Refusal("PARENT_CYCLE")
+    node: dict | None = parent
+    for _ in range(CYCLE_WALK_DEPTH):
+        pid = ((node or {}).get("parent") or {}).get("id")
+        if not pid:
+            return  # reached the root: no cycle
+        if pid == issue_id:
+            raise _Refusal("PARENT_CYCLE")
+        data = await ctx.client.gql(QUERY_ISSUE_PARENT, {"id": pid})
+        node = data.get("issue") if isinstance(data, dict) else None
+    raise _Refusal("PARENT_CYCLE")
 
 
 def _carried(issue: dict) -> set[str]:
@@ -743,8 +798,7 @@ async def _sync_plan(ctx: ToolContext, a: dict) -> dict:
             if (project.get("project") or {}).get("id"):
                 inp["projectId"] = project["project"]["id"]
             new = await client.issue_create(inp)
-            # On the loop (this coroutine): the UUID Linear returned, never the identifier.
-            ctx.adapter.tool_created.setdefault(ctx.session_key or "", set()).add(new["id"])
+            _record_created(ctx, new["id"])  # the UUID Linear returned, never the identifier
             keep.add(new["id"])
             mapping[t.number] = new["identifier"]
             created.append(new["identifier"])
@@ -972,8 +1026,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_issue_update": {
         "name": "linear_issue_update",
         "description": ("Update a Linear issue as the Linear app: title, description, state, "
-                        "labels. Only the session issue, its descendants, or issues you "
-                        "created."),
+                        "labels, parent. Only the session issue, its descendants, or issues "
+                        "you created; a new parent must be one of those too."),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "title": {"type": "string"},
@@ -984,6 +1038,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
                            "description": "Existing label names to add."},
             "remove_labels": {"type": "array", "items": {"type": "string"},
                               "description": "Label names to remove."},
+            "parent": {"type": "string",
+                       "description": ("New parent: identifier (e.g. RET-12) or UUID. Empty "
+                                       "string detaches the issue (top-level). Refused "
+                                       "(PARENT_CYCLE) if it is the issue or a descendant. A "
+                                       "detached issue you did not create leaves your scope.")},
         }, "required": ["id"]},
     },
     "linear_comment": {

@@ -26,14 +26,14 @@ via `tool_call`. The seven tools:
 - `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`): in
   the session ticket's team and project.
 - `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`,
-  `remove_labels?`).
+  `remove_labels?`, `parent?`): `parent: ""` detaches; a cycle is `PARENT_CYCLE`.
 - `linear_comment` (`id`, `body`, `edit_marker?`).
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
 - `linear_task_state` (`id`, `state` = `in_progress | in_review | done | blocked |
   unblocked`, `summary?`, `question?`).
 
 They act as the Linear app, write only to the session ticket, its descendants and
-tickets created in this session, never raise, and fail as `{"ok": false, "error": …}`.
+tickets they created from it (in any turn), never raise, and fail as `{"ok": false, "error": …}`.
 Every tool is safe to re-run.
 
 ## Questions and approvals

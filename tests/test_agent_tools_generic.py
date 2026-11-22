@@ -18,6 +18,7 @@ from fake_workspace import PROJECT, TEAM, VIEWER, FakeWorkspace
 from hermes_linear.linear_client import LinearError
 
 from hermes_linear import agent_tools
+from hermes_linear.store import Store
 from hermes_linear.agent_tools import (TOOL_HANDLERS, TOOL_SCHEMAS, linear_comment,
                                        linear_issue_create, linear_issue_get,
                                        linear_issue_update, resolve_state)
@@ -47,7 +48,9 @@ def ws():
 
 @pytest.fixture
 def adapter(loop, ws):
-    return new_adapter(loop, client=ws)
+    a = new_adapter(loop, client=ws)
+    a._store = Store.open(":memory:")
+    return a
 
 
 @pytest.fixture
@@ -170,8 +173,8 @@ def test_create_child_in_scope_records_created(pin_ctx, ws, adapter):
     assert stored["team"] == TEAM and stored["project"] == PROJECT  # from the session issue
     assert stored["labels"] == ["lb-bug"] and stored["state"] == "st-progress"
     assert stored["description"] == "do it"
-    assert adapter.tool_created["sk"] == {new_id}  # the UUID, never the identifier
-    assert out["issue"]["identifier"] not in adapter.tool_created["sk"]
+    # recorded for the session ticket, as the UUID (never the identifier)
+    assert adapter._store.created_by(SELF) == {new_id}
 
 
 def test_create_without_parent_then_update_created(pin_ctx, ws, adapter):
@@ -188,7 +191,7 @@ def test_create_without_parent_then_update_created(pin_ctx, ws, adapter):
 def test_create_parent_out_of_scope_refused(pin_ctx, ws, adapter):
     out = linear_issue_create({"title": "Sneaky", "parent": "OTH-9"})
     assert out == {"ok": False, "error": "OUT_OF_SCOPE"}
-    assert ws.writes() == [] and adapter.tool_created == {}
+    assert ws.writes() == [] and adapter._store.created_by(SELF) == set()
 
 
 def test_create_refused_outside_linear_session(pin_ctx, ws):
@@ -266,6 +269,127 @@ def test_update_out_of_scope_refused(pin_ctx, ws):
     assert linear_issue_update({"id": "OTH-9", "title": "x"}) == {"ok": False,
                                                                   "error": "OUT_OF_SCOPE"}
     assert ws.writes() == []
+
+
+# ----------------------------------------------------------------- reparent (RET-110)
+
+
+def test_reparent_within_scope(pin_ctx, ws):
+    ws.add_issue("RET-4", title="Sibling", uuid="uuid-sib", parent=SELF)
+    out = linear_issue_update({"id": "RET-4", "parent": "RET-2"})  # parent alone is a change
+    assert out["ok"] is True and out["issue"]["identifier"] == "RET-4"
+    assert ws.issues["uuid-sib"]["parent"] == "uuid-child"
+    assert ws.writes() == [("issue_update", ("uuid-sib", {"parentId": "uuid-child"}))]
+
+
+@pytest.mark.parametrize("detach", [None, "", "  "])
+def test_reparent_detach(pin_ctx, ws, detach):
+    out = linear_issue_update({"id": "RET-2", "parent": detach})
+    assert out["ok"] is True
+    assert ws.issues["uuid-child"]["parent"] is None
+    assert ws.writes() == [("issue_update", ("uuid-child", {"parentId": None}))]
+
+
+def test_reparent_with_other_fields(pin_ctx, ws):
+    ws.add_issue("RET-4", uuid="uuid-sib", parent=SELF)
+    out = linear_issue_update({"id": "RET-4", "parent": "uuid-child", "title": "Moved"})
+    assert out["ok"] is True
+    assert ws.writes()[-1][1] == ("uuid-sib", {"title": "Moved", "parentId": "uuid-child"})
+
+
+def test_reparent_out_of_scope_source(pin_ctx, ws):
+    assert linear_issue_update({"id": "OTH-9", "parent": "RET-1"}) == {
+        "ok": False, "error": "OUT_OF_SCOPE"}
+    assert linear_issue_update({"id": "OTH-9", "parent": None}) == {
+        "ok": False, "error": "OUT_OF_SCOPE"}
+    assert ws.writes() == []
+
+
+def test_reparent_out_of_scope_target(pin_ctx, ws):
+    assert linear_issue_update({"id": "RET-2", "parent": "OTH-9"}) == {
+        "ok": False, "error": "OUT_OF_SCOPE"}
+    assert ws.issues["uuid-child"]["parent"] == SELF
+    assert ws.writes() == []
+
+
+def test_reparent_unknown_target(pin_ctx, ws):
+    assert linear_issue_update({"id": "RET-2", "parent": "NOPE-1"}) == {
+        "ok": False, "error": "NOT_FOUND"}
+    assert ws.writes() == []
+
+
+def test_reparent_cycle_refused(pin_ctx, ws):
+    ws.add_issue("RET-3", title="Grandchild", uuid="uuid-gc", parent="uuid-child")
+    for issue, parent in (("RET-2", "RET-2"),        # itself
+                          ("RET-2", "uuid-child"),   # itself, by UUID
+                          ("RET-1", "RET-2"),        # its child
+                          ("RET-1", "RET-3"),        # its grandchild
+                          ("RET-2", "RET-3")):       # its child
+        assert linear_issue_update({"id": issue, "parent": parent}) == {
+            "ok": False, "error": "PARENT_CYCLE"}, (issue, parent)
+    assert ws.writes() == []
+
+
+def test_reparent_cycle_walk_bounded_fails_closed(pin_ctx, ws, monkeypatch):
+    monkeypatch.setattr(agent_tools, "CYCLE_WALK_DEPTH", 2)
+    ws.add_issue("RET-3", uuid="uuid-gc", parent="uuid-child")
+    ws.add_issue("RET-4", uuid="uuid-ggc", parent="uuid-gc")
+    # RET-4's ancestry (gc, child, SELF) is deeper than the walk: can't prove no cycle
+    assert linear_issue_update({"id": "RET-1", "parent": "RET-4"}) == {
+        "ok": False, "error": "PARENT_CYCLE"}
+    assert linear_issue_update({"id": "RET-3", "parent": "RET-2"})["ok"] is True  # 1 level up
+    assert ws.writes() == [("issue_update", ("uuid-gc", {"parentId": "uuid-child"}))]
+
+
+def test_reparent_bad_parent_type(pin_ctx, ws):
+    for bad in (5, ["RET-1"], {"id": "RET-1"}):
+        assert linear_issue_update({"id": "RET-2", "parent": bad}) == {
+            "ok": False, "error": "BAD_ARGS"}
+    assert ws.writes() == []
+
+
+def test_update_schema_has_parent():
+    props = TOOL_SCHEMAS["linear_issue_update"]["parameters"]["properties"]
+    assert props["parent"]["type"] == "string"
+    assert "detach" in props["parent"]["description"].lower()
+
+
+# ------------------------------------------------- app-created scope persists (RET-110)
+
+
+def test_created_issue_writable_in_a_later_turn(pin_ctx, ws, adapter):
+    top = linear_issue_create({"title": "Umbrella"})["issue"]
+    # a later turn: another gateway session key, same session ticket, nothing in memory
+    pin_ctx(key="sk-later")
+    kid = linear_issue_create({"title": "Sub", "parent": top["identifier"]})
+    assert kid["ok"] is True and ws.issues[kid["issue"]["id"]]["parent"] == top["id"]
+    assert linear_issue_update({"id": top["identifier"], "title": "Umbrella 2"})["ok"] is True
+    # and it can adopt an existing child of the session ticket
+    assert linear_issue_update({"id": "RET-2", "parent": top["id"]})["ok"] is True
+    assert ws.issues["uuid-child"]["parent"] == top["id"]
+
+
+def test_created_issue_survives_adapter_restart(pin_ctx, ws, adapter, loop):
+    top = linear_issue_create({"title": "Umbrella"})["issue"]
+    fresh = new_adapter(loop, client=ws)
+    fresh._store = adapter._store  # same plugin store, new adapter (reconnect / restart)
+    pin_ctx(ad=fresh, key="sk-after-restart")
+    assert linear_issue_update({"id": top["id"], "title": "Still mine"})["ok"] is True
+
+
+def test_created_issue_scoped_to_its_session_ticket(pin_ctx, ws, adapter):
+    top = linear_issue_create({"title": "Umbrella"})["issue"]
+    pin_ctx(issue="uuid-other", key="sk-other")  # a session on another ticket
+    assert linear_issue_update({"id": top["id"], "title": "x"}) == {
+        "ok": False, "error": "OUT_OF_SCOPE"}
+    assert linear_issue_create({"title": "x", "parent": top["id"]}) == {
+        "ok": False, "error": "OUT_OF_SCOPE"}
+
+
+def test_create_without_store_still_creates(pin_ctx, ws, adapter):
+    adapter._store = None  # disconnect race: the write lands, scope just isn't extended
+    out = linear_issue_create({"title": "Loose"})
+    assert out["ok"] is True and out["issue"]["id"] in ws.issues
 
 
 # ----------------------------------------------------------------- linear_comment

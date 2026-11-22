@@ -93,9 +93,12 @@ that includes the identifier and URL of each ticket they touch.
   identifier or a UUID.
 - `linear_issue_create(title, description?, parent?, labels?, state?)`: team and
   project default to those of the session's ticket.
-- `linear_issue_update(id, title?, description?, state?, add_labels?, remove_labels?)`:
+- `linear_issue_update(id, title?, description?, state?, add_labels?, remove_labels?, parent?)`:
   `state` can be a state name or a state type (`started`, `completed`, …), resolved
-  against the team's workflow states.
+  against the team's workflow states. `parent` moves the issue under another one
+  (identifier or UUID); an empty string or null detaches it (top-level). The new
+  parent must be in write scope too, and a parent that is the issue itself or one of
+  its descendants is refused as `PARENT_CYCLE` before Linear is called (RET-110).
 - `linear_comment(id, body, edit_marker?)`: with `edit_marker`, the tool edits the
   app's existing comment that carries the hidden marker `<!-- hermes-linear:<marker> -->`.
   If no such comment exists, it creates one.
@@ -136,7 +139,12 @@ that includes the identifier and URL of each ticket they touch.
 ### 4.3 Guardrails
 
 - Writes are limited to the session's own ticket, its descendants, and tickets these
-  tools created in the session. Reads work across the workspace.
+  tools created from that ticket (and their descendants). Reads work across the
+  workspace.
+- Created tickets are recorded in the plugin store (`created_issues`), keyed by the
+  session ticket they were created from. They stay writable from that ticket in every
+  later turn and session, across restarts, and from no other ticket (RET-110). This
+  replaces the M1 rule that kept them in memory for one turn only.
 - In a session that did not start on the Linear platform there is no session ticket,
   so writes are refused.
 - The tools reuse the plugin's `LinearClient`: token renewal, bounded 429 retries and
@@ -370,7 +378,9 @@ each one before working it.
 **Found at close (filed as tickets)**
 
 - RET-110: `linear_issue_update` can't change a ticket's parent, and the
-  app-created write scope lasts only one turn.
+  app-created write scope lasts only one turn. Resolved: `parent` on
+  `linear_issue_update`, and app-created tickets persist per session ticket (§4.1,
+  §4.3).
 
 ## 10. Out of scope
 
