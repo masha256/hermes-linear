@@ -20,7 +20,7 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 - [Requirements](#requirements)
 - [Install](#install)
 - [Create the Linear OAuth app](#create-the-linear-oauth-app)
-- [Expose the webhook with Tailscale Funnel](#expose-the-webhook-with-tailscale-funnel)
+- [Expose the webhook](#expose-the-webhook)
 - [Configure the plugin](#configure-the-plugin)
 - [Configuration reference](#configuration-reference)
 - [Multiple Hermes profiles](#multiple-hermes-profiles)
@@ -51,7 +51,7 @@ Everything the agent does appears in Linear's agent session panel: every tool ca
 
 - Hermes Agent with the gateway running (`hermes gateway run` or the systemd service).
 - A Linear workspace where you can create an OAuth application (workspace admin).
-- A way for Linear to reach your machine over HTTPS. This guide uses [Tailscale Funnel](https://tailscale.com/kb/1223/funnel); any tunnel or reverse proxy works.
+- A way for Linear to reach your machine over HTTPS: Tailscale Funnel, Cloudflare Tunnel, ngrok, or a reverse proxy on a public host. See [Expose the webhook](#expose-the-webhook).
 
 ## Install
 
@@ -88,9 +88,24 @@ Create **one app per Hermes profile** you want in Linear. The app's name and ico
 
 The plugin requests the scopes `read, write, app:mentionable, app:assignable`.
 
-## Expose the webhook with Tailscale Funnel
+## Expose the webhook
 
-The plugin runs one local listener (default `127.0.0.1:8650`) for all profiles. Publish it under the `/linear/` path:
+The plugin runs one local listener (default `127.0.0.1:8650`) for all profiles, with a single route: `POST /linear/<profile>/webhook`. Linear must reach it over public HTTPS. Any tunnel or proxy works as long as it forwards to the listener **with the path unchanged**. Forwarding only `/linear/` is enough; nothing else is served.
+
+Your webhook URL is always `https://<public_host>/linear/<profile>/webhook`. `hermes linear setup` asks for `public_host` (it suggests your Tailscale name when Tailscale is installed; overwrite it for any other option) and prints the exact URL.
+
+No extra auth is needed at the tunnel: every webhook is HMAC-signed and rejected if older than 60 s.
+
+| Option | Setup | Stable URL | Needs your own domain | Notes |
+|---|---|---|---|---|
+| [Tailscale Funnel](#tailscale-funnel) | One command | Yes | No | Ports 443, 8443, 10000 only; URL carries the port. |
+| [Cloudflare Tunnel](#cloudflare-tunnel) | Moderate | Yes (named tunnel) | Yes, on Cloudflare DNS | No open ports; quick tunnels are testing-only. |
+| [ngrok](#ngrok) | One command | Yes (dev domain) | No | Free plan: one static dev domain. |
+| [Reverse proxy on a public host](#reverse-proxy-on-a-public-host) | Most work | Yes | Yes | VPS or public IP; Caddy handles TLS. |
+
+### Tailscale Funnel
+
+Publish the listener under the `/linear/` path:
 
 ```bash
 tailscale funnel --bg --https=8443 --set-path /linear http://127.0.0.1:8650/linear
@@ -99,8 +114,97 @@ tailscale funnel status
 
 - Funnel only serves ports **443, 8443, 10000**. Pick one not already used by `tailscale serve`.
 - If your tailnet hasn't enabled Funnel yet, the command prints an enable link — open it once.
-- Your webhook URL is then `https://<machine>.<tailnet>.ts.net:8443/linear/<profile>/webhook`. `hermes linear setup` prints the exact URL.
+- `public_host` is `<machine>.<tailnet>.ts.net:8443`, so the webhook URL is `https://<machine>.<tailnet>.ts.net:8443/linear/<profile>/webhook`.
 - To stop exposing it: `tailscale funnel --https=8443 off` (this turns off everything on that port).
+
+### Cloudflare Tunnel
+
+Use a **named tunnel** on a domain whose DNS is on Cloudflare. `cloudflared` connects outbound, so no inbound ports are opened. See Cloudflare's [locally-managed tunnel guide](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/local-management/create-local-tunnel/) for installing `cloudflared`.
+
+```bash
+cloudflared tunnel login                       # once; opens a browser to pick the zone
+cloudflared tunnel create hermes               # prints the tunnel UUID and credentials file
+cloudflared tunnel route dns hermes hermes.example.com
+```
+
+`~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <tunnel-uuid>
+credentials-file: /home/<you>/.cloudflared/<tunnel-uuid>.json
+ingress:
+  - hostname: hermes.example.com
+    path: ^/linear/
+    service: http://127.0.0.1:8650
+  - service: http_status:404
+```
+
+```bash
+cloudflared tunnel run hermes                  # foreground, to test
+sudo cloudflared service install               # then run it as a service
+```
+
+- `public_host` is `hermes.example.com` (no port); the webhook URL is `https://hermes.example.com/linear/<profile>/webhook`.
+- The service reads its config from `/etc/cloudflared/` when installed as root; copy `config.yml` and the credentials file there if it can't find them. See [run as a service](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/local-management/as-a-service/).
+- **Quick tunnels** (`cloudflared tunnel --url http://127.0.0.1:8650`) give a random `*.trycloudflare.com` URL that changes on every restart, so you'd re-edit the Linear app each time. Testing only.
+
+### ngrok
+
+Every ngrok account, free included, gets one static **dev domain** (e.g. `your-name.ngrok-free.dev`; find it under *Domains* in the ngrok dashboard). Paid plans can use a reserved or custom domain via `--url`.
+
+```bash
+ngrok config add-authtoken <token>             # once
+ngrok http 8650 --url your-name.ngrok-free.dev # foreground, to test
+```
+
+To keep it running, define the endpoint in the agent config (`ngrok config edit`):
+
+```yaml
+version: 3
+agent:
+  authtoken: <token>
+endpoints:
+  - name: hermes-linear
+    url: https://your-name.ngrok-free.dev
+    upstream:
+      url: 8650
+```
+
+```bash
+sudo ngrok service install --config /home/<you>/.config/ngrok/ngrok.yml
+sudo ngrok service start
+```
+
+`ngrok config check` prints the config file's path if yours lives elsewhere (macOS: `~/Library/Application Support/ngrok/ngrok.yml`).
+
+- `public_host` is `your-name.ngrok-free.dev` (no port).
+- The free plan's browser warning page is shown to browsers only; Linear's webhook requests are not affected.
+- This exposes the whole listener port, not just `/linear/`. That is fine (the listener serves nothing else); restrict it with an ngrok traffic policy if you want.
+
+### Reverse proxy on a public host
+
+If you have a VPS or a machine with a public IP and a DNS name, put [Caddy](https://caddyserver.com/) in front of the listener; it obtains and renews the TLS certificate itself. `Caddyfile`:
+
+```caddyfile
+hermes.example.com {
+	handle /linear/* {
+		reverse_proxy 127.0.0.1:8650
+	}
+	respond 404
+}
+```
+
+- Hermes on the same host: done. `public_host` is `hermes.example.com`.
+- Hermes behind NAT (home box) and Caddy on a VPS: carry the listener port over SSH from the Hermes machine, and keep it up with `autossh` or a systemd unit:
+
+  ```bash
+  ssh -N -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes \
+      -R 127.0.0.1:8650:127.0.0.1:8650 you@vps.example.com
+  ```
+
+- nginx or any other proxy works the same way: TLS termination, forward `/linear/` to the listener, path unchanged.
+
+Not recommended: ad-hoc tunnel services with random URLs or interstitial pages (localtunnel and similar). A changing URL means re-editing the Linear app, and an interstitial breaks delivery.
 
 ## Configure the plugin
 
@@ -112,7 +216,7 @@ hermes linear setup            # or: hermes gateway setup → Linear
 hermes -p <profile> linear setup
 ```
 
-The wizard stores secrets in the profile's `.env`, other settings in the profile's `config.yaml`, prints the webhook URL, and runs a live check. Restart the gateway afterwards.
+The wizard stores secrets in the profile's `.env`, other settings in the profile's `config.yaml`, prints the webhook URL, and runs a live check. Restart the gateway afterwards. Its step 3 prints a Tailscale Funnel command; skip it if you expose the webhook another way.
 
 Manual setup is equivalent:
 
@@ -138,6 +242,7 @@ Settings live at `plugins.entries.linear.settings.<key>` in each profile's `conf
 | `allowed_users` | list | `[]` | Who may drive the agent: Linear user UUIDs, emails, or `*` for everyone. Accepts a list or a comma-separated string. `LINEAR_ALLOWED_USERS` (comma-separated) in `.env` is also honoured; the two are combined. Empty and `allow_all_users` off = nobody. |
 | `allow_all_users` | bool | `false` | Allow every workspace member with access to the app's teams. `LINEAR_ALLOW_ALL_USERS=true` is also honoured. |
 | `auto_start` | bool | `true` | When a human delegates a ticket that is in Backlog / Todo / Triage, move it to the team's first *started* status when work begins. Tickets delegated by automations are left alone. |
+| `public_host` | string | `""` | Public HTTPS host (optionally `:port`) that Linear reaches the listener on. Used to build and print the webhook URL (`https://<public_host>/linear/<profile>/webhook`); set by `hermes linear setup`. Empty = Tailscale name if detected. |
 | `session_url` | string | `""` | Optional link shown as **Open** on the Linear agent session, e.g. `https://hermes.example.com/sessions/{session_id}`. Empty = no link. |
 | `listener_host` | string | `127.0.0.1` | Bind address of the shared webhook listener. **Read from the default profile only.** |
 | `listener_port` | int | `8650` | Port of the shared webhook listener. **Read from the default profile only.** |
@@ -176,9 +281,10 @@ Use `hermes -p <profile> linear …` for other profiles.
 
 ## Troubleshooting
 
-- **Agent shows "unresponsive" in Linear.** Linear needs a first response within 10 s. Check the gateway is running, `hermes linear status` shows a recent event, and the Funnel is up (`tailscale funnel status`).
+- **Agent shows "unresponsive" in Linear.** Linear needs a first response within 10 s. Check the gateway is running, `hermes linear status` shows a recent event, and the tunnel is up (`tailscale funnel status`, `cloudflared tunnel info <name>`, or the ngrok dashboard).
 - **No events arriving.** Confirm the webhook URL in the Linear app matches `hermes linear status` exactly (including the profile name and port), and that *Agent session events* is ticked.
 - **401s in the gateway log.** The webhook signing secret doesn't match `LINEAR_WEBHOOK_SECRET`, the machine clock is off (replay window is 60 s), or a webhook URL for one profile was pasted into another profile's app.
+- **Tunnel up but nothing reaches the listener.** Test from outside: `curl -i -X POST https://<public_host>/linear/<profile>/webhook` should return a 401 from the plugin (unsigned request). A 404 from the tunnel or proxy means the path was rewritten or not routed; a 502 means it can't reach `127.0.0.1:8650`.
 - **404s.** The profile in the URL doesn't exist or the Linear channel isn't enabled for it.
 - **"Not authorized" replies.** Add the user to `allowed_users` (UUID or email).
 - **Agent can't see a private team.** Add the team on the app's page in Linear settings.
