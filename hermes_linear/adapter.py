@@ -110,15 +110,6 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     last_outcome = property(lambda self: self.turns.last_outcome)
 
-    @property
-    def session_namespace(self) -> str:
-        """This profile's session-key prefix (``gateway/session.py`` ``_session_key_namespace``,
-        mirrored: that helper is private): ``agent:main`` for the default profile,
-        ``agent:main~`` for a profile named ``main``, else ``agent:<profile>``."""
-        profile = self._profile
-        if not profile or profile == "default":
-            return "agent:main"
-        return "agent:main~" if profile == "main" else f"agent:{profile}"
     stop_message_ids = property(lambda self: self.turns.stop_message_ids)
 
     # ------------------------------------------------------------ status

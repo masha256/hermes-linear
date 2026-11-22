@@ -12,7 +12,8 @@ fold the digest, snapshot) -> handed off (``handle_message``) -> admitted
 -> the next turn is released. A turn that is refused, never admitted, fails
 before hand-off, is stopped before hand-off, or exceeds
 ``constants.TURN_SAFETY_TIMEOUT_S`` frees the FIFO too, as does a stopped turn the gateway has
-not completed ``constants.STOP_SETTLE_S`` after the stop (Q6 safety net).
+not completed ``constants.STOP_SETTLE_S`` after the stop (Q6 safety net); those two nets drain
+like a completed turn (wait for the base's session guard, bounded) before the next release.
 """
 
 from __future__ import annotations
@@ -145,6 +146,17 @@ class TurnEngine:
     def last_outcome_for(self, key: Key) -> ProcessingOutcome | None:
         return self.last_outcome.get(key)
 
+    def turn_for_session_key(self, session_key: str | None) -> tuple[Key, Turn] | None:
+        """The in-flight turn whose gateway session key (as the base computed it) is
+        ``session_key``; tool hooks route by it (``HERMES_SESSION_KEY``)."""
+        if not session_key:
+            return None
+        key = next((k for k, t in self.inflight.items() if t.session_key == session_key), None)
+        return None if key is None else (key, self.inflight[key])
+
+    def owns_session_key(self, session_key: str | None) -> bool:
+        return self.turn_for_session_key(session_key) is not None
+
     def busy(self, key: Key) -> bool:
         return key in self.inflight or key in self.draining or bool(self.queues.get(key))
 
@@ -251,6 +263,9 @@ class TurnEngine:
                                     message_id=turn.mid)
         event = MessageEvent(text=text, source=source, message_id=turn.mid, user_id=d.user_id,
                              user_name=d.user_name, allow_gateway_control=False)
+        # The exact key the base derives for this event (``_event_session_key``), captured
+        # before hand-off: tool hooks may fire before handle_message returns.
+        turn.session_key = self._session_key_of(event)
         turn.handed_off = True  # from here on, interrupt synthesizes /stop
         try:
             await self._handle_message(event)
@@ -259,7 +274,6 @@ class TurnEngine:
             raise
         # The base spawns the processing task (and registers it) before handle_message
         # returns, so "admitted" is checkable now: hook fired, or the base owns the session.
-        turn.session_key = self._session_key_of(event)
         if not turn.admitted and not self._base_owns(turn.session_key):
             self._not_admitted(key, turn)
             return
@@ -287,7 +301,7 @@ class TurnEngine:
         try:
             self._on_safety_expired(turn)
         finally:
-            self._free(key, turn)
+            self._drain(key, turn)
 
     # ------------------------------------------------------------ base hooks
 
@@ -315,6 +329,15 @@ class TurnEngine:
         if found is None:
             return
         key, turn = found
+        self._drain(key, turn, after_current_task=True)
+
+    def _drain(self, key: Key, turn: Turn, *, after_current_task: bool = False) -> None:
+        """Drop ``turn`` from in-flight and release the next one only once the base no
+        longer holds the session guard (bounded retries, then ``DRAIN_DEADLINE_S``).
+
+        Used by normal completion (after the calling base task ends) and by the stop-settle
+        and safety-timeout nets, where the gateway may still own the session.
+        """
         if self.inflight.get(key) is not turn:
             return
         del self.inflight[key]
@@ -323,7 +346,7 @@ class TurnEngine:
         loop = asyncio.get_running_loop()
         self._drain_deadlines[key] = (turn, loop.call_later(
             DRAIN_DEADLINE_S, self._drain_deadline_hit, key, turn))
-        task = asyncio.current_task()
+        task = asyncio.current_task() if after_current_task else None
         if task is None:
             loop.call_soon(self._release_after_drain, key, turn, 0)
         else:
@@ -418,7 +441,7 @@ class TurnEngine:
         try:
             self._on_stop_unsettled(turn)
         finally:
-            self._free(key, turn)
+            self._drain(key, turn)
 
 
 __all__ = ["Key", "QUEUED_ACK", "STOPPED_TEXT", "Turn", "TurnEngine", "human_creator",

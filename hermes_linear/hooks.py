@@ -7,11 +7,16 @@ are bound), copies the event, and hands it to each connected adapter's loop with
 ``loop.call_soon_threadsafe``. Store lookups, adapter selection and Linear writes all happen
 on the loop; nothing here blocks or does I/O.
 
-Adapter selection: when ``HERMES_SESSION_KEY`` is bound, only adapters whose session namespace
-(``<ns>:linear:``, ``LinearAdapter.session_namespace``) prefixes it are candidates, so two
-profiles serving the same chat never cross. Among the candidates: the adapter whose store has
+Adapter selection: when ``HERMES_SESSION_KEY`` is bound, the adapter with an in-flight turn
+whose gateway session key (the exact key the base computed at hand-off,
+``TurnEngine.turn_for_session_key``) equals it owns the event. The key's profile namespace is
+never derived here: under ``multiplex_profiles`` the primary adapter's keys carry the launch
+profile name, not ``_owner_profile``. If no adapter claims the key (no key bound, or the turn
+already ended), the fallback is the adapter whose store has
 ``turn(HERMES_SESSION_MESSAGE_ID)``, else the one with
-``latest_turn_for_chat(HERMES_SESSION_CHAT_ID, HERMES_SESSION_THREAD_ID)``.
+``latest_turn_for_chat(HERMES_SESSION_CHAT_ID, HERMES_SESSION_THREAD_ID)``, skipping a turn
+that is in flight under a different known key, so two profiles serving the same chat never
+cross.
 """
 
 from __future__ import annotations
@@ -47,7 +52,18 @@ def _copy_args(args: Any) -> Any:
 
 
 def _route(adapters: list, phase: str, env: dict, ev: dict) -> None:
-    """On the loop: pick the owning adapter (message id first, then chat) and render."""
+    """On the loop: pick the owning adapter (session key, then message id, then chat)."""
+    session_key = env.get("session_key")
+    if session_key:
+        for ad in adapters:
+            try:
+                target = ad.outbound.tool_target_for_key(session_key)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("linear: tool hook key lookup failed: %s", type(exc).__name__)
+                continue
+            if target is not None:
+                ad.outbound.tool_event(phase, target, ev)
+                return
     for by_message in (True, False):
         for ad in adapters:
             try:
@@ -61,20 +77,9 @@ def _route(adapters: list, phase: str, env: dict, ev: dict) -> None:
     log.debug("linear: tool event for an unknown turn dropped")
 
 
-def _owns_key(ad: Any, session_key: str | None) -> bool:
-    if not session_key:
-        return True  # unknown key: fall back to message id / chat lookup
-    try:
-        return session_key.startswith(f"{ad.session_namespace}:{PLATFORM}:")
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def _schedule(phase: str, env: dict, ev: dict) -> None:
     groups: dict[asyncio.AbstractEventLoop, list] = {}
     for ad in list(adapter_mod.ADAPTERS.values()):
-        if not _owns_key(ad, env.get("session_key")):
-            continue
         loop = getattr(ad, "event_loop", None)
         if loop is not None and not loop.is_closed():
             groups.setdefault(loop, []).append(ad)

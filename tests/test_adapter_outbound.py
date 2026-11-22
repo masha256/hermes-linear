@@ -253,14 +253,16 @@ async def test_final_send_is_response(env):
     assert bodies(client, "response") == [(D_SID, "All done")]
 
 
-async def test_second_final_becomes_thought(env):
+async def test_second_final_is_additional_response(env):
     a, client, gw, store, order = env
     await deliver(a, DELEGATION)
     mid = gw.events[0].message_id
     await a.send(D_CHAT, "first", reply_to=mid, metadata={"notify": True})
     await a.send(D_CHAT, "second", reply_to=mid, metadata={"notify": True})
-    assert bodies(client, "response") == [(D_SID, "first")]
-    assert bodies(client, "thought")[-1] == (D_SID, "second")
+    # Ruling 33: never a thought after the response; content is kept as another response.
+    assert bodies(client, "response") == [(D_SID, "first"), (D_SID, "second")]
+    kinds = [c["type"] for _s, c, *_ in client.activities]
+    assert kinds[kinds.index("response"):] == ["response", "response"]
 
 
 async def test_turn_error_notice_posted_as_error(env):
@@ -760,7 +762,9 @@ async def test_interim_after_response_dropped(env, caplog):
         r3 = await a.send(D_CHAT, "late final", reply_to=mid, metadata={"notify": True})
     await a.wait_idle()
     assert r1.success and r2.success and r3.success  # never retried / notified
-    assert len(client.activities) == n
+    # Ruling 33: real content addressed to the answered turn is an additional response.
+    assert [(s, c["type"], c.get("body")) for s, c, *_ in client.activities[n:]] == [
+        (D_SID, "response", "late final")]
     assert "dropped" in caplog.text
     # A new turn of the same agent session is in flight: thoughts are posted again.
     await deliver(a, prompted(D_SID, D_ISSUE, "more", "act-2"))
@@ -901,7 +905,6 @@ async def test_two_profiles_same_chat_routed_by_session_key(session_env):
     a2, c2, gw2, s2, _ = new_adapter("pb")
     assert await a1.connect() and await a2.connect()
     try:
-        assert (a1.session_namespace, a2.session_namespace) == ("agent:pa", "agent:pb")
         await deliver(a1, MENTION)
         await deliver(a2, MENTION)  # same issue, thread and message id on both profiles
         assert gw1.events[0].message_id == gw2.events[0].message_id
@@ -923,13 +926,6 @@ async def test_two_profiles_same_chat_routed_by_session_key(session_env):
     finally:
         await a1.disconnect()
         await a2.disconnect()
-
-
-def test_session_namespace_rules():
-    a, *_ = new_adapter()
-    for profile, ns in (("default", "agent:main"), ("main", "agent:main~"), ("ops", "agent:ops")):
-        a._profile = profile
-        assert a.session_namespace == ns
 
 
 async def test_typing_suppressed_after_recent_activity(env):
@@ -963,3 +959,124 @@ def test_outbound_memory_bounded():
         ob.url_set.add(f"s{i}")
     assert len(ob.last_thought) == len(ob.typing_at) == len(ob.url_set) == outbound_mod._REMEMBER
     assert "m0" not in ob.last_thought and f"m{outbound_mod._REMEMBER + 49}" in ob.last_thought
+
+
+# ------------------------------------------------------------- fix round 2
+
+
+async def test_attachment_after_response_posted_as_response(env):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    mid = gw.events[0].message_id
+    await a.send(D_CHAT, "looking", metadata={"reply_to_message_id": mid, "_interim_send": True})
+    await a.send(D_CHAT, "Here is the chart", reply_to=mid, metadata={"notify": True})
+    # The base attachment fallback (_deliver_attachments -> send_image -> send) runs after
+    # the final text, while the turn is still in flight.
+    res = await a.send_image(D_CHAT, "https://x.example/chart.png", caption="chart",
+                             reply_to=mid, metadata={"thread_id": None})
+    assert res.success
+    await complete(a, gw.events[0])
+    kinds = [c["type"] for _s, c, *_ in client.activities]
+    first = kinds.index("response")
+    assert kinds[first:] == ["response", "response"]  # no thought after the first response
+    assert bodies(client, "response") == [(D_SID, "Here is the chart"),
+                                          (D_SID, "chart\nhttps://x.example/chart.png")]
+
+
+async def test_status_notice_after_response_dropped_while_turn_still_in_flight(env, caplog):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    mid = gw.events[0].message_id
+    await a.send(D_CHAT, "All done", reply_to=mid, metadata={"notify": True})
+    assert a.turns.find(mid) is not None  # still in flight (before on_processing_complete)
+    n = len(client.activities)
+    with caplog.at_level(logging.DEBUG, logger="hermes_linear.outbound"):
+        r1 = await a.send(D_CHAT, "⏳ Still working...", metadata={"thread_id": None,
+                                                                 "_interim_send": True})
+        r2 = await a.send(D_CHAT, "💾 Memory updated", metadata={
+            "reply_to_message_id": mid, "_interim_send": True})
+        r3 = await a.send(D_CHAT, "unmarked status", metadata={"thread_id": None})
+    await a.wait_idle()
+    assert r1.success and r2.success and r3.success
+    assert len(client.activities) == n
+    assert "dropped" in caplog.text
+    await complete(a, gw.events[0])
+    assert client.activities[-1][1]["type"] == "response"
+
+
+@pytest.mark.parametrize("write_fails", [False, True])
+async def test_cancelled_final_send_still_answers(env, write_fails):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    first = gw.events[0]
+    client.type_delay["thought"] = 0.1
+    a.outbound._post(D_SID, {"type": "thought", "body": "slow"})  # the final queues behind it
+    if write_fails:
+        real, failed = client.create_activity, []
+
+        async def fail_first_response(sid, content, **kw):
+            if content["type"] == "response" and not failed:
+                failed.append(content)
+                raise RuntimeError("linear down")
+            return await real(sid, content, **kw)
+
+        client.create_activity = fail_first_response
+    task = asyncio.create_task(a.send(D_CHAT, "final", reply_to=first.message_id,
+                                      metadata={"notify": True}))
+    await asyncio.sleep(0.01)
+    a.turns.interrupt(D_SID)  # the stop webhook: /stop goes to the gateway
+    await asyncio.sleep(0)
+    assert a.stop_message_ids
+    task.cancel()  # /stop cancels the base task during the final send
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The base completes the cancelled turn while the final is still queued.
+    await asyncio.create_task(a.on_processing_complete(first, ProcessingOutcome.CANCELLED))
+    assert bodies(client, "response") == []
+    await settle(a, 0.2)
+    want = "Stopped." if write_fails else "final"
+    assert bodies(client, "response") == [(D_SID, want)]
+    assert client.activities[-1][1]["type"] == "response"
+
+
+async def test_primary_multiplexed_profile_routes_tool_events(session_env):
+    a, client, gw, store, _ = new_adapter()  # primary adapter: no _owner_profile
+    a._session_key_profile = lambda source=None: "neo"  # launch profile under multiplexing
+    assert await a.connect()
+    try:
+        await deliver(a, DELEGATION)
+        mid = gw.events[0].message_id
+        key = f"agent:neo:linear:dm:{D_ISSUE}:1"
+        assert a.turns.owns_session_key(key)
+        assert a.turns.turn_for_session_key(key)[1].mid == mid
+        session_env(platform="linear", message_id=mid, chat_id=D_CHAT, key=key)
+        hooks.on_post_tool_call("terminal", {"command": "ls"}, "x", "t", tool_call_id="c1")
+        await settle(a)
+        assert acts(client, "action") == [(D_SID, {"type": "action", "action": "terminal",
+                                                   "parameter": "ls", "result": "x"})]
+    finally:
+        await a.disconnect()
+
+
+@pytest.mark.parametrize("net", ["safety", "stop_settle"])
+async def test_safety_release_waits_for_base_guard(env, monkeypatch, net):
+    a, client, gw, store, order = env
+    if net == "safety":
+        monkeypatch.setattr(constants, "TURN_SAFETY_TIMEOUT_S", 0.05)
+    else:
+        monkeypatch.setattr(constants, "STOP_SETTLE_S", 0.05)
+    await deliver(a, DELEGATION)
+    key = a.turns.current_turn_for(D_CHAT, None).session_key
+    a._active_sessions[key] = asyncio.Event()  # the base still holds the session guard
+    if net == "stop_settle":
+        a.turns.interrupt(D_SID)  # /stop sent; the gateway never completes the turn
+    await deliver(a, prompted(D_SID, D_ISSUE, "next", "act-2"))
+    await asyncio.sleep(0.15)
+    if net == "safety":
+        assert bodies(client, "error") == [(D_SID, "This turn timed out.")]
+    else:
+        assert bodies(client, "response") == [(D_SID, "Stopped.")]
+    assert not gw.events[-1].text.endswith("next")  # not released into the busy path
+    del a._active_sessions[key]
+    await settle(a, 0.1)
+    assert gw.events[-1].text.endswith("next")

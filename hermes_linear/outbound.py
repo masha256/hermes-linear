@@ -5,7 +5,10 @@ Q8, Q10).
   ``reply_to_message_id`` -> ``store.latest_turn_for_chat(chat_id, thread_id)`` (exact thread)
   -> drop + log. Classification: ``_interim_send`` / ``expect_edits`` -> ``thought``; the
   turn-error notice -> ``error``; an anchorless send with no turn in flight -> ``thought``;
-  anything else -> ``response`` (at most one per turn; later ones become ``thought``).
+  anything else -> ``response``. For a turn that already answered (Ruling 33): content
+  addressed to it by ``reply_to`` / ``reply_to_message_id`` (attachment fallback, late final)
+  is another ``response``; a status/interim notice is dropped unless another turn of the
+  agent session is in flight. A cancelled caller never unqueues a response write (shielded).
 * Stop (Q6): the gateway's ``/stop`` acknowledgement is recognised by ``reply_to`` and never
   forwarded; a stopped turn with no response gets ``Stopped.`` as its ``response`` when it
   completes (CANCELLED or FAILURE), or after ``STOP_SETTLE_S`` if the gateway never completes it.
@@ -158,6 +161,7 @@ class Outbound:
         self.pending_starts: dict[tuple, asyncio.TimerHandle] = {}  # fast-tool skip timers
         self.url_set = _Bounded()  # agent sessions whose link was set
         self.retired_stops = _Bounded()  # synthesized stop ids already handled
+        self.stop_skipped = _Bounded()  # stopped turn mids whose Stopped. a response replaced
         self.writes = _SessionWrites(lambda coro: self.a._spawn(coro))
 
     def reset(self) -> None:
@@ -185,9 +189,10 @@ class Outbound:
         self.typing_at.put(sid, self.clock())
         return self.writes.submit(sid, lambda: self.a._post_response(sid, content, **kw))
 
-    def _session_busy(self, sid: str) -> bool:
-        """True while a turn of agent session ``sid`` is in flight."""
-        return any(t.decision.agent_session_id == sid for t in self.a.turns.inflight.values())
+    def _other_turn_busy(self, sid: str, mid: str) -> bool:
+        """True while a turn of agent session ``sid`` other than ``mid`` is in flight."""
+        return any(t.decision.agent_session_id == sid and t.mid != mid
+                   for t in self.a.turns.inflight.values())
 
     def _answered(self, mid: str) -> bool:
         """The turn already has its response, or is no longer in flight (tool events)."""
@@ -229,8 +234,12 @@ class Outbound:
                      "(session %s)", t.sid)
             return "thought"
         if t.mid in self.responded:
-            log.info("linear: turn %s already has its response; posting as a thought", t.mid)
-            return "thought"
+            if t.via == "chat":
+                return "thought"  # a status notice: dropped by send() (Ruling 33)
+            # Ruling 33: real content addressed to the answered turn (the base attachment
+            # fallback, a late final) is an additional response, never a thought after it.
+            log.info("linear: turn %s already has its response; posting another", t.mid)
+            return "more"
         return "response"
 
     # ------------------------------------------------------------ send
@@ -251,14 +260,18 @@ class Outbound:
         if not body.strip():
             return SendResult(success=True, message_id=f"{target.sid}:empty")
         if (kind == "thought" and target.mid in self.responded
-                and not self._session_busy(target.sid)):
-            # I1: a thought after the response would flip the Linear session back to active.
-            log.debug("linear: thought for answered turn %s dropped (session %s idle)",
-                      target.mid, target.sid)
+                and not self._other_turn_busy(target.sid, target.mid)):
+            # I1: a status/interim thought after the response would flip the Linear session
+            # back to active, even while the answered turn itself is still finishing.
+            log.debug("linear: thought for answered turn %s dropped (no other turn of "
+                      "session %s in flight)", target.mid, target.sid)
             return SendResult(success=True, message_id=f"{target.sid}:dropped:{target.mid}")
-        if kind == "response":
-            self.responded.add(target.mid)
-            ok = await self._respond(target.sid, renderer.response(body))
+        if kind in ("response", "more"):
+            first = kind == "response"
+            if first:
+                self.responded.add(target.mid)
+            ok = await self._shielded_response(target, renderer.response(body), first)
+            kind = "response"
         else:
             if kind == "thought" and target.via == "reply_to_message_id":
                 # Only commentary carries reply_to_message_id; gateway status notices
@@ -269,6 +282,22 @@ class Outbound:
         if not ok:
             return SendResult(success=False, error="linear write failed")
         return SendResult(success=True, message_id=f"{target.sid}:{kind}:{target.mid}")
+
+    async def _shielded_response(self, t: Target, content: dict, first: bool) -> bool:
+        """Write a response; a cancelled caller (``/stop`` during the final send) never
+        unqueues it. If the turn's first response fails, the turn is unanswered again."""
+        fut = self._respond(t.sid, content)
+        if first:
+            fut.add_done_callback(lambda f: self._response_done(f, t))
+        return await asyncio.shield(fut)
+
+    def _response_done(self, fut: asyncio.Future, t: Target) -> None:
+        if not fut.cancelled() and fut.result():
+            return
+        self.responded.pop(t.mid, None)
+        if t.mid in self.stop_skipped:  # the stop reply was skipped for this write
+            del self.stop_skipped[t.mid]
+            self._answer_stopped(t.mid, t.sid)
 
     # ------------------------------------------------------------ stop (Q6)
 
@@ -291,9 +320,11 @@ class Outbound:
         return stop_ids
 
     def _answer_stopped(self, mid: str, sid: str) -> None:
-        if mid not in self.responded:
-            self.responded.add(mid)
-            self._respond(sid, renderer.response(STOPPED_TEXT), timeout_s=ACK_TIMEOUT_S)
+        if mid in self.responded:
+            self.stop_skipped.add(mid)  # answered, unless that response write fails
+            return
+        self.responded.add(mid)
+        self._respond(sid, renderer.response(STOPPED_TEXT), timeout_s=ACK_TIMEOUT_S)
 
     def turn_finished(self, found: tuple[Key, Turn] | None, outcome: ProcessingOutcome) -> None:
         """``on_processing_complete`` (sync): stop reply, turn-end fallback, heartbeat."""
@@ -452,8 +483,21 @@ class Outbound:
             row = store.latest_turn_for_chat(chat, env.get("thread_id")) if chat else None
         if row is None:
             return None
+        found = self.a.turns.find(row.message_id)
+        session_key = env.get("session_key")
+        if (session_key and found is not None and found[1].session_key
+                and found[1].session_key != session_key):
+            return None  # in flight under another gateway session (another profile's turn)
         return Target(row.agent_session_id, row.message_id, (row.hermes_chat_id, row.thread_id),
                       "hook")
+
+    def tool_target_for_key(self, session_key: str) -> Target | None:
+        """The in-flight turn the base keyed as ``session_key`` (hooks.py, on the loop)."""
+        found = self.a.turns.turn_for_session_key(session_key)
+        if found is None:
+            return None
+        key, turn = found
+        return Target(turn.decision.agent_session_id, turn.mid, key, "hook")
 
     def tool_event(self, phase: str, t: Target, ev: dict) -> None:
         """One pre/post tool call for agent session ``t.sid`` (sync, on the loop)."""
