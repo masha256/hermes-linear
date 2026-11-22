@@ -39,10 +39,20 @@ the Linear MCP server, and the collision hides every MCP Linear tool. Use a diff
   plugin toolset of that name before it consults the alias (`toolsets.py:297-305`), so the MCP tools are
   never selected. The neo profile has exactly this server (`mcp_servers.linear`,
   `https://mcp.linear.app/mcp`).
-- Tool Search can defer plugin tools behind `tool_search`/`tool_describe`/`tool_call` when the
-  deferrable surface is large (`model_tools.py:546-559`). In the probe, `linear_probe` was in the
-  `tool_search` catalog listing rather than in the direct schemas. It can still be called, but only by
-  its exact name.
+- **With neo's defaults the tools are always deferred behind Tool Search.** The comment at
+  `model_tools.py:545-547` speaks of a size threshold, but the gate is `should_activate`
+  (`tools/tool_search.py:204-213`): unless `enabled == "off"`, it activates whenever *any* deferrable
+  tool exists. The default is `tools.tool_search.enabled: "auto"` (`hermes_cli/config_defaults.py:1970-1978`,
+  "auto" is an alias of "on"), and neo's `config.yaml` has no `tool_search` override. Plugin tools are
+  deferrable (`tools/tool_search.py:150-162`: not core, not a direct-surface toolset). So
+  `get_tool_definitions` replaces `linear_*` with the `tool_search`/`tool_describe`/`tool_call` bridge
+  (`model_tools.py:549-559`). The probe agreed: `linear_probe` was in the catalog listing, not in the
+  direct schemas.
+  - A direct call to a deferred name is rejected as an unknown tool; deferred tools are reachable only
+    through the `tool_call` bridge (`agent/prompt_builder.py:615-624`).
+  - `tool_call` is unwrapped to the real tool name before the pre/post hooks, middleware and dispatch
+    run (`model_tools.py:928-947`). So `hooks.py` and the handler still see `linear_*`, never the
+    bridge name.
 - Probe (`t0_probe.py`):
   - With `toolset="linear"`, `linear_probe` is selected on linear, telegram and cli.
   - With an MCP `linear` server and its alias added, `mcp_linear_list_issues` is **not** selected.
@@ -60,8 +70,11 @@ the Linear MCP server, and the collision hides every MCP Linear tool. Use a diff
     (spec §4.3);
   - a user who later saves a toolset list with `hermes tools` controls them under `hermes_linear` in
     `platform_toolsets.<platform>`.
-- The skill (Task 6) names each tool exactly, because the tools may be reachable only through
-  `tool_search`.
+- **Task 6: the skill must tell the agent to reach the tools through the bridge.** It says to call
+  `tool_describe` with the exact tool name to load the schema, then
+  `tool_call(name="linear_issue_get", arguments={...})`, and so on for each tool. It also says plainly
+  that calling `linear_issue_get(...)` directly fails as an unknown tool. The skill lists all seven exact
+  names (Q5).
 - Fallback, if a toolset named after the platform is ever needed: document
   `platform_toolsets.<platform>: [..., hermes_linear]`.
 
@@ -80,19 +93,25 @@ inside a sync tool handler run by `registry.dispatch`?
 - `run_sync` goes to the executor through `_run_in_executor_with_context`, which uses
   `copy_context().run` (`gateway/session_runtime_workers.py:136`, `gateway/run.py:3981-3985`). That
   carries the vars to the turn thread.
-- Concurrent tool calls run in `DaemonThreadPoolExecutor` workers wrapped by
-  `propagate_context_to_thread`, which snapshots the context (`agent/tool_executor.py:944-945,1418`,
-  `tools/thread_context.py:38-45`).
+- Both tool paths run the call on a `DaemonThreadPoolExecutor` worker wrapped by
+  `propagate_context_to_thread`, which snapshots the context (`tools/thread_context.py:38-45`):
+  - **sequential** path: a single-worker executor per call (`agent/tool_executor.py:944-945`);
+  - **concurrent** path: the batch pool (`agent/tool_executor.py:1418`).
+
+  The middleware chain that ends in `handle_function_call` (`agent/agent_runtime_helpers.py:2544`) runs
+  inside that worker.
 - The `pre_tool_call` hook and the handler run in the same `handle_function_call` frame
   (`model_tools.py:966,981`, dispatch at `:863`). That is why m1's hooks already see these values.
 - Context kwargs are matched to the handler's signature (`tools/registry.py:1077-1080`). The probe
   handler received `session_id`, `task_id`, `conversation_id` and `user_task`.
 - Delegated subagents copy the context too (`tools/delegate_tool_dispatch.py:176`,
   `tools/delegate_tool_child_run.py:944`), so their tool calls see the parent's Linear session.
-- Probe: on all three paths (`seq` = `handle_function_call` on the turn thread, `par` = pool plus
-  `propagate_context_to_thread`, `dispatch` = `registry.dispatch`), the handler read
+- Probe: on all three cases (`seq` = `handle_function_call` called directly on the turn thread, `par` =
+  pool plus `propagate_context_to_thread`, `dispatch` = `registry.dispatch`), the handler read
   `HERMES_SESSION_KEY=agent:main:linear:dm:as1`, `HERMES_SESSION_PLATFORM=linear` and
-  `HERMES_SESSION_MESSAGE_ID=as1:act1`.
+  `HERMES_SESSION_MESSAGE_ID=as1:act1`. Note: the `seq` case did **not** go through the real sequential
+  middleware (single-worker executor). That path is the same `propagate_context_to_thread` wrapper the
+  `par` case exercised, so it is covered by `par`, not by `seq`.
 
 **Decision: default.**
 - Task 1 resolves the session ticket from `get_session_env("HERMES_SESSION_PLATFORM") == "linear"` and
@@ -110,17 +129,22 @@ inside a sync tool handler run by `registry.dispatch`?
 `asyncio.run_coroutine_threadsafe(coro, adapter.event_loop)` with a timed wait safe from there?
 
 **Answer.** A sync handler for a gateway turn runs on a worker thread that has **no running event
-loop**. That thread is either the turn's executor thread (`run_sync`) or a tool-pool worker spawned
-from it. It is never the gateway loop thread. Scheduling onto `adapter.event_loop` with
-`run_coroutine_threadsafe(...).result(timeout)` is safe.
+loop**: a `DaemonThreadPoolExecutor` worker spawned from the turn's executor thread (`run_sync`). On the
+agent-turn path it is never the gateway loop thread. Scheduling onto `adapter.event_loop` with
+`run_coroutine_threadsafe(...).result(timeout)` is safe there. One host path can break that:
+`PluginContext.dispatch_tool` (`hermes_cli/plugins_context.py:483-492`) calls `registry.dispatch`
+synchronously on whatever thread calls it. Another plugin calling it from gateway-loop code would run
+our sync handler on the loop thread.
 
 - Turn path: `GatewayRunner._run_agent_start_turn_worker` → `start_turn_worker` →
   `asyncio.ensure_future(runner._run_in_executor_with_context(run_sync))`
-  (`gateway/run_turn.py:1320-1383`, `gateway/session_runtime_workers.py:134-136`). The agent loop calls
-  tools inline on that thread (`agent/agent_runtime_helpers.py:2544`) or on pool workers
-  (`agent/tool_executor.py:944,1418`).
+  (`gateway/run_turn.py:1320-1383`, `gateway/session_runtime_workers.py:134-136`). From that thread the
+  agent loop runs each call on a worker: the sequential path uses a single-worker
+  `DaemonThreadPoolExecutor` (`agent/tool_executor.py:944`), and the concurrent path uses the batch pool
+  (`agent/tool_executor.py:1418`). The middleware → `handle_function_call` step
+  (`agent/agent_runtime_helpers.py:2544`) runs inside that worker.
 - Nothing in `gateway/` calls `registry.dispatch` or `handle_function_call` directly; the grep finds no
-  callers. `tui_gateway/methods_connectors.py:162` is the separate TUI backend and only dispatches
+  callers. The one generic path that could is `PluginContext.dispatch_tool` (above). `tui_gateway/methods_connectors.py:162` is the separate TUI backend and only dispatches
   connector tools.
 - `is_async=True` handlers would run in a *new* loop: `_run_async` uses a worker loop, or a fresh thread
   if a loop is running (`model_tools.py:95-147`). Because `LinearClient` and its aiohttp session belong
@@ -138,12 +162,15 @@ with a bounded wait.** Task 1's runtime bridge must:
 1. Look up the adapter for the session's profile in `adapter.ADAPTERS`. Return
    `{"ok": false, "error": "not_connected"}` when the entry is missing, `event_loop` is `None`, or the
    loop is closed or not running.
-2. Guard against deadlock even though the probe never saw a handler on the loop thread: if
+2. **Mandatory** deadlock guard. The agent-turn paths never run a handler on the loop thread, but
+   `PluginContext.dispatch_tool` (`hermes_cli/plugins_context.py:483-492`) can. If
    `asyncio.get_running_loop()` succeeds and is `adapter.event_loop`, return
    `{"ok": false, "error": "wrong_thread"}` without blocking. Never call `.result()` on the loop
    thread.
-3. Call `fut.result(timeout=T)` with `T` around 60 s. That stays well under the 300 s `_run_async` cap
-   and the gateway inactivity watchdog. On `TimeoutError`, call `fut.cancel()` and return
+3. Call `fut.result(timeout=T)` with `T` around 60 s. The bound that matters is the per-call sequential
+   deadline `timeouts.tools.sequential_call`. It falls back to the concurrent batch deadline, 420 s by
+   default (`agent/tool_executor.py:139,839-846`). 60 s stays well under it and under the gateway
+   inactivity watchdog. On `TimeoutError`, call `fut.cancel()` and return
    `{"ok": false, "error": "timeout"}`.
 4. Map every other exception to a sanitized `{"ok": false, "error": "<code>"}`. Never raise
    (spec §4.3).
@@ -183,6 +210,14 @@ inside `register()`.
 - Proposed text (58 characters): `Use when a repo has .hermes-linear.yaml or ticket says so.` Put the
   full trigger sentence in the SKILL.md frontmatter and body.
 - Ship SKILL.md inside the package directory, so that a symlinked or copied plugin dir resolves it.
+- **Do not gate the skill on tools or toolsets.** The skill index is built with
+  `available_tools=agent.valid_tool_names` (`agent/system_prompt.py:319`). That set is computed from the
+  tool surface *after* Tool Search deferral (`agent/agent_init.py:1019-1021`), so it holds the bridge
+  names, not `linear_*` (Q1). `_skill_should_show` hides a skill when any `requires_tools` or
+  `requires_toolsets` entry is missing (`agent/prompt_builder.py:1168-1186`). Frontmatter naming
+  `linear_*` or `hermes_linear` there would therefore hide the skill from `<available_skills>`.
+  SKILL.md must carry no `requires_tools`, `requires_toolsets`, `fallback_for_tools` or
+  `fallback_for_toolsets` keys. Scope it through its description and body.
 - **Live-verify** the index line in a neo Linear session after enablement.
 
 ## Q5. Manifest
