@@ -36,16 +36,20 @@ from .linear_client import LinearClient
 from .listener import ProfileEndpoint, get_listener
 from .outbound import Outbound, media_text
 from .models import (AddContext, AwaitDelegation, Fatal, Ignore, Interrupt, OpenSessionOnComment,
-                     Refuse, ResolveControl, SetMode, StartTurn)
+                     Refuse, Reply, ResolveControl, SetMode, StartTurn)
 from .router import RouterContext, route
 from .sessions_open import SessionOpener
 from .settings import (
     GLOBAL_ALLOWLIST_WARNING, Settings, SettingsError, load_scoped_settings, only_global_allowlist,
 )
 from .store import Store
+from .sync import MANAGED_TITLE_RE
 from .turns import QUEUED_ACK, TurnEngine, human_creator, snapshot_block
 
 log = logging.getLogger(__name__)
+
+#: Bound on the task sub-ticket lookup; it runs before the delegation's 10 s ack (RET-107).
+TASK_LOOKUP_TIMEOUT_S = 3.0
 
 PLATFORM = "linear"
 
@@ -171,6 +175,32 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._allow_from.add(user_id)  # email-resolved UUIDs join the gateway allowlist
         return ok
 
+    async def _task_parent(self, issue_id: str, title: str | None) -> str | None:
+        """The parent's identifier if ``issue_id`` is an app-managed task sub-ticket (RET-107).
+
+        Same test as ``linear_sync_plan``: a ``T<n> · <name>`` title, created by the app,
+        whose parent is a ticket delegated to the app. A payload title that does not match
+        decides without a fetch; a failed lookup allows the delegation (fail open).
+        """
+        if title is not None and not MANAGED_TITLE_RE.match(title):
+            return None
+        store, client, rctx = self._store, self._client, self._router_ctx
+        if store is None or client is None or rctx is None:
+            return None
+        try:
+            issue = await asyncio.wait_for(client.issue_get(issue_id), TASK_LOOKUP_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 - includes TimeoutError and NOT_FOUND
+            log.warning("linear: task sub-ticket check for %s failed: %s", issue_id,
+                        type(exc).__name__)
+            return None
+        parent = issue.get("parent") or {}
+        pt = store.ticket(parent["id"]) if parent.get("id") else None
+        if (not MANAGED_TITLE_RE.match(issue.get("title") or "") or pt is None
+                or pt.mode != "delegated"
+                or (issue.get("creator") or {}).get("id") != rctx.app_user_id):
+            return None
+        return parent.get("identifier") or pt.identifier or parent["id"]
+
     # ------------------------------------------------------------ lifecycle
 
     def _load_settings(self) -> Settings:
@@ -215,7 +245,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._policy = AccessPolicy(settings.allowed_users, settings.allow_all_users)
         self._allow_from = gateway_allow_from(settings.allowed_users, self._policy.open)
         self._router_ctx = RouterContext(store, str(viewer["id"]), self._allowed,
-                                         viewer.get("displayName"))
+                                         viewer.get("displayName"), self._task_parent)
         self._writer = renderer.ActivityWriter(self._client)
         self._activity_writer = renderer.ActivityWriter(self._client)
         self.event_loop = asyncio.get_running_loop()
@@ -475,6 +505,10 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 self._forget_tool_created()  # dropped/freed turns may have been a session's last
         elif isinstance(d, Refuse):
             await self._post_ack(d.agent_session_id, renderer.error(d.text))
+        elif isinstance(d, Reply):
+            self.opener.cancel_delegation_timer(d.issue_id)
+            self.opener.note_declined(d.issue_id)
+            await self._post_ack(d.agent_session_id, renderer.response(d.text))
         elif isinstance(d, AwaitDelegation):
             self.opener.await_delegation(d, event)
         elif isinstance(d, OpenSessionOnComment):

@@ -131,20 +131,20 @@ the umbrella: it holds the decomposition and build order. Create one top-level t
 per sub-project with `linear_issue_create` (no `parent`; same project; link the
 umbrella in its description). Each sub-project runs its own cycle in its own session.
 The tools cannot set a delegate: when a sub-project's turn comes, ask the user in the
-umbrella ticket to delegate its ticket to the app. Never delegate through other Linear
-tools or MCP servers; they act as the user, not the app.
+umbrella ticket to delegate its ticket to the app (never via other Linear tools or MCP
+servers; they act as the user).
 
 ## Rules
 
 - Ticket descriptions and the plan comment are written only by `linear_sync_spec` and
   `linear_sync_plan`. To change them, fix the file, commit and sync again.
-- On a sync failure, keep working (git holds everything). Mark the step
-  `unsynced (<code>)`: before the ledger exists (spec and plan stages) in your reply
-  in the ticket thread, afterwards in the ledger. Retry at the next sync point and
-  before any approval. Never ask for approval of an unsynced spec or plan; instead ask (select)
-  "Linear sync failed (<code>); retry now or approve from the file link?".
+- On a sync failure, keep working (git holds everything). Mark the step `unsynced
+  (<code>)` (in the thread before the ledger exists, then in the ledger); retry at the next
+  sync point and before any approval. Never ask to approve an unsynced spec or plan; ask
+  (select) "Linear sync failed (<code>); retry now or approve from the file link?".
 - Edits made in Linear are not synced back. A deleted or canceled sub-ticket whose
-  task is still in the plan is recreated on the next plan sync; ask whether to drop
-  the task.
+  task is still in the plan is recreated on the next plan sync; ask whether to drop it.
+- `T<n> · <name>` task sub-tickets are never delegated (the plugin declines): all SDD work
+  runs in the project ticket's session. Sub-project tickets are top-level and delegated.
 - On resume (crash, restart, new prompt): re-read the ledger and `git log`, re-sync the
   spec and plan, then continue.

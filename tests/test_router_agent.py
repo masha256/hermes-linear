@@ -14,12 +14,14 @@ from hermes_linear.models import (
     Ignore,
     Interrupt,
     Refuse,
+    Reply,
     ResolveControl,
     SetMode,
     StartTurn,
 )
 from hermes_linear.router import (
     RouterContext,
+    task_ticket_text,
     message_id,
     route,
     ticket_chat_id,
@@ -417,3 +419,95 @@ async def test_denied_undelegate_still_interrupts(store):
     store.record_session("s1", ISSUE, "c1", "delegation")
     out = await route(_delegate_event(APP, None), ctx)
     assert out == [Interrupt("s1"), SetMode(issue_id=ISSUE, mode="untouched", generation=1)]
+
+
+# ------------------------------------------------- task sub-tickets (RET-107)
+
+
+def _task_ctx(store, parent="RET-94"):
+    seen = []
+
+    async def task_parent(issue_id, title):
+        seen.append((issue_id, title))
+        return parent
+
+    return RouterContext(store=store, app_user_id=APP, allowed=_yes, task_parent=task_parent), seen
+
+
+def test_task_ticket_text():
+    assert task_ticket_text("RET-94") == (
+        "This is a task of RET-94; work on it continues in RET-94's session.")
+
+
+async def test_delegated_task_ticket_replies_without_a_turn(store):
+    ctx, seen = _task_ctx(store)
+    ev = copy.deepcopy(DELEGATION)
+    ev["agentSession"]["issue"]["title"] = "T3 · Gamma"
+    out = await route(ev, ctx)
+    assert out == [Reply(D_SID, D_ISSUE, task_ticket_text("RET-94"))]
+    assert seen == [(D_ISSUE, "T3 · Gamma")]
+    assert store.ticket(D_ISSUE).mode != "delegated"
+
+
+async def test_delegated_task_ticket_denied_user_still_refused(store):
+    ctx, seen = _task_ctx(store)
+    ctx.allowed = _no
+    out = await route(copy.deepcopy(DELEGATION), ctx)
+    assert [type(d) for d in out] == [Refuse] and seen == []
+
+
+async def test_mention_on_task_ticket_unaffected(store):
+    ctx, seen = _task_ctx(store)
+    out = await route(copy.deepcopy(MENTION), ctx)
+    assert _turns(out) and seen == []
+
+
+async def test_not_a_task_ticket_delegates_normally(store):
+    ctx, seen = _task_ctx(store, parent=None)  # e.g. a human-created `T1 ·` child
+    out = await route(copy.deepcopy(DELEGATION), ctx)
+    assert isinstance(out[0], SetMode) and _turns(out) and len(seen) == 1
+
+
+async def test_prompt_in_declined_task_session_replies_again(store):
+    ctx, seen = _task_ctx(store)
+    ev = copy.deepcopy(DELEGATION)
+    await route(ev, ctx)  # declined: the session row exists, the ticket is not delegated
+    p = copy.deepcopy(PROMPTED)
+    p["agentSession"]["id"] = D_SID
+    p["agentSession"]["issueId"] = D_ISSUE
+    p["agentSession"]["issue"]["id"] = D_ISSUE
+    p["agentActivity"]["agentSessionId"] = D_SID
+    out = await route(p, ctx)
+    assert out == [Reply(D_SID, D_ISSUE, task_ticket_text("RET-94"))] and len(seen) == 2
+
+
+async def test_prompt_in_delegated_session_not_checked(store):
+    ctx, seen = _task_ctx(store)
+    ctx.task_parent = None
+    out = await route(copy.deepcopy(DELEGATION), ctx)  # delegated normally
+    assert out[0] == SetMode(D_ISSUE, "delegated", 1)
+    store.set_mode(D_ISSUE, "delegated", 1)  # as the adapter applies it
+    ctx2, seen = _task_ctx(store)
+    p = copy.deepcopy(PROMPTED)
+    p["agentSession"]["id"] = D_SID
+    p["agentSession"]["issueId"] = D_ISSUE
+    p["agentSession"]["issue"]["id"] = D_ISSUE
+    p["agentActivity"]["agentSessionId"] = D_SID
+    assert _turns(await route(p, ctx2)) and seen == []
+
+
+async def test_delegate_change_on_task_ticket_awaits_decline_only(store):
+    ctx, seen = _task_ctx(store)
+    ev = copy.deepcopy(ISSUE_DELEGATED)
+    ev["data"]["title"] = "T1 · Alpha"
+    out = await route(ev, ctx)
+    assert out == [AwaitDelegation(ISSUE, DELEGATION_WAIT_S,
+                                   decline=task_ticket_text("RET-94"))]
+    assert seen == [(ISSUE, "T1 · Alpha")]
+    assert store.ticket(ISSUE).mode != "delegated"
+
+
+async def test_delegate_change_not_a_task_ticket_unchanged(store):
+    ctx, _seen = _task_ctx(store, parent=None)
+    out = await route(copy.deepcopy(ISSUE_DELEGATED), ctx)
+    assert out == [SetMode(ISSUE, "delegated", 1), AwaitDelegation(ISSUE, DELEGATION_WAIT_S)]

@@ -182,6 +182,7 @@ class FakeWorkspace:
         return {
             "id": i["id"], "identifier": i["identifier"], "title": i["title"],
             "description": i["description"], "subIssueSortOrder": i["subIssueSortOrder"],
+            "creator": {"id": i["creator"]} if i.get("creator") else None,
             "url": f"https://linear.app/x/issue/{i['identifier']}",
             "state": dict(st), "team": {"id": i["team"]}, "project": copy.deepcopy(i["project"]),
             "parent": {"id": parent["id"], "identifier": parent["identifier"]} if parent else None,

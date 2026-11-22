@@ -77,6 +77,13 @@ class FakeClient:
         self.activity_delay: dict[str, float] = {}  # agent session id -> seconds
         self.snapshot_delay = 0.0
         self.comment_fails = False
+        self.issues: dict[str, dict] = {}  # issue_get by id (task sub-ticket guard)
+
+    async def issue_get(self, issue_id):
+        self.calls.append(("issue_get", issue_id))
+        if issue_id not in self.issues:
+            raise RuntimeError("no such issue")
+        return copy.deepcopy(self.issues[issue_id])
 
     async def token(self):
         return "tok"
@@ -973,3 +980,91 @@ async def test_deliver_after_disconnect_is_noop(caplog):
     with caplog.at_level(logging.WARNING):
         a.deliver(copy.deepcopy(DELEGATION))
     assert "not connected" in caplog.text
+
+
+# ------------------------------------------------- task sub-tickets (RET-107)
+
+PARENT = "00000000-0000-4000-8000-0000000000aa"
+TASK_TEXT = "This is a task of RET-94; work on it continues in RET-94's session."
+
+
+def task_issue(issue_id, *, title="T1 · Alpha", creator=APP, parent=PARENT):
+    return {"id": issue_id, "identifier": "RET-200", "title": title,
+            "creator": {"id": creator} if creator else None,
+            "parent": {"id": parent, "identifier": "RET-94"} if parent else None}
+
+
+def responses(client):
+    return [(sid, c["body"]) for sid, c, *_ in client.activities if c["type"] == "response"]
+
+
+@pytest.fixture
+def task_env(env):
+    a, client, gw, store, order = env
+    store.upsert_ticket(PARENT, identifier="RET-94")
+    store.set_mode(PARENT, "delegated", 1)
+    return env
+
+
+async def test_task_parent_rules(task_env):
+    a, client, gw, store, order = task_env
+    client.issues["i1"] = task_issue("i1")
+    assert await a._task_parent("i1", "T1 · Alpha") == "RET-94"
+    assert await a._task_parent("i1", None) == "RET-94"  # no title in the payload: fetched
+    n = len(client.calls)
+    assert await a._task_parent("i1", "Plain title") is None
+    assert client.calls[n:] == []  # payload title decides without a fetch
+    client.issues["i2"] = task_issue("i2", creator=HUMAN)  # a human's `T1 ·` child
+    assert await a._task_parent("i2", "T1 · Alpha") is None
+    client.issues["i3"] = task_issue("i3", parent="not-delegated")
+    assert await a._task_parent("i3", "T1 · Alpha") is None
+    client.issues["i4"] = task_issue("i4", parent=None)
+    assert await a._task_parent("i4", "T1 · Alpha") is None
+    client.issues["i5"] = task_issue("i5", title="Renamed")
+    assert await a._task_parent("i5", None) is None
+    assert await a._task_parent("missing", "T1 · Alpha") is None  # lookup fails: allowed
+
+
+async def test_delegated_task_ticket_created_replies_once(task_env):
+    a, client, gw, store, order = task_env
+    client.issues[D_ISSUE] = task_issue(D_ISSUE)
+    ev = copy.deepcopy(DELEGATION)
+    ev["agentSession"]["issue"]["title"] = "T1 · Alpha"
+    await deliver(a, ev)
+    assert responses(client) == [(D_SID, TASK_TEXT)]
+    assert gw.events == [] and store.ticket(D_ISSUE).mode != "delegated"
+    # The Issue update for the same delegation arrives after: no second reply.
+    up = issue_delegated_event()
+    up["data"].update(id=D_ISSUE, title="T1 · Alpha")
+    await deliver(a, up)
+    await asyncio.sleep(0.2)
+    await a.wait_idle()
+    assert responses(client) == [(D_SID, TASK_TEXT)] and gw.events == []
+    assert not [c for c in client.calls if c[0] in ("create_session_on_issue",
+                                                     "app_sessions_on_issue")]
+
+
+async def test_delegated_task_ticket_timer_path_replies(task_env):
+    a, client, gw, store, order = task_env
+    issue = ISSUE_DELEGATED["data"]["id"]
+    client.issues[issue] = task_issue(issue)
+    up = issue_delegated_event()
+    up["data"]["title"] = "T1 · Alpha"
+    await deliver(a, up)
+    assert store.ticket(issue).mode != "delegated"
+    await asyncio.sleep(0.2)
+    await a.wait_idle()
+    assert responses(client) == [("sess-issue", TASK_TEXT)]
+    assert gw.events == [] and store.ticket(issue).mode != "delegated"
+    assert store.session("sess-issue").plugin_created
+    assert not thoughts(client)  # no "On it" ack: no turn
+
+
+async def test_human_task_titled_child_still_delegates(task_env):
+    a, client, gw, store, order = task_env
+    client.issues[D_ISSUE] = task_issue(D_ISSUE, creator=HUMAN)
+    ev = copy.deepcopy(DELEGATION)
+    ev["agentSession"]["issue"]["title"] = "T1 · Alpha"
+    await deliver(a, ev)
+    assert responses(client) == [] and len(gw.events) == 1
+    assert store.ticket(D_ISSUE).mode == "delegated"

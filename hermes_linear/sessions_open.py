@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
@@ -34,6 +35,8 @@ SNAPSHOT_TIMEOUT_S = 15
 AUTO_START_TIMEOUT_S = 20
 _AUTO_START_STATES = frozenset({"backlog", "unstarted", "triage"})
 _APPROVAL_CHOICES = ("once", "session", "deny")
+#: How long a declined task sub-ticket delegation suppresses a second reply (RET-107).
+DECLINE_TTL_S = 600.0
 
 
 # Hermes control-plane calls (public API, imported lazily; module-level so tests can stub).
@@ -110,6 +113,20 @@ class SessionOpener:
         self._wait_override = wait_override
         self._spawn = spawn  # fire-and-forget label writes (never block the event worker)
         self.delegation_timers: dict[str, asyncio.TimerHandle | None] = {}
+        self._declined: dict[str, float] = {}  # issue id -> monotonic time of the decline
+
+    # ------------------------------------------------------------ task sub-ticket declines
+
+    def note_declined(self, issue_id: str) -> None:
+        """Record that a delegation of ``issue_id`` was declined (RET-107)."""
+        now = time.monotonic()
+        self._declined = {k: t for k, t in self._declined.items() if now - t < DECLINE_TTL_S}
+        self._declined[issue_id] = now
+
+    def recently_declined(self, issue_id: str) -> bool:
+        """One delegation fires a `created` and an ``Issue update``: reply to only one."""
+        t = self._declined.get(issue_id)
+        return t is not None and time.monotonic() - t < DECLINE_TTL_S
 
     # ------------------------------------------------------------ delegation timers
 
@@ -127,8 +144,10 @@ class SessionOpener:
     def await_delegation(self, d: AwaitDelegation, event: dict) -> None:
         if d.issue_id in self.delegation_timers:
             return  # one timer per issue
+        if d.decline and self.recently_declined(d.issue_id):
+            return  # the delegation's `created` already got the reply
         actor = event.get("actor") or {}
-        info = (actor.get("id"), actor.get("name"))
+        info = (actor.get("id"), actor.get("name"), d.decline)
         override = self._wait_override()
         wait = override if override is not None else d.deadline_s
         self.delegation_timers[d.issue_id] = asyncio.get_running_loop().call_later(
@@ -142,14 +161,17 @@ class SessionOpener:
             self.delegation_timers.pop(issue_id, None)
 
     async def open_delegated_session(self, issue_id: str, actor_id: str | None,
-                                     actor_name: str | None) -> None:
+                                     actor_name: str | None, decline: str | None = None) -> None:
         if issue_id not in self.delegation_timers:
             return  # a `created` arrived meanwhile
         del self.delegation_timers[issue_id]
         store, client = self._store(), self._client()
         assert store is not None and client is not None
         ticket = store.ticket(issue_id)
-        if ticket is None or ticket.mode != "delegated" or not actor_id:
+        if decline:  # RET-107: a task sub-ticket; reply once, never delegated mode
+            if ticket is None or not actor_id or self.recently_declined(issue_id):
+                return
+        elif ticket is None or ticket.mode != "delegated" or not actor_id:
             return
 
         async def reuse_or_create() -> str:
@@ -165,6 +187,10 @@ class SessionOpener:
         # A reused session is one of *our app's* sessions (app_sessions_on_issue), so marking
         # it plugin_created is accurate; the flag is sticky (MAX) if it was already set.
         store.record_session(sid, issue_id, None, "delegation", plugin_created=True)
+        if decline:
+            self.note_declined(issue_id)
+            await self._post_ack(sid, renderer.response(decline))
+            return
         ident = ticket.identifier or issue_id
         author = actor_name or DEFAULT_AUTHOR
         await self._enqueue(StartTurn(
