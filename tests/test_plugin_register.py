@@ -474,3 +474,64 @@ def test_entry_point_via_metadata_when_installed():
     if not eps:
         pytest.skip("hermes-linear is not pip-installed in this environment")
     assert callable(eps[0].load().register)
+
+
+# ------------------------------------------------------------------ platform pinning
+
+
+def test_register_pins_platform_member_after_registration(monkeypatch):
+    """register() resolves Platform("linear") right after register_platform, in the plugin's own
+    scope, so the enum member is cached process-wide before the gateway's (launch-scope) session
+    store parses ``agent:<profile>:linear:…`` routing entries. Without it those entries are
+    dropped at startup ("'linear' is not a valid Platform") and tickets lose their session."""
+    order: list[str] = []
+
+    class OrderCtx(FakeCtx):
+        def register_platform(self, **kw):
+            order.append("register_platform")
+            super().register_platform(**kw)
+
+    def spy_platform(value):
+        order.append(f"Platform({value})")
+        return value
+
+    monkeypatch.setattr(plugin, "Platform", spy_platform)
+    monkeypatch.setattr(plugin, "get_secret", secrets_of({}))
+    plugin.register(OrderCtx({"client_id": CLIENT_ID}))
+    assert order[:2] == ["register_platform", "Platform(linear)"]
+
+
+def test_register_survives_platform_pin_failure(monkeypatch):
+    def boom(value):
+        raise ValueError(f"{value!r} is not a valid Platform")
+
+    monkeypatch.setattr(plugin, "Platform", boom)
+    monkeypatch.setattr(plugin, "get_secret", secrets_of({}))
+    c = FakeCtx({"client_id": CLIENT_ID})
+    plugin.register(c)  # must not raise
+    assert len(c.platforms) == 1 and c.hooks  # rest of registration still happened
+
+
+def test_platform_member_cached_across_scopes_real_hermes(monkeypatch):
+    """The Hermes behaviour the pin relies on (real gateway.config / platform_registry): a
+    plugin platform registered only in a profile scope resolves there, and once resolved the
+    member is cached so a launch-scope lookup succeeds too. Unpinned, the launch scope fails."""
+    from gateway.config import Platform as RealPlatform
+    from gateway.platform_registry import PlatformEntry, platform_registry
+
+    def entry(name):
+        return PlatformEntry(name=name, label=name, adapter_factory=lambda c: None,
+                             check_fn=lambda: True, source="plugin", plugin_name=name)
+
+    scope = {"key": "launch"}
+    monkeypatch.setattr(type(platform_registry), "current_scope_key",
+                        staticmethod(lambda: scope["key"]))
+    for name in ("zz-pinned-probe", "zz-unpinned-probe"):
+        platform_registry.register(entry(name), scope="profile-neo")
+
+    scope["key"] = "profile-neo"
+    RealPlatform("zz-pinned-probe")            # what _pin_platform_member does at register time
+    scope["key"] = "launch"                    # session store parses routing entries here
+    assert RealPlatform("zz-pinned-probe").value == "zz-pinned-probe"
+    with pytest.raises(ValueError):
+        RealPlatform("zz-unpinned-probe")

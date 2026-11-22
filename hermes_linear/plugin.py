@@ -16,10 +16,11 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 
+from gateway.config import Platform
 from gateway.platforms._shared import get_scoped_secret
 
 from . import hooks
-from .adapter import LinearAdapter, set_config_getter
+from .adapter import PLATFORM, LinearAdapter, set_config_getter
 from .settings import (
     ALLOW_ALL_USERS_ENV, ALLOWED_USERS_ENV, CLIENT_SECRET_KEY, WEBHOOK_SECRET_KEY, SettingsError,
     load_scoped_settings,
@@ -65,6 +66,23 @@ def config_errors(get_config: Callable[[str, Any], Any],
     return errors
 
 
+def _pin_platform_member() -> None:
+    """Resolve ``Platform("linear")`` now, while our registration is visible.
+
+    Plugin platforms are dynamic enum members created on first lookup, and only when the
+    platform is registered *in the looking-up scope*. Our registration lives in this
+    profile's plugin scope, but the gateway's session store parses every profile's routing
+    entries in the launch scope; there ``Platform("linear")`` fails and the ticket sessions
+    are dropped at startup. Once created here, the member is cached process-wide, so later
+    lookups in any scope succeed. Never fatal.
+    """
+    try:
+        Platform(PLATFORM)
+    except Exception as exc:  # noqa: BLE001 - registration must not fail on this
+        log.warning("linear: could not pin Platform(%r): %s; ticket sessions may not survive "
+                    "a gateway restart", PLATFORM, type(exc).__name__)
+
+
 def register(ctx) -> None:
     """Register the Linear platform, the tool hooks and ``hermes linear``."""
     from . import setup_cli  # deferred: keeps CLI helpers out of the adapter import path
@@ -105,6 +123,7 @@ def register(ctx) -> None:
         emoji=EMOJI,
         max_message_length=0,
     )
+    _pin_platform_member()
     ctx.register_hook("pre_tool_call", hooks.on_pre_tool_call)
     ctx.register_hook("post_tool_call", hooks.on_post_tool_call)
     ctx.register_cli_command(
