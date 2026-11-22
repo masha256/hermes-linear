@@ -43,7 +43,8 @@ Slack and Telegram are unchanged.
 - Linear appears to hold back a user's `prompted` webhook while the session is `active`. On
   RET-93 (2026-11-22 16:16) a reply typed during a live select was delivered only after a stop.
   An action posted after the elicitation (the pre-fix bug) had made the session active again.
-  Verified live in plan task 1, not assumed.
+  On the fixed build this is confirmed: in the RET-94 thread (2026-11-22 17:16:37) a reply
+  typed during a live select arrived at once and resolved the clarify as its answer.
 
 ## States
 
@@ -88,8 +89,10 @@ New methods:
 
 `ControlRow` gains the fields.
 
-`sessions` gains `open_tasks TEXT NOT NULL DEFAULT '[]'` (a JSON list of issue ids) with
-`set_open_task(sid, issue_id, open: bool)` and `open_tasks(sid)`.
+New table `open_tasks(issue_id TEXT, task_id TEXT, PRIMARY KEY (issue_id, task_id))`,
+keyed by the **session ticket** (the agent tools know `session_issue_id`, not the agent
+session id; a row's ticket comes from `sessions.issue_id`), with
+`set_open_task(issue_id, task_id, open: bool)` and `open_tasks(issue_id) -> list[str]`.
 
 New table `approval_grants(session_key TEXT, command TEXT, choice TEXT, actor_id TEXT,
 created_at REAL, PRIMARY KEY (session_key, command))`. One use per row.
@@ -128,8 +131,9 @@ does no I/O.
 
 ### 4. `Blocked` target
 
-- `agent_tools` `linear_task_state` records open tasks: `in_progress` / `in_review` →
-  `set_open_task(sid, id, True)`; `done` / `blocked` / `unblocked` → `False`.
+- `agent_tools` `linear_task_state` records open tasks under the session ticket:
+  `in_progress` / `in_review` → `set_open_task(session_issue_id, task_id, True)`; `done` /
+  `blocked` / `unblocked` → `False`.
 - At the switch to pending: exactly one open task → that issue; otherwise the session ticket.
   The id is stored as `row.ticket_id`.
 - Add and remove reuse `agent_tools._blocked_label` and the client's `issue_update`, bounded
