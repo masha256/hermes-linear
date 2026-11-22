@@ -24,8 +24,8 @@ Q8, Q10).
   Hermes's wait ends unanswered (``retire_clarify``, the approval-timeout ``edit_message``) the
   live row becomes *pending* (RET-94): nothing is posted and ``Blocked`` is added to the
   target issue. A plugin-issued stop for the session or a stale generation keeps the expiry:
-  a fixed ``thought`` and the row dropped (Q10). A new elicitation drops the session's pending
-  rows (their ``Blocked`` stays).
+  a fixed ``thought`` and the row dropped (Q10). A new elicitation, once posted, drops the
+  session's pending rows and removes their ``Blocked`` (a failed post leaves them standing).
 * Pending elicitation: Linear shows a select input only while the elicitation is the agent
   session's latest activity. While a control this adapter elicited is pending (row present,
   its turn in flight), ``_post`` drops every ``thought`` / ``action`` for that session
@@ -498,7 +498,6 @@ class Outbound:
                      *, question: str, command: Optional[str] = None):
         store = self.a._store
         assert store is not None
-        self._drop_pending(t.sid)  # a new question replaces a pending one (Blocked stays)
         store.put_control(rid, kind, t.sid, _generation(t.key[0]), choices,
                           session_key=session_key, question=question, command=command,
                           turn_mid=t.mid)
@@ -535,14 +534,22 @@ class Outbound:
             log.warning("linear: re-posting the pending question of %s failed: %s", sid,
                         type(exc).__name__)
 
-    def _drop_pending(self, sid: str) -> None:
+    def _replace_pending(self, sid: str, rid: str) -> None:
+        """A new question ``rid`` of ``sid`` was posted: it replaces the session's pending
+        ones. Called only after a successful post (a failed one leaves them standing). Their
+        rows are dropped and their ``Blocked`` removed; the new question adds it again if it
+        goes pending (final review 3)."""
         store = self.a._store
         session = store.session(sid) if store is not None else None
         if session is None:
             return
-        for row in store.controls_for_issue(session.issue_id):
-            if row.agent_session_id == sid and row.state == "pending":
-                self._drop_control(row.request_id)
+        rows = [r for r in store.controls_for_issue(session.issue_id)
+                if r.agent_session_id == sid and r.state == "pending" and r.request_id != rid]
+        for row in rows:
+            for pending in self.elicited.values():
+                pending.pop(row.request_id, None)
+        if rows:
+            self.a.opener.drop_pending(rows)
 
     def _drop_control(self, rid: str) -> None:
         for pending in self.elicited.values():
@@ -565,6 +572,7 @@ class Outbound:
         if not ok:
             self._drop_control(rid)
             return SendResult(success=False, error="linear write failed")
+        self._replace_pending(target.sid, rid)
         return SendResult(success=True, message_id=f"approval:{rid}")
 
     def _use_grant(self, prompt: Any, rid: str) -> bool:
@@ -606,6 +614,7 @@ class Outbound:
         if not ok:
             self._drop_control(str(clarify_id))
             return SendResult(success=False, error="linear write failed")
+        self._replace_pending(target.sid, str(clarify_id))
         return SendResult(success=True, message_id=f"clarify:{clarify_id}")
 
     async def _expire(self, rid: str, kind: str, text: str) -> bool:

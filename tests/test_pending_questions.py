@@ -218,6 +218,8 @@ async def test_set_blocked_failure_and_missing_label_return_false(env, caplog, m
 
 
 async def test_new_question_replaces_pending(env, session_env):
+    """Final review 3: the replaced pending row is dropped, and its Blocked removed, only
+    once the new elicitation posted; the new question adds Blocked again if it goes pending."""
     a, client, gw, store, order = env
     await _delegated(a, gw, session_env)
     await _clarify(a, client)
@@ -225,10 +227,55 @@ async def test_new_question_replaces_pending(env, session_env):
     await settle(a)
     assert store.control("clar-1").state == "pending"
     await _clarify(a, client, "clar-2", "Second?")
+    await settle(a)
     assert store.control("clar-1") is None
     rows = store.controls_for_issue(D_ISSUE)
     assert [(r.request_id, r.state) for r in rows] == [("clar-2", "live")]
-    assert not any("removedLabelIds" in u for _, u in client.issue_updates)  # Blocked stays
+    assert _removed(client) == [(D_ISSUE, [BLOCKED])]
+    await a.retire_clarify_card("clar-2", "expired")
+    await settle(a)
+    assert _added(client) == [(D_ISSUE, [BLOCKED]), (D_ISSUE, [BLOCKED])]
+
+
+async def test_new_question_answered_live_leaves_no_blocked(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    monkeypatch.setattr(sessions_open_mod, "_resolve_clarify", lambda rid, answer: True)
+    await _delegated(a, gw, session_env)
+    await _clarify(a, client)
+    await a.retire_clarify_card("clar-1", "expired")
+    await settle(a)
+    await _clarify(a, client, "clar-2", "Second?")
+    await deliver(a, prompted(D_SID, D_ISSUE, "staging", "act-ans"))
+    await settle(a)
+    assert store.controls_for_issue(D_ISSUE) == []
+    assert _removed(client) == [(D_ISSUE, [BLOCKED])]  # nothing leaves Blocked behind
+
+
+async def test_new_question_post_fails_keeps_pending(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    await _clarify(a, client)
+    await a.retire_clarify_card("clar-1", "expired")
+    await settle(a)
+    client.fail_types = {"elicitation"}
+    res = await a.send_clarify(D_CHAT, "Second?", ["a"], "clar-2", "sk", metadata=META)
+    await settle(a)
+    assert not res.success
+    assert store.control("clar-2") is None
+    assert store.control("clar-1").state == "pending"  # the old question still stands
+    assert _removed(client) == []
+
+
+async def test_new_approval_replaces_pending_after_post(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    await _clarify(a, client)
+    await a.retire_clarify_card("clar-1", "expired")
+    await settle(a)
+    assert (await a._send_exec_approval_prompt(_approval())).success
+    await settle(a)
+    assert store.control("clar-1") is None and store.control("req-1").state == "live"
+    assert _removed(client) == [(D_ISSUE, [BLOCKED])]
 
 
 def test_copy_verbatim():

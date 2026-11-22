@@ -65,7 +65,7 @@ Transitions:
 | live | gateway restart (startup sweep) | pending (no posts, no relabel) |
 | pending | answer (click or reply) | row dropped, `Blocked` removed, next turn started |
 | pending | stop signal on the session | row dropped, `Blocked` removed; stop handled as today |
-| pending | a new elicitation in the same session | old row dropped (its `Blocked` stays, the new question re-adds it when it goes pending) |
+| pending | a new elicitation in the same session, once posted | old row dropped and its `Blocked` removed (the new question re-adds it when it goes pending); a failed post leaves the old row standing |
 | pending | undelegation / re-delegation (generation change) | row dropped, `Blocked` removed |
 
 ## Components
