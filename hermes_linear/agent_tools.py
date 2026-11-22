@@ -531,11 +531,25 @@ async def _update(ctx: ToolContext, a: dict) -> dict:
     if a["state"] is not None:
         inp["stateId"] = await _state_id(ctx, team, a["state"])
     added, removed = await _label_ids(ctx, team, a["add_labels"], a["remove_labels"])
+    carried = _carried(issue)
+    removed = [lid for lid in removed if lid in carried]  # removing an absent label: no-op
     if added:
         inp["addedLabelIds"] = added
     if removed:
         inp["removedLabelIds"] = removed
+    if not inp:  # only no-op removals: never send an empty issueUpdate (Task 2 minor N1)
+        return {"ok": True, "issue": _summary(issue)}
     return {"ok": True, "issue": await ctx.client.issue_update(issue["id"], inp)}
+
+
+def _carried(issue: dict) -> set[str]:
+    """The label ids ``issue`` (an ``issue_get`` result) carries."""
+    return {lb["id"] for lb in issue.get("labels") or [] if isinstance(lb, dict) and lb.get("id")}
+
+
+def _summary(issue: dict) -> dict:
+    """The ``issue_update`` result shape, from an ``issue_get`` result (no write made)."""
+    return {k: issue.get(k) for k in ("id", "identifier", "title", "url")}
 
 
 # -- linear_comment
@@ -811,6 +825,97 @@ def _finish_sync_plan(a: dict, out: dict) -> dict:
     return out
 
 
+# -- linear_task_state (RET-79)
+
+TASK_STATES = ("in_progress", "in_review", "done", "blocked", "unblocked")
+BLOCKED_LABEL = "Blocked"
+
+
+def _parse_task_state(args: dict) -> dict:
+    state = args.get("state")
+    if not isinstance(state, str) or state.strip() not in TASK_STATES:
+        raise _Refusal("BAD_ARGS")
+    a = {"id": _req_str(args, "id"), "state": state.strip(),
+         "summary": _opt_str(args, "summary"), "question": _opt_str(args, "question")}
+    if a["state"] == "blocked":
+        a["question"] = _req_str(args, "question").strip()  # before any write (or read)
+    return a
+
+
+def _first_of_type(states: list[dict], type_: str) -> dict | None:
+    return next((s for s in states if (s.get("type") or "").casefold() == type_), None)
+
+
+def _named(states: list[dict], name: str) -> dict | None:
+    want = name.casefold()
+    return next((s for s in states if (s.get("name") or "").casefold() == want), None)
+
+
+def _target_state(states: list[dict], current: dict, state: str) -> dict:
+    """The workflow state ``state`` moves to (may be ``current``), else ``BAD_ARGS``."""
+    if state == "in_progress":
+        found = _named(states, "In Progress") or _first_of_type(states, "started")
+    elif state == "in_review":
+        found = _named(states, "In Review")
+        if found is None:  # no review state: stay in a started state, else move to one
+            found = current if (current.get("type") or "") == "started" \
+                else _first_of_type(states, "started")
+    else:  # done
+        found = _first_of_type(states, "completed")
+    if found is None or not found.get("id"):
+        raise _Refusal("BAD_ARGS")  # the team has no such state, as for _state_id
+    return found
+
+
+async def _blocked_label(ctx: ToolContext, team: str) -> str | None:
+    """The id of the team's (or workspace's) ``Blocked`` label, case-insensitive."""
+    want = BLOCKED_LABEL.casefold()
+    return next((lb["id"] for lb in await ctx.client.team_labels(team)
+                 if (lb.get("name") or "").casefold() == want and lb.get("id")), None)
+
+
+async def _task_state(ctx: ToolContext, a: dict) -> dict:
+    client, state = ctx.client, a["state"]
+    task = await _writable(ctx, a["id"])
+    team = _team_of(task)
+    current = task.get("state") or {}
+    out: dict[str, Any] = {"ok": True, "issue": task.get("identifier"),
+                           "state": current.get("name"), "label_missing": False}
+
+    if state in {"in_progress", "in_review", "done"}:
+        target = _target_state(await client.team_states(team), current, state)
+        summary = (a["summary"] or "").strip() if state == "done" else ""
+        if summary:  # first: a crash in between repeats the summary rather than losing it
+            await client.comment_create(task["id"], a["summary"])
+            out["summary_posted"] = True
+        if target["id"] != current.get("id"):
+            await client.issue_update(task["id"], {"stateId": target["id"]})
+        out["state"] = target.get("name")
+        return out
+
+    label = await _blocked_label(ctx, team)
+    carried = label is not None and label in _carried(task)
+    if state == "unblocked":
+        if label is None:
+            out["label_missing"] = True
+        elif carried:
+            await client.issue_update(task["id"], {"removedLabelIds": [label]})
+        return out  # nothing to remove: zero writes
+
+    # blocked: the question goes to the project ticket (the session issue), scope-checked
+    # like every write target, before anything is written.
+    project = await _writable(ctx, ctx.session_issue_id or "")
+    if label is not None and not carried:
+        await client.issue_update(task["id"], {"addedLabelIds": [label]})
+    await client.comment_create(
+        project["id"], f"**{task.get('identifier')} needs input:** {a['question']}")
+    if label is None:  # Ruling S18: the question is posted, the label could not be
+        return {"ok": False, "error": "LABEL_MISSING", "issue": task.get("identifier"),
+                "label_missing": True, "question_posted": True}
+    out["question_posted"] = True
+    return out
+
+
 linear_issue_get = _tool(_parse_get, _get)
 linear_issue_create = _tool(_parse_create, _create)
 linear_issue_update = _tool(_parse_update, _update)
@@ -819,6 +924,7 @@ linear_sync_spec = _tool(_parse_sync_spec, _sync_spec, blocking_parse=True)
 linear_sync_plan = _tool(_parse_sync_plan, lambda ctx, a: _sync_plan(ctx, a),  # late-bound
                          blocking_parse=True, timeout_s=PLAN_SYNC_TIMEOUT_S,
                          finish=_finish_sync_plan)
+linear_task_state = _tool(_parse_task_state, _task_state)
 
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
 
@@ -902,6 +1008,26 @@ TOOL_SCHEMAS: dict[str, dict] = {
                      "description": "Absolute path to the plan file."},
         }, "required": ["path"]},
     },
+    "linear_task_state": {
+        "name": "linear_task_state",
+        "description": ("Track a plan task sub-ticket as the Linear app. in_progress: move to "
+                        "In Progress; in_review: move to In Review (if the team has none, "
+                        "stay in or move to a started state); done: move to a completed "
+                        "state, posting summary (if given) on the task ticket; blocked: add "
+                        "the Blocked label and post question on the session (project) "
+                        "ticket as '**<ID> needs input:** <question>' (LABEL_MISSING if the "
+                        "team has no Blocked label, the question is still posted); "
+                        "unblocked: remove the Blocked label. Already-applied changes are "
+                        "not rewritten."),
+        "parameters": {"type": "object", "properties": {
+            "id": {"type": "string", "description": _ISSUE_REF},
+            "state": {"type": "string", "enum": list(TASK_STATES)},
+            "summary": {"type": "string",
+                        "description": "Markdown; with done, posted on the task ticket."},
+            "question": {"type": "string",
+                         "description": "Required with blocked: what you need answered."},
+        }, "required": ["id", "state"]},
+    },
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
@@ -911,10 +1037,11 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_comment": linear_comment,
     "linear_sync_spec": linear_sync_spec,
     "linear_sync_plan": linear_sync_plan,
+    "linear_task_state": linear_task_state,
 }
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_comment", "linear_issue_create", "linear_issue_get", "linear_issue_update",
-           "linear_sync_plan", "linear_sync_spec",
+           "linear_sync_plan", "linear_sync_spec", "linear_task_state",
            "resolve_context", "resolve_state", "run_on_adapter"]
