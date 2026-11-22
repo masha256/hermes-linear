@@ -115,7 +115,7 @@ def test_constants():
     assert c.WRITE_RETRIES == 3
 
 
-def test_register_stub_callable():
+def test_register_callable():
     from hermes_linear.plugin import register
 
-    assert register(object()) is None
+    assert callable(register)

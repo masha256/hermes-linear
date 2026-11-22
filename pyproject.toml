@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "hermes-linear"
 version = "0.1.0"
@@ -9,6 +13,10 @@ dependencies = []
 
 [project.entry-points."hermes_agent.plugins"]
 linear = "hermes_linear.plugin"
+
+[tool.setuptools]
+# Only the code package ships; the repo-root __init__.py is the directory-plugin shim.
+packages = ["hermes_linear"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

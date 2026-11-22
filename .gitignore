@@ -5,3 +5,5 @@ scratch/
 .pytest_cache/
 .worktrees/
 .superpowers/
+build/
+*.egg-info/

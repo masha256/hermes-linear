@@ -631,6 +631,12 @@ class Store:
 
         return self._write(go)
 
+    def last_event_at(self) -> float | None:
+        """Receive time of the newest webhook still in the dedup window (``hermes linear status``)."""
+        with self._lock:
+            r = self.conn.execute("SELECT MAX(at) FROM seen_webhooks").fetchone()
+        return None if r is None or r[0] is None else float(r[0])
+
     # users ---------------------------------------------------------------
 
     def cached_user(self, user_id: str, now: float) -> UserRow | None:

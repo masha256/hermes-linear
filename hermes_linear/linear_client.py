@@ -132,6 +132,8 @@ class LinearClient:
         self._token: str | None = None
         self._renew_at = 0.0
         self._viewer_id: str | None = None
+        #: Wall-clock expiry of the cached token (status display only; renewal uses ``clock``).
+        self.token_expires_at: float | None = None
 
     # -- plumbing -------------------------------------------------------
 
@@ -169,6 +171,7 @@ class LinearClient:
         expires_in = float(body.get("expires_in") or 0)
         self._token = body["access_token"]
         self._renew_at = self._clock() + expires_in - TOKEN_RENEW_MARGIN_S
+        self.token_expires_at = time.time() + expires_in if expires_in else None
         log.debug("linear: obtained app token (expires_in=%s)", int(expires_in))
 
     def _token_fresh(self) -> bool:

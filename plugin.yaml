@@ -7,6 +7,9 @@ description: >
   workspace webhooks on a shared listener and runs one Hermes session per
   delegated ticket, reporting progress back as Linear agent activities.
 author: masha256
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
 requires_env:
   - name: LINEAR_CLIENT_SECRET
     description: "Linear OAuth app client secret (used for client-credentials tokens)"
@@ -60,6 +63,11 @@ config_schema:
     default: ""
     label: "Session URL"
     description: "Template with {session_id} for the Linear \"Open\" link"
+  public_host:
+    type: str
+    default: ""
+    label: "Public host"
+    description: "Public HTTPS host of the webhook URL (Tailscale Funnel name); printed by setup/status"
   listener_host:
     type: str
     default: "127.0.0.1"
