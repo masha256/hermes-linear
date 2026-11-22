@@ -84,9 +84,31 @@ CREATE TABLE IF NOT EXISTS pending_controls (
     execution_generation INTEGER NOT NULL,
     choices              TEXT NOT NULL,
     created_at           REAL NOT NULL,
-    session_key          TEXT
+    session_key          TEXT,
+    state                TEXT NOT NULL DEFAULT 'live',
+    question             TEXT,
+    command              TEXT,
+    ticket_id            TEXT,
+    turn_mid             TEXT
 );
 CREATE INDEX IF NOT EXISTS controls_session ON pending_controls(agent_session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS open_tasks (
+    issue_id TEXT NOT NULL,
+    task_id  TEXT NOT NULL,
+    PRIMARY KEY (issue_id, task_id)
+);
+
+CREATE TABLE IF NOT EXISTS approval_grants (
+    session_key TEXT NOT NULL,
+    command     TEXT NOT NULL,
+    choice      TEXT NOT NULL,
+    actor_id    TEXT NOT NULL,
+    turn_mid    TEXT,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (session_key, command)
+);
+CREATE INDEX IF NOT EXISTS grants_turn ON approval_grants(turn_mid);
 
 CREATE TABLE IF NOT EXISTS seen_webhooks (
     webhook_id TEXT PRIMARY KEY,
@@ -111,6 +133,15 @@ CREATE TABLE IF NOT EXISTS labels (
     name     TEXT NOT NULL
 );
 """
+
+# Columns added to ``pending_controls`` after release; migrated in ``Store.__init__``.
+_CONTROL_COLUMNS = (
+    ("state", "TEXT NOT NULL DEFAULT 'live'"),
+    ("question", "TEXT"),
+    ("command", "TEXT"),
+    ("ticket_id", "TEXT"),
+    ("turn_mid", "TEXT"),
+)
 
 
 # ------------------------------------------------------------------ rows
@@ -157,6 +188,11 @@ class ControlRow:
     choices: tuple[Any, ...]
     created_at: float
     session_key: str | None = None
+    state: str = "live"
+    question: str | None = None
+    command: str | None = None
+    ticket_id: str | None = None
+    turn_mid: str | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +217,9 @@ class Store:
             cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_controls)")}
             if "session_key" not in cols:  # pre-session_key databases
                 conn.execute("ALTER TABLE pending_controls ADD COLUMN session_key TEXT")
+            for col, ddl in _CONTROL_COLUMNS:  # pre-pending-question databases
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE pending_controls ADD COLUMN {col} {ddl}")
             if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
@@ -549,17 +588,25 @@ class Store:
         choices: Sequence[Any],
         *,
         session_key: str | None = None,
+        question: str | None = None,
+        command: str | None = None,
+        turn_mid: str | None = None,
     ) -> None:
         """``session_key`` is the Hermes gateway session key the request belongs to
-        (needed to resolve an approval card, integration notes Q8)."""
+        (needed to resolve an approval card, integration notes Q8). ``question`` /
+        ``command`` are the clarify text / approval command shown to the user and
+        ``turn_mid`` the message id of the asking turn. Always writes a ``live`` row
+        (``ticket_id`` reset); ``mark_control_pending`` flips it after a timeout."""
 
         def go() -> None:
             self.conn.execute(
                 "INSERT OR REPLACE INTO pending_controls (request_id, kind, agent_session_id, "
-                "execution_generation, choices, created_at, session_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "execution_generation, choices, created_at, session_key, state, question, "
+                "command, ticket_id, turn_mid) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, NULL, ?)",
                 (request_id, kind, agent_session_id, execution_generation,
-                 json.dumps(list(choices)), time.time(), session_key),
+                 json.dumps(list(choices)), time.time(), session_key, question, command,
+                 turn_mid),
             )
 
         self._write(go)
@@ -579,6 +626,48 @@ class Store:
             r = self._one("SELECT * FROM pending_controls WHERE request_id = ?", (request_id,))
         return self._control_row(r)
 
+    def mark_control_pending(self, request_id: str, ticket_id: str | None) -> bool:
+        """Turn a timed-out live control into a stored pending question.
+
+        False when the row is gone (answered / dropped meanwhile)."""
+
+        def go() -> bool:
+            cur = self.conn.execute(
+                "UPDATE pending_controls SET state = 'pending', ticket_id = ? "
+                "WHERE request_id = ?",
+                (ticket_id, request_id),
+            )
+            return cur.rowcount > 0
+
+        return self._write(go)
+
+    def live_controls(self) -> list[ControlRow]:
+        with self._lock:
+            rows = self._all(
+                "SELECT * FROM pending_controls WHERE state = 'live' "
+                "ORDER BY created_at, rowid")
+        return [self._control_row(r) for r in rows]  # type: ignore[misc]
+
+    def controls_for_session_key(self, session_key: str) -> list[ControlRow]:
+        """All controls (any state) for a gateway session key, newest first."""
+        with self._lock:
+            rows = self._all(
+                "SELECT * FROM pending_controls WHERE session_key = ? "
+                "ORDER BY created_at DESC, rowid DESC",
+                (session_key,))
+        return [self._control_row(r) for r in rows]  # type: ignore[misc]
+
+    def controls_for_issue(self, issue_id: str) -> list[ControlRow]:
+        """All controls (any state) whose agent session belongs to ``issue_id``,
+        newest first."""
+        with self._lock:
+            rows = self._all(
+                "SELECT c.* FROM pending_controls c "
+                "JOIN sessions s ON s.agent_session_id = c.agent_session_id "
+                "WHERE s.issue_id = ? ORDER BY c.created_at DESC, c.rowid DESC",
+                (issue_id,))
+        return [self._control_row(r) for r in rows]  # type: ignore[misc]
+
     @staticmethod
     def _control_row(r: sqlite3.Row | None) -> ControlRow | None:
         if r is None:
@@ -590,6 +679,57 @@ class Store:
     def drop_control(self, request_id: str) -> None:
         self._write(lambda: self.conn.execute(
             "DELETE FROM pending_controls WHERE request_id = ?", (request_id,)))
+
+    # open tasks ----------------------------------------------------------
+
+    def set_open_task(self, issue_id: str, task_id: str, open: bool) -> None:
+        """Mark ``task_id`` open (or closed) for the session ticket ``issue_id``.
+        Idempotent either way."""
+        if open:
+            sql = "INSERT OR IGNORE INTO open_tasks (issue_id, task_id) VALUES (?, ?)"
+        else:
+            sql = "DELETE FROM open_tasks WHERE issue_id = ? AND task_id = ?"
+        self._write(lambda: self.conn.execute(sql, (issue_id, task_id)))
+
+    def open_tasks(self, issue_id: str) -> list[str]:
+        with self._lock:
+            rows = self._all(
+                "SELECT task_id FROM open_tasks WHERE issue_id = ? ORDER BY rowid",
+                (issue_id,))
+        return [r["task_id"] for r in rows]
+
+    # approval grants -----------------------------------------------------
+
+    def put_grant(
+        self, session_key: str, command: str, choice: str, actor_id: str, turn_mid: str
+    ) -> None:
+        """Store a one-use approval for ``command`` in ``session_key`` (replaces any
+        earlier grant). ``turn_mid`` is the answer turn's message id."""
+        self._write(lambda: self.conn.execute(
+            "INSERT OR REPLACE INTO approval_grants (session_key, command, choice, "
+            "actor_id, turn_mid, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (session_key, command, choice, actor_id, turn_mid, time.time())))
+
+    def take_grant(self, session_key: str, command: str) -> tuple[str, str] | None:
+        """Consume the grant: ``(choice, actor_id)`` and delete it, or None."""
+
+        def go() -> tuple[str, str] | None:
+            r = self._one(
+                "SELECT choice, actor_id FROM approval_grants "
+                "WHERE session_key = ? AND command = ?",
+                (session_key, command))
+            if r is None:
+                return None
+            self.conn.execute(
+                "DELETE FROM approval_grants WHERE session_key = ? AND command = ?",
+                (session_key, command))
+            return (r["choice"], r["actor_id"])
+
+        return self._write(go)
+
+    def drop_grants_for_turn(self, turn_mid: str) -> None:
+        self._write(lambda: self.conn.execute(
+            "DELETE FROM approval_grants WHERE turn_mid = ?", (turn_mid,)))
 
     # name caches ---------------------------------------------------------
 
