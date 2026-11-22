@@ -89,7 +89,8 @@ CREATE TABLE IF NOT EXISTS pending_controls (
     question             TEXT,
     command              TEXT,
     ticket_id            TEXT,
-    turn_mid             TEXT
+    turn_mid             TEXT,
+    authority            TEXT
 );
 CREATE INDEX IF NOT EXISTS controls_session ON pending_controls(agent_session_id, created_at);
 
@@ -141,6 +142,7 @@ _CONTROL_COLUMNS = (
     ("command", "TEXT"),
     ("ticket_id", "TEXT"),
     ("turn_mid", "TEXT"),
+    ("authority", "TEXT"),  # JSON: an approval's asking-time authority (who may answer)
 )
 
 
@@ -193,6 +195,7 @@ class ControlRow:
     command: str | None = None
     ticket_id: str | None = None
     turn_mid: str | None = None
+    authority: dict | None = None  # approval: Hermes's authority entry when it was asked
 
 
 @dataclass(frozen=True)
@@ -591,22 +594,25 @@ class Store:
         question: str | None = None,
         command: str | None = None,
         turn_mid: str | None = None,
+        authority: dict | None = None,
     ) -> None:
         """``session_key`` is the Hermes gateway session key the request belongs to
         (needed to resolve an approval card, integration notes Q8). ``question`` /
         ``command`` are the clarify text / approval command shown to the user and
-        ``turn_mid`` the message id of the asking turn. Always writes a ``live`` row
+        ``turn_mid`` the message id of the asking turn. ``authority`` (approvals) is Hermes's
+        entry of who may answer, captured while the approval was still pending in Hermes
+        (stored as JSON; checked when a pending approval is answered). Always writes a ``live`` row
         (``ticket_id`` reset); ``mark_control_pending`` flips it after a timeout."""
 
         def go() -> None:
             self.conn.execute(
                 "INSERT OR REPLACE INTO pending_controls (request_id, kind, agent_session_id, "
                 "execution_generation, choices, created_at, session_key, state, question, "
-                "command, ticket_id, turn_mid) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, NULL, ?)",
+                "command, ticket_id, turn_mid, authority) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'live', ?, ?, NULL, ?, ?)",
                 (request_id, kind, agent_session_id, execution_generation,
                  json.dumps(list(choices)), time.time(), session_key, question, command,
-                 turn_mid),
+                 turn_mid, json.dumps(authority, default=str) if authority is not None else None),
             )
 
         self._write(go)
@@ -674,6 +680,7 @@ class Store:
             return None
         d = dict(r)
         d["choices"] = tuple(json.loads(d["choices"]))
+        d["authority"] = json.loads(d["authority"]) if d.get("authority") else None
         return ControlRow(**d)
 
     def drop_control(self, request_id: str) -> None:

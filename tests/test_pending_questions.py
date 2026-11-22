@@ -27,7 +27,7 @@ from hermes_linear import hooks
 from hermes_linear import outbound as outbound_mod
 from hermes_linear import questions
 from hermes_linear import sessions_open as sessions_open_mod
-from hermes_linear.models import SetMode
+from hermes_linear.models import ResolveControl, SetMode, StartTurn
 from hermes_linear.router import message_id
 from hermes_linear.store import Store
 
@@ -659,12 +659,29 @@ async def test_other_session_does_not_answer(env, session_env):
     assert _removed(client) == []
 
 
+NARROWED = {"requester_id": HUMAN, "requester_name": "Human", "approvers": [],
+            "chat_type": "dm"}  # approvals.approvers narrowed: only the requester answers
+
+
+def _authority(monkeypatch, authority=NARROWED):
+    """Stub the asking-time capture (``tools.approval.list_gateway_approval_authority``)."""
+    seen = []
+    monkeypatch.setattr(sessions_open_mod, "_approval_authority",
+                        lambda sk, rid: seen.append((sk, rid)) or (
+                            None if authority is None else {"request_id": rid, **authority}))
+    return seen
+
+
 async def test_pending_approval_approve(env, session_env, monkeypatch):
     a, client, gw, store, order = env
-    monkeypatch.setattr(sessions_open_mod, "_approval_refusal", lambda *a, **k: None)
+    seen = _authority(monkeypatch)
+    monkeypatch.setattr(sessions_open_mod, "_approval_refusal",
+                        lambda *a, **k: pytest.fail("pending answers use the stored authority"))
     monkeypatch.setattr(sessions_open_mod, "_resolve_approval_card",
                         lambda *a, **k: pytest.fail("a pending approval has no waiter"))
     n = await _pending_approval(a, client, gw, session_env)
+    assert seen == [("agent:main:linear:dm:x", "req-1")]
+    assert store.control("req-1").authority == {"request_id": "req-1", **NARROWED}
     await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
     await settle(a)
     assert len(gw.events) == n + 1
@@ -676,9 +693,52 @@ async def test_pending_approval_approve(env, session_env, monkeypatch):
     assert _removed(client) == [(D_ISSUE, [BLOCKED])]
 
 
-async def test_pending_approval_deny(env, session_env, monkeypatch):
+async def test_pending_approval_non_approver_refused(env, session_env, monkeypatch):
+    """Final review 1: Hermes no longer has the timed-out approval, so the check uses the
+    authority captured when it was asked; another user's Approve is refused, row kept."""
     a, client, gw, store, order = env
-    monkeypatch.setattr(sessions_open_mod, "_approval_refusal", lambda *a, **k: None)
+    _authority(monkeypatch, {"requester_id": "u-alice", "requester_name": "Alice",
+                             "approvers": ["u-bob"], "chat_type": "dm"})
+    monkeypatch.setattr(sessions_open_mod, "_refusal_text", lambda who: f"only {who}")
+    n = await _pending_approval(a, client, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "once", "act-ans"))
+    await settle(a)
+    assert client.activities[-1][1] == {"type": "thought", "body": "only Alice"}
+    assert store.control("req-1").state == "pending"
+    assert len(gw.events) == n and _grants(store) == [] and _removed(client) == []
+
+
+async def test_pending_approval_listed_approver_accepted(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    _authority(monkeypatch, {"requester_id": "u-alice", "approvers": [HUMAN]})
+    n = await _pending_approval(a, client, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "session", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    assert [g[2:4] for g in _grants(store)] == [("session", HUMAN)]
+
+
+async def test_pending_approval_without_authority_refused(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    _authority(monkeypatch, None)  # not captured (e.g. Hermes had no entry): never approved
+    got = []
+    monkeypatch.setattr(sessions_open_mod, "_refusal_text", lambda who: got.append(who) or "no")
+    n = await _pending_approval(a, client, gw, session_env)
+    assert store.control("req-1").authority is None
+    await deliver(a, prompted(D_SID, D_ISSUE, "once", "act-ans"))
+    await settle(a)
+    assert len(got) == 1 and client.activities[-1][1] == {"type": "thought", "body": "no"}
+    assert store.control("req-1").state == "pending"
+    assert len(gw.events) == n and _grants(store) == [] and _removed(client) == []
+
+
+@pytest.mark.parametrize("authority", [None, {"requester_id": "u-alice", "approvers": []}])
+async def test_pending_approval_deny(env, session_env, monkeypatch, authority):
+    """Deny needs no authority (ruling R7 revised): anyone allowed in the thread may deny."""
+    a, client, gw, store, order = env
+    _authority(monkeypatch, authority)
+    monkeypatch.setattr(sessions_open_mod, "_may_answer",
+                        lambda *a, **k: pytest.fail("deny is never checked"))
     n = await _pending_approval(a, client, gw, session_env)
     await deliver(a, prompted(D_SID, D_ISSUE, "deny", "act-ans"))
     await settle(a)
@@ -687,6 +747,105 @@ async def test_pending_approval_deny(env, session_env, monkeypatch):
     assert _grants(store) == []
     assert store.control("req-1") is None
     assert _removed(client) == [(D_ISSUE, [BLOCKED])]
+
+
+def test_approval_authority_picks_the_request(monkeypatch):
+    import tools.approval as approval
+    monkeypatch.setattr(approval, "list_gateway_approval_authority", lambda sk: [
+        {"request_id": "other", "requester_id": "x"},
+        {"request_id": "req-1", "requester_id": "u1", "approvers": ["*"]}])
+    assert sessions_open_mod._approval_authority("K", "req-1") == {
+        "request_id": "req-1", "requester_id": "u1", "approvers": ["*"]}
+    assert sessions_open_mod._approval_authority("K", "gone") is None
+
+    def boom(sk):
+        raise RuntimeError("x")
+    monkeypatch.setattr(approval, "list_gateway_approval_authority", boom)
+    assert sessions_open_mod._approval_authority("K", "req-1") is None
+
+
+def test_may_answer_uses_hermes_check():
+    assert sessions_open_mod._may_answer({"requester_id": "u1", "approvers": []}, "u1")
+    assert not sessions_open_mod._may_answer({"requester_id": "u1", "approvers": []}, "u2")
+    assert sessions_open_mod._may_answer({"requester_id": "u1", "approvers": ["*"]}, "u2")
+
+
+# --- final review 2: a grant lives only as long as its answer turn ------------------------
+
+
+async def test_no_grant_without_session(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    _authority(monkeypatch)
+    n = await _pending_approval(a, client, gw, session_env)
+    row = store.control("req-1")
+    store.delete_session(D_SID)
+    await a.opener.resolve_control(ResolveControl(
+        D_SID, "req-1", "approval", HUMAN, "once", state="pending", activity_id="act-ans"))
+    await settle(a)
+    assert row is not None and len(gw.events) == n and _grants(store) == []
+
+
+async def test_grant_dropped_when_answer_turn_fails_before_hand_off(env, session_env,
+                                                                     monkeypatch):
+    a, client, gw, store, order = env
+    _authority(monkeypatch)
+    n = await _pending_approval(a, client, gw, session_env)
+    gw.raise_next = True  # the gateway refuses the answer turn
+    await deliver(a, prompted(D_SID, D_ISSUE, "once", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    assert _grants(store) == []
+
+
+async def test_grant_dropped_when_queued_answer_turn_is_stopped(env, session_env,
+                                                                 monkeypatch):
+    a, client, gw, store, order = env
+    _authority(monkeypatch)
+    await _delegated(a, gw, session_env)
+    prompt = dataclasses.replace(_approval(), command=RM, text=f"Run `{RM}`?")
+    assert (await a._send_exec_approval_prompt(prompt)).success
+    await a.edit_message(D_CHAT, "approval:req-1", "timed out")
+    await settle(a)
+    # the asking turn is still in flight: the answer turn queues behind it
+    await deliver(a, prompted(D_SID, D_ISSUE, "once", "act-ans"))
+    await settle(a)
+    assert len(_grants(store)) == 1 and len(gw.events) == 1
+    await deliver(a, prompted(D_SID, D_ISSUE, "", "act-stop", signal="stop"))
+    await settle(a)
+    assert _grants(store) == []
+
+
+async def test_grant_dropped_when_queue_closes(env, session_env, monkeypatch):
+    """A disconnect drops the queued answer turn; its grant goes with it (a reconnect in the
+    same process does not sweep grants)."""
+    a, client, gw, store, order = env
+    _authority(monkeypatch)
+    await _delegated(a, gw, session_env)
+    prompt = dataclasses.replace(_approval(), command=RM, text=f"Run `{RM}`?")
+    assert (await a._send_exec_approval_prompt(prompt)).success
+    await a.edit_message(D_CHAT, "approval:req-1", "timed out")
+    await settle(a)
+    await deliver(a, prompted(D_SID, D_ISSUE, "once", "act-ans"))
+    await settle(a)
+    assert len(_grants(store)) == 1
+    a.turns.close()
+    assert _grants(store) == []
+
+
+async def test_free_drops_grants_only_of_unstarted_turns(env, session_env):
+    a, client, gw, store, order = env
+    from hermes_linear.turns import Turn
+    d = StartTurn(agent_session_id=D_SID, activity_id="x", issue_id=D_ISSUE, chat_id=D_CHAT,
+                  thread_id=None, user_id=HUMAN, user_name="H", text="t", first_turn=False,
+                  ack="a")
+    for handed_off, kept in ((False, []), (True, [("K", RM, "once", "u1", "m1")])):
+        turn = Turn(d, "m1", handed_off=handed_off)
+        a.turns.inflight[(D_CHAT, None)] = turn
+        store.put_grant("K", RM, "once", "u1", "m1")
+        a.turns._free((D_CHAT, None), turn)
+        assert _grants(store) == kept
+        store.drop_grants_for_turn("m1")
+    await settle(a)
 
 
 async def test_pending_approval_gibberish_reasks(env, session_env):
@@ -698,21 +857,6 @@ async def test_pending_approval_gibberish_reasks(env, session_env):
     assert (sid, content, signal) == (
         D_SID, {"type": "elicitation", "body": sessions_open_mod.REASK_TEXT}, "select")
     assert [o["value"] for o in meta["options"]] == ["once", "session", "deny"]
-    assert store.control("req-1").state == "pending"
-    assert len(gw.events) == n and _grants(store) == [] and _removed(client) == []
-
-
-async def test_pending_approval_refusal_keeps_row(env, session_env, monkeypatch):
-    a, client, gw, store, order = env
-    seen = []
-    monkeypatch.setattr(sessions_open_mod, "_approval_refusal",
-                        lambda sk, actor, **k: seen.append((sk, actor, k)) or "Alice")
-    monkeypatch.setattr(sessions_open_mod, "_refusal_text", lambda who: f"only {who}")
-    n = await _pending_approval(a, client, gw, session_env)
-    await deliver(a, prompted(D_SID, D_ISSUE, "once", "act-ans"))
-    await settle(a)
-    assert seen == [("agent:main:linear:dm:x", HUMAN, {"request_id": "req-1"})]
-    assert client.activities[-1][1] == {"type": "thought", "body": "only Alice"}
     assert store.control("req-1").state == "pending"
     assert len(gw.events) == n and _grants(store) == [] and _removed(client) == []
 

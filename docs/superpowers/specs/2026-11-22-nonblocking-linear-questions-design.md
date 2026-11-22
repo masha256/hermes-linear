@@ -184,7 +184,10 @@ actor_id=grant.actor_id)`. No select is posted. If the resolve fails, fall throu
 normal prompt. A command that differs in any byte gets a normal prompt. Grants left unused are
 deleted when the answer turn ends (`turn_finished` for that turn's message id, not for any other
 turn of the shared ticket session), so a grant never
-outlives the turn it was made for.
+outlives the turn it was made for. The grant is written only after the answer turn is enqueued
+(none when it cannot start: no session or ticket), and the turn engine drops it when that turn
+is freed without being handed off (failed or stopped before hand-off, dropped from the queue by
+a stop or a disconnect).
 
 **Feasibility gate (plan task 1):** a unit test against the real `tools.approval` must show
 that resolving from inside `approval_prompt` unblocks the waiting agent thread. If it does

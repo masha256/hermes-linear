@@ -495,12 +495,13 @@ class Outbound:
     # ------------------------------------------------------------ approvals / clarify
 
     def _put_control(self, rid: str, kind: str, t: Target, choices: list, session_key: str,
-                     *, question: str, command: Optional[str] = None):
+                     *, question: str, command: Optional[str] = None,
+                     authority: Optional[dict] = None):
         store = self.a._store
         assert store is not None
         store.put_control(rid, kind, t.sid, _generation(t.key[0]), choices,
                           session_key=session_key, question=question, command=command,
-                          turn_mid=t.mid)
+                          turn_mid=t.mid, authority=authority)
         self.elicited.setdefault(t.sid, {})[rid] = t.mid  # gates _post until resolved
 
     def _elicit(self, sid: str, kind: str, question: str, choices: Sequence[str]
@@ -566,8 +567,11 @@ class Outbound:
         rid = str(prompt.request_id)
         if self._use_grant(prompt, rid):
             return SendResult(success=True, message_id=f"approval:{rid}")  # no row, no post
+        # Who may answer, read now while Hermes still holds the entry (it is queued before
+        # notify): a pending answer comes after Hermes timed it out and forgot it.
+        authority = sessions_open_mod._approval_authority(str(prompt.session_key), rid)
         self._put_control(rid, "approval", target, choices, prompt.session_key,
-                          question=prompt.text, command=prompt.command)
+                          question=prompt.text, command=prompt.command, authority=authority)
         ok = await self._elicit(target.sid, "approval", prompt.text, choices)
         if not ok:
             self._drop_control(rid)

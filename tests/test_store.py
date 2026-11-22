@@ -313,6 +313,7 @@ def test_migrates_old_pending_controls(tmp_path):
     assert c.state == "live"
     assert c.question is None and c.command is None
     assert c.ticket_id is None and c.turn_mid is None
+    assert c.authority is None
     assert c.session_key == "sk"
     s.close()
 
@@ -324,6 +325,19 @@ def test_put_control_new_fields_roundtrip(store):
     c1, c2 = store.control("R1"), store.control("R2")
     assert (c1.state, c1.question, c1.command, c1.turn_mid) == ("live", "Which?", None, "m1")
     assert (c2.state, c2.question, c2.command, c2.turn_mid) == ("live", None, "make deploy", None)
+
+
+def test_put_control_authority_roundtrip(store):
+    """Final review 1: the approval's asking-time authority is kept as JSON, survives the
+    switch to pending, and is absent (None) when not captured."""
+    auth = {"request_id": "R1", "requester_id": "u1", "requester_name": "Alice",
+            "approvers": ["u2"], "chat_type": "dm"}
+    store.put_control("R1", "approval", "S1", 1, ["once"], command="ls", authority=auth)
+    store.put_control("R2", "approval", "S1", 1, ["once"], command="ls")
+    assert store.control("R1").authority == auth
+    assert store.control("R2").authority is None
+    assert store.mark_control_pending("R1", "ISSUE") is True
+    assert store.control("R1").authority == auth
 
 
 def test_mark_pending_and_queries(store):
