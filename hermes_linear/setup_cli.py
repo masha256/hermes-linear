@@ -376,18 +376,22 @@ def signed_test_event(webhook_secret: str, client_id: str, *, now: float | None 
                       ) -> tuple[bytes, dict]:
     """A side-effect-free ``AppUserNotification`` (router: log only), signed like Linear."""
     ts = time.time() if now is None else now
+    # The listener dedups and records on the Linear-Delivery header; the test
+    # prefix there keeps probes out of `last Linear event`.
+    delivery = f"{TEST_WEBHOOK_PREFIX}{uuid.uuid4()}"
     payload = {
         "type": "AppUserNotification",
         "action": "test",
         "webhookTimestamp": int(ts * 1000),
-        "webhookId": f"{TEST_WEBHOOK_PREFIX}{uuid.uuid4()}",
+        "webhookId": delivery,
         "oauthClientId": client_id,
         "createdAt": datetime.fromtimestamp(ts, timezone.utc).isoformat(),
         "data": {"source": "hermes linear test"},
     }
     body = json.dumps(payload, separators=(",", ":")).encode()
     sig = hmac.new(webhook_secret.encode(), body, hashlib.sha256).hexdigest()
-    return body, {"Content-Type": "application/json", "Linear-Signature": sig}
+    return body, {"Content-Type": "application/json", "Linear-Signature": sig,
+                  "Linear-Delivery": delivery}
 
 
 async def aiohttp_post(url: str, body: bytes, headers: dict) -> int:

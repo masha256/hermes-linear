@@ -542,6 +542,15 @@ def test_test_event_signature_matches_listener_scheme():
     assert payload["oauthClientId"] == CLIENT_ID
 
 
+def test_test_event_delivery_id_carries_test_prefix():
+    # The listener dedups (and records) on the Linear-Delivery header, so the
+    # probe must send one with the test prefix or `last Linear event` counts it.
+    body, headers = setup_cli.signed_test_event(WEBHOOK_SECRET, CLIENT_ID, now=1_800_000_000.0)
+    delivery = headers["Linear-Delivery"]
+    assert delivery.startswith(setup_cli.TEST_WEBHOOK_PREFIX)
+    assert delivery == json.loads(body)["webhookId"]
+
+
 # ------------------------------------------------------------------ status
 
 
