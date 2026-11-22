@@ -571,6 +571,16 @@ class Store:
                 "ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (agent_session_id,),
             )
+        return self._control_row(r)
+
+    def control(self, request_id: str) -> ControlRow | None:
+        """The pending control ``request_id``, or None once answered / dropped."""
+        with self._lock:
+            r = self._one("SELECT * FROM pending_controls WHERE request_id = ?", (request_id,))
+        return self._control_row(r)
+
+    @staticmethod
+    def _control_row(r: sqlite3.Row | None) -> ControlRow | None:
         if r is None:
             return None
         d = dict(r)

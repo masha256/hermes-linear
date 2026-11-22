@@ -133,6 +133,9 @@ class TurnEngine:
     def busy(self, key: Key) -> bool:
         return key in self.inflight or key in self.draining or bool(self.queues.get(key))
 
+    def close(self) -> None:
+        pass
+
     def reset(self) -> None:
         """Disconnect: cancel timers and forget all state (tasks are cancelled by the owner)."""
         for turn in self.inflight.values():

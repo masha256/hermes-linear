@@ -10,9 +10,9 @@ task (route -> execute every decision -> next event). Linear calls on the
 worker are bounded by ``ACK_TIMEOUT_S`` or spawned, so the next event's ack is
 never held past Linear's 10 s window.
 
-Seams for Task 12 (outbound): ``self._writer`` (its ``degraded`` flag is the
-adapter status), ``self.turns.current_turn_for`` / ``last_outcome_for``, and
-``self.stop_message_ids`` (recognise the stop notice by ``reply_to``).
+Outbound (send contract, typing, approvals, clarify, tool events): ``outbound.Outbound``
+(``self.outbound``); the overrides below only delegate. ``self.event_loop`` is the loop the
+tool hooks (``hooks.py``) schedule onto.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from typing import Any, Callable, Optional
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms._shared import get_scoped_secret
 from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, ExecApprovalPrompt, SendResult
 from gateway.platforms.event import MessageEvent, ProcessingOutcome
 
 from . import renderer
@@ -34,6 +34,7 @@ from .access import AccessPolicy, gateway_allow_from
 from .constants import ACK_TIMEOUT_S
 from .linear_client import LinearClient
 from .listener import ProfileEndpoint, get_listener
+from .outbound import Outbound
 from .models import (AddContext, AwaitDelegation, Fatal, Ignore, Interrupt, OpenSessionOnComment,
                      Refuse, ResolveControl, SetMode, StartTurn)
 from .router import RouterContext, route
@@ -85,7 +86,9 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._events: asyncio.Queue | None = None
         self._worker: asyncio.Task | None = None
         self._tasks: set[asyncio.Task] = set()
-        self._writer: renderer.ActivityWriter | None = None  # responses (Task 12)
+        self._writer: renderer.ActivityWriter | None = None  # responses (degraded, §8.6)
+        self._activity_writer: renderer.ActivityWriter | None = None  # thoughts, actions, …
+        self.event_loop: asyncio.AbstractEventLoop | None = None  # for hooks.py
         self._ack_writer: renderer.ActivityWriter | None = None  # acks, refusals, control replies
         self.delegation_wait_s: float | None = None  # override of AwaitDelegation.deadline_s
         self.turns = TurnEngine(  # callables late-bound: tests replace handle_message etc.
@@ -101,6 +104,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             settings=lambda: self._settings, post_ack=self._post_ack,
             enqueue=self._enqueue_turn, submit=self._submit,
             wait_override=lambda: self.delegation_wait_s)
+        self.outbound = Outbound(self)
 
     last_outcome = property(lambda self: self.turns.last_outcome)
     stop_message_ids = property(lambda self: self.turns.stop_message_ids)
@@ -188,6 +192,8 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._router_ctx = RouterContext(store, str(viewer["id"]), self._allowed,
                                          viewer.get("displayName"))
         self._writer = renderer.ActivityWriter(self._client)
+        self._activity_writer = renderer.ActivityWriter(self._client)
+        self.event_loop = asyncio.get_running_loop()
         self._ack_writer = renderer.ActivityWriter(self._client, timeout_s=ACK_TIMEOUT_S)
         self._events = asyncio.Queue()
         self._worker = asyncio.create_task(self._run_worker())
@@ -233,6 +239,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._unregister()
         self.opener.cancel_all()
+        self.turns.close()  # before cancelling dispatches: a cancelled one must not release
         await self._stop_worker()  # also cancels spawned tasks (acks, dispatches, stops)
         self._events = None  # deliver() is now a logged no-op
         if ADAPTERS.get(self._profile) is self:
@@ -243,6 +250,8 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             self._store.close()
             self._store = None
         self.turns.reset()
+        self.outbound.reset()
+        self.event_loop = None
         self._mark_disconnected()
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
@@ -251,12 +260,38 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         ident = (ticket.identifier if ticket else None) or issue_id
         return {"name": f"Linear {ident}", "type": "dm", "chat_id": chat_id}
 
+    # ------------------------------------------------------------ outbound (outbound.py)
+
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
-        # Task 12 implements the Q1 send contract (reply_to -> reply_to_message_id ->
-        # latest_turn_for_chat; thought/response/error classification).
-        log.warning("linear: outbound send not implemented yet; dropped (chat %s)", chat_id)
-        return SendResult(success=False, error="linear outbound not implemented")
+        return await self.outbound.send(chat_id, content, reply_to, metadata)
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        self.outbound.typing(chat_id, metadata)  # spawns the write; never waits on Linear
+
+    def format_tool_event(self, event: Any, *, mode: str = "all",
+                          preview_max_len: int = 40) -> Optional[str]:
+        return None  # tool progress comes from hooks.py, never chat-formatted text (§8.2)
+
+    @classmethod
+    def supports_exec_approval_buttons(cls) -> bool:
+        return True
+
+    async def _send_exec_approval_prompt(self, prompt: ExecApprovalPrompt) -> SendResult:
+        return await self.outbound.approval_prompt(prompt)
+
+    async def send_clarify(self, chat_id: str, question: str, choices: Optional[list],
+                           clarify_id: str, session_key: str,
+                           metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        return await self.outbound.clarify(chat_id, question, choices, clarify_id, session_key,
+                                           metadata)
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+        await self.outbound.retire_clarify(clarify_id)  # own fixed text, never ``notice``
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str, *,
+                           finalize: bool = False) -> SendResult:
+        return await self.outbound.edit_message(message_id)  # approval timeout only (Q10)
 
     # ------------------------------------------------------------ event worker
 
@@ -298,17 +333,20 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def wait_idle(self) -> None:
         """Wait until queued events, scheduled turn releases and turn tasks are done."""
+        def pending() -> list[asyncio.Task]:  # heartbeats live as long as their turn
+            beats = set(self.outbound.heartbeats.values())
+            return [t for t in self._tasks if not t.done() and t not in beats]
+
         for _ in range(1000):
             await asyncio.sleep(0)
             if self._events is not None:
                 await self._events.join()
-            pending = [t for t in self._tasks if not t.done()]
-            if pending or self.turns.draining:  # draining: waiting for the base task to end
-                await asyncio.gather(*pending, asyncio.sleep(0.01), return_exceptions=True)
+            waiting = pending()
+            if waiting or self.turns.draining:  # draining: waiting for the base task to end
+                await asyncio.gather(*waiting, asyncio.sleep(0.01), return_exceptions=True)
                 continue
             await asyncio.sleep(0)
-            if not any(not t.done() for t in self._tasks) and (
-                    self._events is None or self._events.empty()):
+            if not pending() and (self._events is None or self._events.empty()):
                 return
 
     async def on_event(self, event: dict) -> None:
@@ -377,6 +415,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             await super().on_processing_start(event)
         finally:
             self.turns.mark_admitted(event.message_id)
+            self.outbound.start_heartbeat(event.message_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         found = self.turns.find(event.message_id)
@@ -384,7 +423,10 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             await super().on_processing_complete(event, outcome)
             self.turns.record_outcome(found, outcome)
         finally:
-            self.turns.complete(found)  # releases after this base task ends (Q5)
+            try:
+                self.outbound.turn_finished(found, outcome)  # stop reply, fallback, heartbeat
+            finally:
+                self.turns.complete(found)  # releases after this base task ends (Q5)
 
     async def _fatal(self, reason: str) -> None:
         log.error("linear: fatal: %s", reason)
