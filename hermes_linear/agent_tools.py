@@ -915,7 +915,7 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
             out["label_missing"] = True
         elif carried:
             await client.issue_update(task["id"], {"removedLabelIds": [label]})
-        _track_open_task(ctx, task["id"], False)
+        _track_open_task(ctx, task["id"], True)  # ruling R12: work resumes, the task is open
         return out  # nothing to remove: zero writes
 
     # blocked: the question goes to the project ticket (the session issue), scope-checked

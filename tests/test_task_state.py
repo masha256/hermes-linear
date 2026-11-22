@@ -268,8 +268,8 @@ def test_update_noop_label_removal_sends_no_write(pin_ctx, ws):
 
 
 def test_task_state_tracks_open_tasks(pin_ctx, ws, adapter):
-    """in_progress / in_review open the task for the session ticket; done, blocked and
-    unblocked close it; a failed call changes nothing."""
+    """in_progress / in_review / unblocked open the task for the session ticket; done and
+    blocked close it (ruling R12); a failed call changes nothing."""
     from hermes_linear.store import Store
     adapter._store = store = Store.open(":memory:")
     assert linear_task_state({"id": "RET-2", "state": "in_progress"})["ok"] is True
@@ -278,10 +278,16 @@ def test_task_state_tracks_open_tasks(pin_ctx, ws, adapter):
     assert store.open_tasks(SELF) == [TASK]
     assert linear_task_state({"id": "RET-2", "state": "done"})["ok"] is True
     assert store.open_tasks(SELF) == []
-    for st, extra in (("blocked", {"question": "q?"}), ("unblocked", {})):
-        store.set_open_task(SELF, TASK, True)
-        assert linear_task_state({"id": "RET-2", "state": st, **extra})["ok"] is True
-        assert store.open_tasks(SELF) == [], st
+    store.set_open_task(SELF, TASK, True)
+    assert linear_task_state({"id": "RET-2", "state": "blocked", "question": "q?"})["ok"] is True
+    assert store.open_tasks(SELF) == []
+    # unblocked: work resumes on the task, so it is open again (carried label or not)
+    assert linear_task_state({"id": "RET-2", "state": "unblocked"})["ok"] is True
+    assert store.open_tasks(SELF) == [TASK]
+    assert linear_task_state({"id": "RET-2", "state": "unblocked"})["ok"] is True
+    assert store.open_tasks(SELF) == [TASK]
+    assert linear_task_state({"id": "RET-2", "state": "done"})["ok"] is True
+    assert store.open_tasks(SELF) == []
     # a refusal (out of scope) changes nothing, either way
     store.set_open_task(SELF, "uuid-other", True)
     for st in ("in_progress", "done"):
