@@ -16,6 +16,7 @@ from hermes_linear.models import (
     Interrupt,
     OpenSessionOnComment,
     Refuse,
+    Reply,
     ResolveControl,
     SetMode,
     StartTurn,
@@ -176,6 +177,7 @@ def test_decision_models_frozen_with_fields():
         ),
         Interrupt(agent_session_id="s1"),
         Refuse(agent_session_id="s1", text="no"),
+        Reply(agent_session_id="s1", issue_id="i1", text="task"),
         SetMode(issue_id="i1", mode="delegated", generation=2),
         AwaitDelegation(issue_id="i1", deadline_s=5),
         OpenSessionOnComment(

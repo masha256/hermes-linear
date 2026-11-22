@@ -1012,10 +1012,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
     },
     "linear_sync_plan": {
         "name": "linear_sync_plan",
-        "description": ("Mirror a plan file onto Linear as the Linear app: the plan as one "
-                        "comment on the ticket named by its 'Linear: <ID>' header, and one "
-                        "sub-ticket 'T<n> · <name>' per '### Task <n>: <name>' heading, in "
-                        "plan order. Headings with '— <ID>' update that ticket; others adopt "
+        "description": ("Mirror a plan file onto Linear as the Linear app: the plan header "
+                        "(before the first task) and the task list as one comment on the "
+                        "ticket named by its 'Linear: <ID>' header, and one sub-ticket "
+                        "'T<n> · <name>' per '### Task <n>: <name>' heading, in plan order, "
+                        "whose description is that task's whole section. Headings with '— <ID>' update that ticket; others adopt "
                         "the app's open child with that exact title or create one. App-made "
                         "tickets of removed tasks are canceled; humans' tickets and Done "
                         "tickets are never touched. Writes the IDs back into "

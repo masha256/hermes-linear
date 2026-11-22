@@ -93,36 +93,36 @@ path. The spec review gate is a select. Each requested change: edit → commit �
 
 **Plan.** Load `superpowers:writing-plans`. Header line `Linear: <ID>`; tasks keep the
 heading form `### Task N: <name>`. Commit, then `linear_sync_plan` (absolute path). It
-writes the plan comment and the `T<n> · <name>` sub-tickets, and writes the ticket IDs
-back into the plan file itself (`### Task N: <name> — <ID>`). It manages only the
-app-created `T<n> · <name>` children; humans' tickets and Done tickets are untouched.
-Then, by result:
+writes the plan comment (header and task list) and one `T<n> · <name>` sub-ticket per
+task (description: the whole task section), and writes the IDs back into the headings
+(`### Task N: <name> — <ID>`). Humans' and Done tickets are untouched. By result:
 - `file_changed: true`: commit the plan (the IDs are now in the headings);
 - `file_conflict: true`: the file changed during the sync; re-read and sync again;
 - `file_error`: the IDs were not written; fix the cause and sync again.
 
 Plan approval is one select that includes the execution method (subagent-driven or
-inline, as writing-plans offers). A plan change at any later point: edit the file,
-commit, `linear_sync_plan`, commit again.
+inline). A later plan change: edit, commit, `linear_sync_plan`, commit again.
 
 **Implementation.** Load `superpowers:subagent-driven-development`. The ledger's
 line 1 stays its identity line; line 2 is `Linear: <ID>`. Each task's ledger entry
-names its sub-ticket, and commit messages carry the sub-ticket ID. Then:
+names its sub-ticket, and commit messages carry the sub-ticket ID. Task progress goes
+on the sub-tickets; the project thread gets only stage changes, stop points and
+questions (a turn that only moves a task along ends with a one-line reply). Then:
 - dispatching a task's implementer: `linear_task_state(id, "in_progress")`;
 - dispatching its review: `in_review`;
-- a fix round after review: back to `in_progress` (then `in_review` again);
+- a fix round after review: back to `in_progress` (then `in_review` again), and a
+  `linear_comment` on the sub-ticket with the findings being fixed;
 - the clean review: `done` with `summary` (commits, test result, review verdict, number
   of fix rounds, deferred minors as a `- [ ]` checklist);
 - anything that needs the user: `blocked` with `question` (it posts the question; do
   not repeat it through `clarify`). Then end the turn, or continue only with tasks
   that do not depend on the answer. When it arrives in the thread: `unblocked`.
-
-If `blocked` returns `LABEL_MISSING` (question posted), ask the user once to add a team `Blocked` label.
+  If it returns `LABEL_MISSING` (question posted), ask once for a team `Blocked` label.
 
 **Finish.** Open the PR from the branch (load `superpowers:finishing-a-development-branch`
-for the mechanics; never merge). Move the project ticket to In Review with
-`linear_issue_update(id=<session ticket>, state="In Review")`, then end with the final reply (PR link and a
-short summary); it is posted as the response.
+for the mechanics; never merge). Move the project ticket to In Review
+(`linear_issue_update(id=<session ticket>, state="In Review")`), then end with the final
+reply (PR link and a short summary).
 
 ## Large projects
 
@@ -131,20 +131,20 @@ the umbrella: it holds the decomposition and build order. Create one top-level t
 per sub-project with `linear_issue_create` (no `parent`; same project; link the
 umbrella in its description). Each sub-project runs its own cycle in its own session.
 The tools cannot set a delegate: when a sub-project's turn comes, ask the user in the
-umbrella ticket to delegate its ticket to the app. Never delegate through other Linear
-tools or MCP servers; they act as the user, not the app.
+umbrella ticket to delegate its ticket to the app (never via other Linear tools or MCP
+servers; they act as the user).
 
 ## Rules
 
 - Ticket descriptions and the plan comment are written only by `linear_sync_spec` and
   `linear_sync_plan`. To change them, fix the file, commit and sync again.
-- On a sync failure, keep working (git holds everything). Mark the step
-  `unsynced (<code>)`: before the ledger exists (spec and plan stages) in your reply
-  in the ticket thread, afterwards in the ledger. Retry at the next sync point and
-  before any approval. Never ask for approval of an unsynced spec or plan; instead ask (select)
-  "Linear sync failed (<code>); retry now or approve from the file link?".
+- On a sync failure, keep working (git holds everything). Mark the step `unsynced
+  (<code>)` (in the thread before the ledger exists, then in the ledger); retry at the next
+  sync point and before any approval. Never ask to approve an unsynced spec or plan; ask
+  (select) "Linear sync failed (<code>); retry now or approve from the file link?".
 - Edits made in Linear are not synced back. A deleted or canceled sub-ticket whose
-  task is still in the plan is recreated on the next plan sync; ask whether to drop
-  the task.
+  task is still in the plan is recreated on the next plan sync; ask whether to drop it.
+- `T<n> · <name>` task sub-tickets are never delegated (the plugin declines): all SDD work
+  runs in the project ticket's session. Sub-project tickets are top-level and delegated.
 - On resume (crash, restart, new prompt): re-read the ledger and `git log`, re-sync the
   spec and plan, then continue.

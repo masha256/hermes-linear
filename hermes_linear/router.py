@@ -39,6 +39,7 @@ from .models import (
     Interrupt,
     OpenSessionOnComment,
     Refuse,
+    Reply,
     ResolveControl,
     SetMode,
     StartTurn,
@@ -58,6 +59,23 @@ class RouterContext:
     # The app user's Linear handle (``displayName``), for spotting @mentions in
     # plain comments (R18). Optional for backward compatibility.
     app_user_handle: str | None = None
+    # RET-107: ``(issue_id, payload title or None) -> parent identifier`` when the issue is
+    # an app-managed ``T<n> · <name>`` task child of a delegated ticket, else None.
+    task_parent: Callable[[str, str | None], Awaitable[str | None]] | None = None
+
+
+def task_ticket_text(parent: str) -> str:
+    return f"This is a task of {parent}; work on it continues in {parent}'s session."
+
+
+async def _task_parent(ctx: RouterContext, issue_id: str, title: Any) -> str | None:
+    """The parent identifier if a delegation of ``issue_id`` must be declined (RET-107).
+
+    Task sub-tickets are never delegated: their work runs in the project ticket's session.
+    """
+    if ctx.task_parent is None:
+        return None
+    return await ctx.task_parent(issue_id, title if isinstance(title, str) else None)
 
 
 # ------------------------------------------------------------------ keys
@@ -217,6 +235,9 @@ async def _agent_session_event(event: dict, ctx: RouterContext) -> list[Decision
     if action == "created":
         prompt_context = event.get("promptContext") or ""
         if not is_mention:  # §6.2.1 delegation; adapter appends the snapshot
+            parent = await _task_parent(ctx, issue_id, issue.get("title"))
+            if parent:  # RET-107: no turn, no delegated mode
+                return [Reply(sid, issue_id, task_ticket_text(parent))]
             gen = _delegation_generation(ticket, ticket.state_type)
             return [
                 SetMode(issue_id, "delegated", gen),
@@ -239,7 +260,12 @@ async def _agent_session_event(event: dict, ctx: RouterContext) -> list[Decision
         return [ResolveControl(sid, control.request_id, control.kind, actor, body,
                                state=control.state, user_name=author,
                                activity_id=activity.get("id") or "")]
-    chat_id, thread_id = _session_key(store.session(sid), ticket)
+    row = store.session(sid)
+    if row is not None and row.kind == "delegation" and ticket.mode != "delegated":
+        parent = await _task_parent(ctx, issue_id, issue.get("title"))
+        if parent:  # RET-107: a reply in a declined task sub-ticket session
+            return [Reply(sid, issue_id, task_ticket_text(parent))]
+    chat_id, thread_id = _session_key(row, ticket)
     return [turn(chat_id, thread_id, body, False)]
 
 
@@ -493,6 +519,9 @@ async def _delegate_change(
         actor_id = actor.get("id") if actor.get("type") == "user" else None
         if not actor_id or _explicit_bot(event) or not await ctx.allowed(actor_id):
             return [Ignore("denied delegator")]
+        parent = await _task_parent(ctx, issue_id, _d(event.get("data")).get("title"))
+        if parent:  # RET-107: only the reply, if Linear's `created` never comes
+            return [AwaitDelegation(issue_id, DELEGATION_WAIT_S, decline=task_ticket_text(parent))]
         gen = _delegation_generation(ticket, state_type or ticket.state_type)
         return [SetMode(issue_id, "delegated", gen), AwaitDelegation(issue_id, DELEGATION_WAIT_S)]
     if old == me and new != me:  # §6.4 un-delegated

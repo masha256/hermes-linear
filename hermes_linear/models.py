@@ -83,6 +83,15 @@ class Refuse:
 
 
 @dataclass(frozen=True)
+class Reply:
+    """Post one response on the agent session without running the agent (RET-107)."""
+
+    agent_session_id: str
+    issue_id: str
+    text: str
+
+
+@dataclass(frozen=True)
 class SetMode:
     """Change the ticket's working mode (e.g. delegated vs mention-only)."""
 
@@ -93,10 +102,14 @@ class SetMode:
 
 @dataclass(frozen=True)
 class AwaitDelegation:
-    """Wait up to ``deadline_s`` seconds for a delegation session to arrive."""
+    """Wait up to ``deadline_s`` seconds for a delegation session to arrive.
+
+    With ``decline``, expiry posts that text on the app session instead of starting a turn.
+    """
 
     issue_id: str
     deadline_s: float
+    decline: str | None = None
 
 
 @dataclass(frozen=True)
@@ -130,6 +143,7 @@ Decision = Union[
     ResolveControl,
     Interrupt,
     Refuse,
+    Reply,
     SetMode,
     AwaitDelegation,
     OpenSessionOnComment,
@@ -147,6 +161,7 @@ __all__ = [
     "Interrupt",
     "OpenSessionOnComment",
     "Refuse",
+    "Reply",
     "ResolveControl",
     "SetMode",
     "StartTurn",
