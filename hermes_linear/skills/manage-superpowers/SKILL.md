@@ -38,10 +38,16 @@ Every tool is safe to re-run.
 
 ## Questions and approvals
 
-- Every multiple-choice question and every approval goes through `clarify` with
-  `choices`; in a Linear session it renders as a Linear select in the ticket.
-  Approvals are **Approve** / **Request changes**. Open-ended questions are plain
-  replies in the thread.
+- Every multiple-choice question and approval (**Approve** / **Request changes**) is a
+  `clarify` with `choices` (a Linear select), one per call, all needed to answer inside
+  the question text (Linear hides the message before it). Open-ended: thread replies.
+- A reply while the select is live answers it in the turn. Otherwise `clarify` returns
+  `outcome: pending` and the ticket gets `Blocked`: end the turn now, never assume an
+  answer, don't restate it (the plugin re-posts it after your final reply). The answer
+  comes later (restarts too) as the next turn: `Answer to "<question>": <value>`.
+- `Command not run: approval is pending in Linear…`: end the turn. On a later
+  ``Answer to approval for `<cmd>`: approved (<choice>)`` re-run exactly `<cmd>`, byte
+  for byte (no second prompt); on `: denied` don't run it.
 - Answers count only when given in the ticket thread. An answer from Slack, the CLI or
   any other channel does not approve or unblock anything; ask again in the ticket.
 
