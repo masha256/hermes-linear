@@ -306,24 +306,21 @@ order:
 
 | Ticket | Work item | Spec |
 |---|---|---|
-| RET-74 | Spec review and approval | this document |
-| RET-75 | Implementation plan | — |
-| RET-76 | Generic Linear tools | §4.1 |
-| RET-77 | `linear_sync_spec` | §4.2 |
-| RET-78 | `linear_sync_plan` | §4.2 |
-| RET-79 | `linear_task_state` + Blocked label | §4.2, §6 |
-| RET-80 | Tool guardrails | §4.3 |
-| RET-81 | Skill `linear:manage-superpowers` + platform hint | §5 |
-| RET-82 | Project setup: `.hermes-linear.yaml`, repo + branch | §3, §5.1 |
-| RET-83 | `setup`/`status` additions | §6 |
-| RET-84 | M1 exit: dogfood the listener split | §8 |
+| RET-74 | Spec review and approval (Done) | this document |
+| RET-75 | Implementation plan | `docs/superpowers/plans/2026-11-21-hermes-linear-superpowers.md` |
+| RET-88 | T0 · Integration probe | — |
+| RET-80 | T1 · Tool runtime and guardrails | §4.3 |
+| RET-76 | T2 · Client operations and generic tools | §4.1 |
+| RET-77 | T3 · `linear_sync_spec` | §4.2 |
+| RET-78 | T4 · `linear_sync_plan` | §4.2 |
+| RET-79 | T5 · `linear_task_state` | §4.2, §6 |
+| RET-81 | T6 · Skill, registration, platform hint (includes project setup) | §3, §5 |
+| RET-83 | T7 · `setup`/`status` additions | §6 |
+| RET-84 | T8 · Install and M1 dogfood | §8 |
+| RET-82 | Canceled: absorbed by T6 | — |
 | RET-85 | M2 · Large projects | §9 |
 | RET-86 | M2 · Repo from the project link | §9 |
 | RET-87 | M2 · BMAD overlay | §9 |
 
-When the implementation plan exists, each plan task gets one ticket titled
-`T<n> · <task>`:
-- A work-item ticket above that matches a task is reused: it is retitled to the task
-  and its ID goes into the task heading.
-- A work-item ticket whose scope is folded into other tasks is canceled, with a
-  comment naming the task that absorbed it.
+The plan's task tickets are the work-item tickets above, retitled `T<n> · <task>`.
+Each task heading in the plan carries its ticket ID.
