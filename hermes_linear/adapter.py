@@ -98,7 +98,9 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             snapshot=lambda i: self.opener.snapshot(i),
             auto_start=lambda d, snap: self.opener.maybe_auto_start(d, snap),
             session_key_of=self._base_session_key, base_owns=self._base_owns,
-            base_busy=lambda sk: sk in getattr(self, "_active_sessions", {}))
+            base_busy=lambda sk: sk in getattr(self, "_active_sessions", {}),
+            on_stop_unsettled=lambda t: self.outbound.stop_unsettled(t),
+            on_safety_expired=lambda t: self.outbound.safety_expired(t))
         self.opener = SessionOpener(
             store=lambda: self._store, client=lambda: self._client,
             settings=lambda: self._settings, post_ack=self._post_ack,
@@ -107,6 +109,16 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self.outbound = Outbound(self)
 
     last_outcome = property(lambda self: self.turns.last_outcome)
+
+    @property
+    def session_namespace(self) -> str:
+        """This profile's session-key prefix (``gateway/session.py`` ``_session_key_namespace``,
+        mirrored: that helper is private): ``agent:main`` for the default profile,
+        ``agent:main~`` for a profile named ``main``, else ``agent:<profile>``."""
+        profile = self._profile
+        if not profile or profile == "default":
+            return "agent:main"
+        return "agent:main~" if profile == "main" else f"agent:{profile}"
     stop_message_ids = property(lambda self: self.turns.stop_message_ids)
 
     # ------------------------------------------------------------ status

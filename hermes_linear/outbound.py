@@ -7,7 +7,11 @@ Q8, Q10).
   turn-error notice -> ``error``; an anchorless send with no turn in flight -> ``thought``;
   anything else -> ``response`` (at most one per turn; later ones become ``thought``).
 * Stop (Q6): the gateway's ``/stop`` acknowledgement is recognised by ``reply_to`` and never
-  forwarded; the stopped turn gets ``Stopped.`` as its ``response`` once it completes CANCELLED.
+  forwarded; a stopped turn with no response gets ``Stopped.`` as its ``response`` when it
+  completes (CANCELLED or FAILURE), or after ``STOP_SETTLE_S`` if the gateway never completes it.
+* No activity after the response: Linear derives the session state from the last activity, so
+  a thought or tool action for a turn that already answered (background review, a tool
+  interrupted by ``/stop``, …) is dropped once nothing is in flight for that session.
 * Typing / heartbeat: spawned ephemeral thoughts, bounded by ``ACK_TIMEOUT_S``; never awaited by
   the caller.
 * Approvals / clarify: ``elicitation`` (+ ``select``) and a ``pending_controls`` row; expiry
@@ -17,6 +21,8 @@ Q8, Q10).
 
 Writers: ``responses`` go through ``adapter._writer`` (its failure marks the adapter degraded,
 §8.6); everything else goes through ``adapter._activity_writer`` and is only logged on failure.
+All writes for one agent session go through one ordered queue (``_SessionWrites``), in the order
+they were issued, so an action issued before the response is never written after it.
 """
 
 from __future__ import annotations
@@ -27,7 +33,8 @@ import logging
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from collections import deque
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import ProcessingOutcome
@@ -46,11 +53,12 @@ WORKING_TEXT = "Working…"
 HEARTBEAT_TEXT = "Still working…"
 EXPIRED_TEXT = "This request expired."
 APPROVAL_EXPIRED_TEXT = "This request expired. The command was not run."
+TIMED_OUT_TEXT = "This turn timed out."
 SESSION_LINK_LABEL = "Hermes session"
 _NOTICE_KEYS = frozenset({"thread_id", "hermes_profile"})  # turn-error notice metadata (Q1)
 _APPROVAL_CHOICES = ("once", "session", "deny")  # spec §8.4 omits "always" (Q8)
 _TODO_TOOLS = frozenset({"todo", "todo_list"})  # tools/todo_tool.py: name + legacy alias
-_REMEMBER = 1024  # bounded memory of answered turns / retired stop ids
+_REMEMBER = 1024  # bound of every per-turn / per-session memory below (LRU)
 __all__ = ["Outbound", "Target"]
 
 
@@ -63,10 +71,74 @@ class Target:
 
 
 class _Bounded(OrderedDict):
-    def add(self, item: str) -> None:
-        self[item] = None
+    """An LRU-capped dict (``put``) / set (``add``) of at most ``_REMEMBER`` entries."""
+
+    def put(self, key: str, value: Any) -> None:
+        self[key] = value
+        self.move_to_end(key)
         while len(self) > _REMEMBER:
             self.popitem(last=False)
+
+    def add(self, item: str) -> None:
+        self.put(item, None)
+
+
+class _SessionWrites:
+    """Per agent session, run writes one at a time in the order they were submitted.
+
+    ``submit`` is synchronous: the write's place in line is fixed when it is issued, not when a
+    spawned task first runs. Returns a future with the write's bool result.
+    """
+
+    def __init__(self, spawn: Callable[[Awaitable[Any]], asyncio.Task]) -> None:
+        self._spawn = spawn
+        self.queues: dict[str, deque] = {}
+
+    def submit(self, sid: str, factory: Callable[[], Awaitable[bool]]) -> asyncio.Future:
+        fut = asyncio.get_running_loop().create_future()
+        queue = self.queues.get(sid)
+        if queue is None:
+            queue = self.queues[sid] = deque([(factory, fut)])
+            self._spawn(self._drain(sid, queue))
+        else:
+            queue.append((factory, fut))
+        return fut
+
+    async def _drain(self, sid: str, queue: deque) -> None:
+        try:
+            while queue:
+                factory, fut = queue[0]
+                if not fut.done():  # the caller may have been cancelled
+                    try:
+                        ok = bool(await factory())
+                    except Exception as exc:  # noqa: BLE001 - writers never raise; be safe
+                        log.debug("linear: write failed for %s: %s", sid, type(exc).__name__)
+                        ok = False
+                    if not fut.done():
+                        fut.set_result(ok)
+                queue.popleft()
+        finally:
+            _fail(queue)
+            if self.queues.get(sid) is queue:
+                del self.queues[sid]
+
+    def reset(self) -> None:
+        for queue in self.queues.values():
+            _fail(queue)
+        self.queues.clear()
+
+
+def _fail(queue: deque) -> None:
+    while queue:
+        _factory, fut = queue.popleft()
+        if not fut.done():
+            fut.set_result(False)
+
+
+def _done(value: bool) -> asyncio.Future:
+    fut = asyncio.get_running_loop().create_future()
+    fut.set_result(value)
+    return fut
 
 
 def _generation(chat_id: str) -> int:
@@ -80,12 +152,13 @@ class Outbound:
         self.clock = time.monotonic  # typing rate limit (tests inject a fake clock)
         self.sleep = asyncio.sleep  # heartbeat interval (tests inject a fake)
         self.responded = _Bounded()  # turn mids that already have their response
-        self.last_thought: dict[str, str] = {}  # turn mid -> last thought (turn-end fallback)
-        self.typing_at: dict[str, float] = {}  # agent session -> last "Working…"
+        self.last_thought = _Bounded()  # turn mid -> last commentary thought (turn-end fallback)
+        self.typing_at = _Bounded()  # agent session -> last activity issued (typing fills gaps)
         self.heartbeats: dict[str, asyncio.Task] = {}  # turn mid -> heartbeat task
         self.pending_starts: dict[tuple, asyncio.TimerHandle] = {}  # fast-tool skip timers
-        self.url_set: set[str] = set()  # agent sessions whose link was set
+        self.url_set = _Bounded()  # agent sessions whose link was set
         self.retired_stops = _Bounded()  # synthesized stop ids already handled
+        self.writes = _SessionWrites(lambda coro: self.a._spawn(coro))
 
     def reset(self) -> None:
         """Disconnect: cancel timers and forget state (tasks are cancelled by the adapter)."""
@@ -95,15 +168,30 @@ class Outbound:
         self.heartbeats.clear()
         self.last_thought.clear()
         self.typing_at.clear()
+        self.writes.reset()
 
     # ------------------------------------------------------------ writers
 
-    async def _post(self, sid: str, content: dict, **kw) -> bool:
-        writer = self.a._activity_writer
-        return bool(writer) and await writer.post(sid, content, **kw)
+    # Synchronous: the write is queued (in order) when called; await the future for the result.
 
-    async def _respond(self, sid: str, content: dict, **kw) -> bool:
-        return await self.a._post_response(sid, content, **kw)
+    def _post(self, sid: str, content: dict, **kw) -> asyncio.Future:
+        writer = self.a._activity_writer
+        if writer is None:
+            return _done(False)
+        self.typing_at.put(sid, self.clock())
+        return self.writes.submit(sid, lambda: writer.post(sid, content, **kw))
+
+    def _respond(self, sid: str, content: dict, **kw) -> asyncio.Future:
+        self.typing_at.put(sid, self.clock())
+        return self.writes.submit(sid, lambda: self.a._post_response(sid, content, **kw))
+
+    def _session_busy(self, sid: str) -> bool:
+        """True while a turn of agent session ``sid`` is in flight."""
+        return any(t.decision.agent_session_id == sid for t in self.a.turns.inflight.values())
+
+    def _answered(self, mid: str) -> bool:
+        """The turn already has its response, or is no longer in flight (tool events)."""
+        return mid in self.responded or self.a.turns.find(mid) is None
 
     # ------------------------------------------------------------ resolution (Q1)
 
@@ -162,12 +250,20 @@ class Outbound:
         body = str(content or "")
         if not body.strip():
             return SendResult(success=True, message_id=f"{target.sid}:empty")
+        if (kind == "thought" and target.mid in self.responded
+                and not self._session_busy(target.sid)):
+            # I1: a thought after the response would flip the Linear session back to active.
+            log.debug("linear: thought for answered turn %s dropped (session %s idle)",
+                      target.mid, target.sid)
+            return SendResult(success=True, message_id=f"{target.sid}:dropped:{target.mid}")
         if kind == "response":
             self.responded.add(target.mid)
             ok = await self._respond(target.sid, renderer.response(body))
         else:
-            if kind == "thought":
-                self.last_thought[target.mid] = body
+            if kind == "thought" and target.via == "reply_to_message_id":
+                # Only commentary carries reply_to_message_id; gateway status notices
+                # (heartbeat, stuck warning) never become the turn-end fallback (I3).
+                self.last_thought.put(target.mid, body)
             builder = renderer.error if kind == "error" else renderer.thought
             ok = await self._post(target.sid, builder(body))
         if not ok:
@@ -186,43 +282,69 @@ class Outbound:
             return True
         return reply_to in self.retired_stops
 
-    def turn_finished(self, found: tuple[Key, Turn] | None, outcome: ProcessingOutcome) -> None:
-        """``on_processing_complete`` (sync): stop reply, turn-end fallback, heartbeat."""
-        if found is None:
-            return
-        _key, turn = found
-        mid, sid = turn.mid, turn.decision.agent_session_id
-        self.stop_heartbeat(mid)
+    def _retire_stops(self, sid: str) -> list[str]:
         stops = self.a.turns.stop_message_ids
         stop_ids = [m for m, s in stops.items() if s == sid]
         for m in stop_ids:
             del stops[m]
             self.retired_stops.add(m)
+        return stop_ids
+
+    def _answer_stopped(self, mid: str, sid: str) -> None:
+        if mid not in self.responded:
+            self.responded.add(mid)
+            self._respond(sid, renderer.response(STOPPED_TEXT), timeout_s=ACK_TIMEOUT_S)
+
+    def turn_finished(self, found: tuple[Key, Turn] | None, outcome: ProcessingOutcome) -> None:
+        """``on_processing_complete`` (sync): stop reply, turn-end fallback, heartbeat."""
+        if found is None:
+            return
+        key, turn = found
+        mid, sid = turn.mid, turn.decision.agent_session_id
+        self.stop_heartbeat(mid)
+        stop_ids = self._retire_stops(sid)
         last = self.last_thought.pop(mid, None)
+        if stop_ids:
+            # I2: a stopped turn is always answered, whatever the outcome; a stop-induced
+            # FAILURE must not turn the next anchorless send into an error activity.
+            self.a.turns.last_outcome.pop(key, None)
+            self._answer_stopped(mid, sid)
+            return
         if mid in self.responded:
             return
-        if outcome is ProcessingOutcome.CANCELLED and stop_ids:
-            self.responded.add(mid)
-            self.a._spawn(self._respond(sid, renderer.response(STOPPED_TEXT),
-                                        timeout_s=ACK_TIMEOUT_S))
-        elif outcome is ProcessingOutcome.SUCCESS and last:
+        if outcome is ProcessingOutcome.SUCCESS and last:
             # Q1 caveat: the final send was deduplicated against commentary; promote it.
             self.responded.add(mid)
-            self.a._spawn(self._respond(sid, renderer.response(last)))
+            self._respond(sid, renderer.response(last))
+
+    def stop_unsettled(self, turn: Turn) -> None:
+        """Q6 safety net: the gateway never completed a stopped turn within STOP_SETTLE_S."""
+        mid, sid = turn.mid, turn.decision.agent_session_id
+        self.stop_heartbeat(mid)
+        self._retire_stops(sid)
+        self.last_thought.pop(mid, None)
+        self._answer_stopped(mid, sid)
+
+    def safety_expired(self, turn: Turn) -> None:
+        """TURN_SAFETY_TIMEOUT_S hit: the turn ends with an ``error`` unless it answered."""
+        mid, sid = turn.mid, turn.decision.agent_session_id
+        self.stop_heartbeat(mid)
+        self._retire_stops(sid)
+        self.last_thought.pop(mid, None)
+        if mid not in self.responded:
+            self._post(sid, renderer.error(TIMED_OUT_TEXT), timeout_s=ACK_TIMEOUT_S)
 
     # ------------------------------------------------------------ typing / heartbeat
 
     def typing(self, chat_id: str, metadata: Optional[dict]) -> None:
         turn = self.a.turns.current_turn_for(str(chat_id), (metadata or {}).get("thread_id"))
-        if turn is None:
+        if turn is None or turn.mid in self.responded:
             return
         sid, now = turn.decision.agent_session_id, self.clock()
         last = self.typing_at.get(sid)
         if last is not None and now - last < TYPING_MIN_INTERVAL_S:
             return
-        self.typing_at[sid] = now
-        self.a._spawn(self._post(sid, renderer.thought(WORKING_TEXT), ephemeral=True,
-                                 timeout_s=ACK_TIMEOUT_S))
+        self._post(sid, renderer.thought(WORKING_TEXT), ephemeral=True, timeout_s=ACK_TIMEOUT_S)
 
     def start_heartbeat(self, mid: str | None) -> None:
         found = self.a.turns.find(mid)
@@ -241,7 +363,7 @@ class Outbound:
         try:
             while True:
                 await self.sleep(HEARTBEAT_S)
-                if self.a.turns.find(mid) is None:  # completed, stopped or timed out
+                if self._answered(mid):  # answered, completed, stopped or timed out
                     return
                 await self._post(sid, renderer.thought(HEARTBEAT_TEXT), ephemeral=True,
                                  timeout_s=ACK_TIMEOUT_S)
@@ -335,13 +457,21 @@ class Outbound:
 
     def tool_event(self, phase: str, t: Target, ev: dict) -> None:
         """One pre/post tool call for agent session ``t.sid`` (sync, on the loop)."""
-        self._session_link(t.sid, ev.get("session_id"))
         name = str(ev.get("tool_name") or "tool")
         ident = (ev.get("task_id"), ev.get("tool_call_id") or name)
+        if self._answered(t.mid):
+            # I1: background-review forks, a tool interrupted by /stop, … — an action now
+            # would flip the answered Linear session back to active.
+            pending = self.pending_starts.pop(ident, None)
+            if pending is not None:
+                pending.cancel()
+            log.debug("linear: tool event %s for answered turn %s dropped", name, t.mid)
+            return
+        self._session_link(t.sid, ev.get("session_id"))
         if name in _TODO_TOOLS:
             if phase == "finish":
                 plan = renderer.plan_from_todos(_todos(ev.get("args"), ev.get("result")))
-                self.a._spawn(self._update_plan(t.sid, plan))
+                self._update_plan(t.sid, plan)
             return
         loop = asyncio.get_running_loop()
         if phase == "start":
@@ -349,8 +479,7 @@ class Outbound:
             if old is not None:
                 old.cancel()
             self.pending_starts[ident] = loop.call_later(
-                FAST_TOOL_SKIP_S, self._post_start, ident, t.sid, name,
-                ev.get("args"))
+                FAST_TOOL_SKIP_S, self._post_start, ident, t, name, ev.get("args"))
             return
         pending = self.pending_starts.pop(ident, None)
         if pending is not None:
@@ -358,18 +487,20 @@ class Outbound:
         result = renderer.result_preview(ev.get("result"))
         if ev.get("status") == "error":
             result = f"Failed: {result}" if result else "Failed"
-        self.a._spawn(self._post(t.sid, renderer.action(
-            name, renderer.tool_parameter(name, ev.get("args")), result)))
+        self._post(t.sid, renderer.action(name, renderer.tool_parameter(name, ev.get("args")),
+                                          result))
 
-    def _post_start(self, ident: tuple, sid: str, name: str, args: Any) -> None:
+    def _post_start(self, ident: tuple, t: Target, name: str, args: Any) -> None:
         self.pending_starts.pop(ident, None)
-        self.a._spawn(self._post(sid, renderer.action(name, renderer.tool_parameter(name, args)),
-                                 ephemeral=True))
+        if self._answered(t.mid):
+            return
+        self._post(t.sid, renderer.action(name, renderer.tool_parameter(name, args)),
+                   ephemeral=True)
 
-    async def _update_plan(self, sid: str, plan: list[dict] | None) -> None:
+    def _update_plan(self, sid: str, plan: list[dict] | None) -> None:
         writer = self.a._activity_writer
-        if writer is not None:
-            await writer.update_plan(sid, plan)
+        if writer is not None and plan is not None:
+            self.writes.submit(sid, lambda: writer.update_plan(sid, plan))
 
     def _session_link(self, sid: str, hermes_session_id: str | None) -> None:
         settings = self.a._settings
@@ -379,7 +510,7 @@ class Outbound:
             return
         self.url_set.add(sid)
         url = template.replace("{session_id}", str(hermes_session_id))
-        self.a._spawn(writer.set_external_url(sid, SESSION_LINK_LABEL, url))
+        self.writes.submit(sid, lambda: writer.set_external_url(sid, SESSION_LINK_LABEL, url))
 
 
 def _todos(args: Any, result: Any) -> list | None:

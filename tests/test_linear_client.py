@@ -283,6 +283,16 @@ async def test_update_session_plan_and_urls(fake, client):
     assert call.variables == {"id": "sess-1", "input": {"plan": plan, "externalUrls": urls}}
 
 
+async def test_update_session_added_urls(fake, client):
+    fake.on("AgentSessionUpdate", {"data": {"agentSessionUpdate": {"success": True}}})
+    urls = [{"label": "Hermes session", "url": "https://h/s/1"}]
+    await client.update_session("sess-1", added_external_urls=urls)
+    (call,) = fake.gql_calls("AgentSessionUpdate")
+    assert call.variables == {"id": "sess-1", "input": {"addedExternalUrls": urls}}
+    with pytest.raises(ValueError):
+        await client.update_session("sess-1", external_urls=urls, added_external_urls=urls)
+
+
 async def test_update_session_noop_without_fields(fake, client):
     await client.update_session("sess-1")
     assert fake.gql_calls("AgentSessionUpdate") == []

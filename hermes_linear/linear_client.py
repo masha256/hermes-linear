@@ -309,12 +309,19 @@ class LinearClient:
         *,
         plan: list[dict] | None = None,
         external_urls: list[dict] | None = None,
+        added_external_urls: list[dict] | None = None,
     ) -> None:
+        """``external_urls`` replaces the whole link list; ``added_external_urls`` appends
+        (SDL ``AgentSessionUpdateInput``: the two cannot be combined)."""
+        if external_urls is not None and added_external_urls is not None:
+            raise ValueError("external_urls and added_external_urls cannot be combined")
         inp: dict[str, Any] = {}
         if plan is not None:
             inp["plan"] = plan
         if external_urls is not None:
             inp["externalUrls"] = external_urls
+        if added_external_urls is not None:
+            inp["addedExternalUrls"] = added_external_urls
         if not inp:
             return
         data = await self.gql(MUTATION_SESSION_UPDATE, {"id": agent_session_id, "input": inp})

@@ -23,7 +23,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.base import ExecApprovalPrompt
 from gateway.platforms.event import ProcessingOutcome
 
-from hermes_linear import hooks
+from hermes_linear import constants, hooks
 from hermes_linear import outbound as outbound_mod
 from hermes_linear.adapter import ADAPTERS, LinearAdapter
 from hermes_linear.store import Store
@@ -38,6 +38,8 @@ class OutClient(FakeClient):
     def __init__(self, order):
         super().__init__(order)
         self.updates: list[tuple] = []
+        self.added_urls: list[tuple] = []
+        self.type_delay: dict[str, float] = {}  # activity type -> seconds
         self.fail_types: set[str] = set()
         self.app_delay = 0.0
         self.create_delay = 0.0
@@ -45,10 +47,15 @@ class OutClient(FakeClient):
     async def create_activity(self, sid, content, **kw):
         if content["type"] in self.fail_types:
             raise RuntimeError("linear down")
+        if self.type_delay.get(content["type"]):
+            await asyncio.sleep(self.type_delay[content["type"]])
         return await super().create_activity(sid, content, **kw)
 
-    async def update_session(self, sid, *, plan=None, external_urls=None):
+    async def update_session(self, sid, *, plan=None, external_urls=None,
+                             added_external_urls=None):
         self.updates.append((sid, plan, external_urls))
+        if added_external_urls is not None:
+            self.added_urls.append((sid, added_external_urls))
         return True
 
     async def app_sessions_on_issue(self, issue_id):
@@ -674,9 +681,9 @@ async def test_external_url_once():
             hooks.on_post_tool_call("terminal", {"command": "ls"}, "x", "t",
                                     tool_call_id=f"c{i}", session_id="hs-1")
         await settle(a)
-        urls = [u for u in client.updates if u[2] is not None]
-        assert urls == [(D_SID, None, [{"label": "Hermes session",
-                                         "url": "https://hermes.example/s/hs-1"}])]
+        assert [u for u in client.updates if u[2] is not None] == []  # never a full replace
+        assert client.added_urls == [(D_SID, [{"label": "Hermes session",
+                                               "url": "https://hermes.example/s/hs-1"}])]
     finally:
         from gateway.session_context import get_session_env
         hooks.get_session_env = get_session_env
@@ -703,3 +710,256 @@ async def test_two_adapters_hook_routes_by_turn(session_env):
     finally:
         await a1.disconnect()
         await a2.disconnect()
+
+
+# --------------------------------------- fix round 1: no activity after response (I1)
+
+
+def stop_event(activity="act-stop"):
+    return prompted(D_SID, D_ISSUE, "", activity, signal="stop")
+
+
+async def test_tool_event_after_response_dropped(env, session_env, monkeypatch, caplog):
+    a, client, gw, store, order = env
+    monkeypatch.setattr(outbound_mod, "FAST_TOOL_SKIP_S", 0.02)
+    await deliver(a, DELEGATION)
+    mid = gw.events[0].message_id
+    await a.send(D_CHAT, "All done", reply_to=mid, metadata={"notify": True})
+    # A background-review fork still has the turn's session vars bound.
+    session_env(platform="linear", message_id=mid, chat_id=D_CHAT)
+    n = len(client.activities)
+    with caplog.at_level(logging.DEBUG, logger="hermes_linear.outbound"):
+        hooks.on_pre_tool_call("memory", {"action": "add"}, "t", tool_call_id="c1")
+        await settle(a, 0.05)  # past the fast-tool skip: the start is not shown either
+        hooks.on_post_tool_call("memory", {"action": "add"}, "ok", "t", tool_call_id="c1")
+        await settle(a)
+    assert len(client.activities) == n
+    assert a.outbound.pending_starts == {}
+    assert "answered turn" in caplog.text
+    # Still in flight and not answered: tool events are posted as usual.
+    await complete(a, gw.events[0])
+    await deliver(a, prompted(D_SID, D_ISSUE, "more", "act-2"))
+    session_env(platform="linear", message_id=gw.events[-1].message_id, chat_id=D_CHAT)
+    hooks.on_post_tool_call("terminal", {"command": "ls"}, "x", "t", tool_call_id="c2")
+    await settle(a)
+    assert acts(client, "action")[-1][0] == D_SID
+
+
+async def test_interim_after_response_dropped(env, caplog):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    mid = gw.events[0].message_id
+    await a.send(D_CHAT, "All done", reply_to=mid, metadata={"notify": True})
+    await complete(a, gw.events[0])
+    n = len(client.activities)
+    with caplog.at_level(logging.DEBUG, logger="hermes_linear.outbound"):
+        r1 = await a.send(D_CHAT, "💾 Memory updated", metadata={
+            "reply_to_message_id": mid, "_interim_send": True})
+        r2 = await a.send(D_CHAT, "review note", metadata={"thread_id": None,
+                                                           "_interim_send": True})
+        r3 = await a.send(D_CHAT, "late final", reply_to=mid, metadata={"notify": True})
+    await a.wait_idle()
+    assert r1.success and r2.success and r3.success  # never retried / notified
+    assert len(client.activities) == n
+    assert "dropped" in caplog.text
+    # A new turn of the same agent session is in flight: thoughts are posted again.
+    await deliver(a, prompted(D_SID, D_ISSUE, "more", "act-2"))
+    await a.send(D_CHAT, "note", metadata={"reply_to_message_id": mid, "_interim_send": True})
+    assert bodies(client, "thought")[-1] == (D_SID, "note")
+
+
+async def test_post_tool_after_stop_dropped(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    monkeypatch.setattr(outbound_mod, "FAST_TOOL_SKIP_S", 0.05)
+    await deliver(a, DELEGATION)
+    first = gw.events[0]
+    session_env(platform="linear", message_id=first.message_id, chat_id=D_CHAT)
+    hooks.on_pre_tool_call("terminal", {"command": "sleep 99"}, "t", tool_call_id="c1")
+    await settle(a)
+    await deliver(a, stop_event())
+    await complete(a, first, ProcessingOutcome.CANCELLED)
+    # The interrupted tool reports after Stopped.
+    hooks.on_post_tool_call("terminal", {"command": "sleep 99"}, "interrupted", "t",
+                            tool_call_id="c1", status="error")
+    await settle(a, 0.1)
+    assert acts(client, "action") == []
+    assert bodies(client, "response") == [(D_SID, "Stopped.")]
+    assert client.activities[-1][1]["type"] == "response"
+
+
+async def test_writes_ordered_per_session(env, session_env):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    mid = gw.events[0].message_id
+    client.type_delay["action"] = 0.05  # the action's write is slow (backoff)
+    session_env(platform="linear", message_id=mid, chat_id=D_CHAT)
+    hooks.on_post_tool_call("terminal", {"command": "ls"}, "x", "t", tool_call_id="c1")
+    await asyncio.sleep(0)  # the hook's call_soon_threadsafe: the action is issued
+    assert ("t", "c1") not in a.outbound.pending_starts
+    res = await a.send(D_CHAT, "All done", reply_to=mid, metadata={"notify": True})
+    assert res.success
+    kinds = [c["type"] for _sid, c, *_ in client.activities]
+    assert kinds[-2:] == ["action", "response"]  # issued first, written first
+
+
+# ------------------------------------------- fix round 1: stop always answered (I2)
+
+
+async def test_stop_settled_as_failure_still_posts_stopped(env):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    first = gw.events[0]
+    await deliver(a, stop_event())
+
+    async def base_task():  # the base's exception path after an unexpected cancel
+        await a.on_processing_complete(first, ProcessingOutcome.FAILURE)
+        await a.send(D_CHAT, "Sorry, I hit an error.")
+
+    await asyncio.create_task(base_task())
+    await a.wait_idle()
+    assert bodies(client, "response") == [(D_SID, "Stopped.")]
+    assert bodies(client, "error") == []
+    assert a.last_outcome.get((D_CHAT, None)) is None
+    assert a.stop_message_ids == {}
+
+
+async def test_stop_never_settles_posts_stopped_after_30s(env, monkeypatch, caplog):
+    a, client, gw, store, order = env
+    assert constants.STOP_SETTLE_S == 30
+    monkeypatch.setattr(constants, "STOP_SETTLE_S", 0.05)
+    await deliver(a, DELEGATION)
+    first = gw.events[0]
+    await deliver(a, stop_event())
+    stop_mid = gw.events[-1].message_id
+    await deliver(a, prompted(D_SID, D_ISSUE, "next", "act-3"))  # queued behind the stop
+    assert [e.text for e in gw.events].count("next") == 0
+    with caplog.at_level(logging.WARNING):
+        await settle(a, 0.1)
+    assert bodies(client, "response") == [(D_SID, "Stopped.")]
+    assert a.stop_message_ids == {}
+    assert "after /stop" in caplog.text
+    assert gw.events[-1].text.endswith("next")  # the FIFO was freed
+    # The gateway finally completes the stopped turn and acks late: nothing more is posted.
+    n = len(client.activities)
+    await complete(a, first, ProcessingOutcome.CANCELLED)
+    await a.send(D_CHAT, "⚡ Stopped.", reply_to=stop_mid, metadata={"notify": True})
+    await a.wait_idle()
+    assert len(client.activities) == n
+
+
+async def test_stop_settle_cancelled_when_turn_finishes(env, monkeypatch):
+    a, client, gw, store, order = env
+    monkeypatch.setattr(constants, "STOP_SETTLE_S", 0.05)
+    await deliver(a, DELEGATION)
+    await deliver(a, stop_event())
+    await complete(a, gw.events[0], ProcessingOutcome.CANCELLED)
+    await settle(a, 0.1)
+    assert bodies(client, "response") == [(D_SID, "Stopped.")]  # once, not again at 0.05
+
+
+async def test_safety_expired_posts_error(env, monkeypatch):
+    a, client, gw, store, order = env
+    monkeypatch.setattr(constants, "TURN_SAFETY_TIMEOUT_S", 0.05)
+    await deliver(a, DELEGATION)
+    await settle(a, 0.1)
+    assert bodies(client, "error") == [(D_SID, "This turn timed out.")]
+    # A turn that already answered gets no timeout error.
+    await deliver(a, prompted(D_SID, D_ISSUE, "more", "act-2"))
+    await a.send(D_CHAT, "done", reply_to=gw.events[-1].message_id, metadata={"notify": True})
+    await settle(a, 0.1)
+    assert bodies(client, "error") == [(D_SID, "This turn timed out.")]
+
+
+# ----------------------------------- fix round 1: status notices never promoted (I3)
+
+
+async def test_heartbeat_thought_never_promoted(env):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    mid = gw.events[0].message_id
+    await a.send(D_CHAT, "the answer", metadata={"thread_id": None, "reply_to_message_id": mid,
+                                                "_interim_send": True})
+    # The gateway's heartbeat: thread metadata only, no reply_to_message_id.
+    await a.send(D_CHAT, "⏳ Still working... (10 min elapsed)",
+                 metadata={"thread_id": None, "_interim_send": True})
+    await complete(a, gw.events[0])  # SUCCESS; the final send was deduplicated
+    assert bodies(client, "response") == [(D_SID, "the answer")]  # commentary, not heartbeat
+    # A turn whose only thought is a status notice gets no promoted response.
+    await deliver(a, prompted(D_SID, D_ISSUE, "more", "act-2"))
+    await a.send(D_CHAT, "⏳ Still working...", metadata={"thread_id": None,
+                                                         "_interim_send": True})
+    await complete(a, gw.events[-1])
+    assert bodies(client, "response") == [(D_SID, "the answer")]
+    assert a.outbound.last_thought == {}
+
+
+# ---------------------------------------------------------- fix round 1: minors
+
+
+async def test_two_profiles_same_chat_routed_by_session_key(session_env):
+    a1, c1, gw1, s1, _ = new_adapter("pa")
+    a2, c2, gw2, s2, _ = new_adapter("pb")
+    assert await a1.connect() and await a2.connect()
+    try:
+        assert (a1.session_namespace, a2.session_namespace) == ("agent:pa", "agent:pb")
+        await deliver(a1, MENTION)
+        await deliver(a2, MENTION)  # same issue, thread and message id on both profiles
+        assert gw1.events[0].message_id == gw2.events[0].message_id
+        n1, n2 = len(c1.activities), len(c2.activities)
+        session_env(platform="linear", message_id=gw2.events[0].message_id, chat_id=M_ISSUE,
+                    thread_id=M_SID, key=f"agent:pb:linear:dm:{M_ISSUE}:{M_SID}")
+        hooks.on_post_tool_call("terminal", {"command": "ls"}, "x", "t", tool_call_id="c1")
+        await settle(a1)
+        await settle(a2)
+        assert len(c1.activities) == n1
+        assert [s for s, *_ in c2.activities[n2:]] == [M_SID]
+        # A key of another namespace reaches neither adapter.
+        session_env(platform="linear", message_id=gw2.events[0].message_id, chat_id=M_ISSUE,
+                    thread_id=M_SID, key=f"agent:main:linear:dm:{M_ISSUE}:{M_SID}")
+        hooks.on_post_tool_call("terminal", {"command": "ls"}, "x", "t", tool_call_id="c2")
+        await settle(a1)
+        await settle(a2)
+        assert (len(c1.activities), len(c2.activities)) == (n1, n2 + 1)
+    finally:
+        await a1.disconnect()
+        await a2.disconnect()
+
+
+def test_session_namespace_rules():
+    a, *_ = new_adapter()
+    for profile, ns in (("default", "agent:main"), ("main", "agent:main~"), ("ops", "agent:ops")):
+        a._profile = profile
+        assert a.session_namespace == ns
+
+
+async def test_typing_suppressed_after_recent_activity(env):
+    a, client, gw, store, order = env
+    now = [1000.0]
+    a.outbound.clock = lambda: now[0]
+    await deliver(a, MENTION)
+    mid, meta = gw.events[0].message_id, {"thread_id": M_SID}
+
+    def working():
+        return [c for _s, c, *_ in client.activities if c.get("body") == "Working…"]
+
+    await a.send(M_ISSUE, "commentary", metadata={**meta, "reply_to_message_id": mid,
+                                                  "_interim_send": True})
+    now[0] = 1010.0
+    await a.send_typing(M_ISSUE, metadata=meta)
+    await settle(a)
+    assert working() == []  # an activity 10 s ago: no gap to fill
+    now[0] = 1071.0
+    await a.send_typing(M_ISSUE, metadata=meta)
+    await settle(a)
+    assert len(working()) == 1  # 71 s of silence
+
+
+def test_outbound_memory_bounded():
+    a, *_ = new_adapter()
+    ob = a.outbound
+    for i in range(outbound_mod._REMEMBER + 50):
+        ob.last_thought.put(f"m{i}", "x")
+        ob.typing_at.put(f"s{i}", float(i))
+        ob.url_set.add(f"s{i}")
+    assert len(ob.last_thought) == len(ob.typing_at) == len(ob.url_set) == outbound_mod._REMEMBER
+    assert "m0" not in ob.last_thought and f"m{outbound_mod._REMEMBER + 49}" in ob.last_thought

@@ -132,8 +132,9 @@ class FakeClient:
             raise self.exc
         return "act-1"
 
-    async def update_session(self, sid, *, plan=None, external_urls=None):
-        self.updates.append((sid, plan, external_urls))
+    async def update_session(self, sid, *, plan=None, external_urls=None,
+                             added_external_urls=None):
+        self.updates.append((sid, plan, external_urls, added_external_urls))
         if self.exc:
             raise self.exc
 
@@ -188,9 +189,9 @@ async def test_writer_session_updates():
     plan = [{"content": "a", "status": "pending"}]
     assert await w.update_plan("s1", plan) is True
     assert await w.set_external_url("s1", "Hermes session", "https://h/s") is True
-    assert c.updates == [
-        ("s1", plan, None),
-        ("s1", None, [{"label": "Hermes session", "url": "https://h/s"}]),
+    assert c.updates == [  # the link is added (incremental), never a full replace
+        ("s1", plan, None, None),
+        ("s1", None, None, [{"label": "Hermes session", "url": "https://h/s"}]),
     ]
 
 

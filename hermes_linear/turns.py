@@ -11,7 +11,8 @@ fold the digest, snapshot) -> handed off (``handle_message``) -> admitted
 (until the base's processing task has finished and dropped its session guard)
 -> the next turn is released. A turn that is refused, never admitted, fails
 before hand-off, is stopped before hand-off, or exceeds
-``constants.TURN_SAFETY_TIMEOUT_S`` frees the FIFO too.
+``constants.TURN_SAFETY_TIMEOUT_S`` frees the FIFO too, as does a stopped turn the gateway has
+not completed ``constants.STOP_SETTLE_S`` after the stop (Q6 safety net).
 """
 
 from __future__ import annotations
@@ -56,6 +57,13 @@ class Turn:
     admitted: bool = False  # on_processing_start fired for this turn
     session_key: Optional[str] = None  # the base's session key (busy-guard lookups)
     safety: Optional[asyncio.TimerHandle] = None  # TURN_SAFETY_TIMEOUT_S watchdog
+    stop_settle: Optional[asyncio.TimerHandle] = None  # STOP_SETTLE_S watchdog after /stop
+
+    def disarm(self) -> None:
+        for handle in (self.safety, self.stop_settle):
+            if handle is not None:
+                handle.cancel()
+        self.safety = self.stop_settle = None
 
 
 def human_creator(event: dict) -> bool:
@@ -101,6 +109,8 @@ class TurnEngine:
         session_key_of: Callable[[MessageEvent], Optional[str]],
         base_owns: Callable[[Optional[str]], bool],
         base_busy: Callable[[str], bool],
+        on_stop_unsettled: Callable[[Turn], None] = lambda turn: None,
+        on_safety_expired: Callable[[Turn], None] = lambda turn: None,
     ) -> None:
         self._handle_message = handle_message
         self._build_source = build_source
@@ -113,6 +123,8 @@ class TurnEngine:
         self._session_key_of = session_key_of
         self._base_owns = base_owns
         self._base_busy = base_busy
+        self._on_stop_unsettled = on_stop_unsettled  # posts Stopped. (outbound)
+        self._on_safety_expired = on_safety_expired  # posts the timeout error (outbound)
         self.queues: dict[Key, deque[Turn]] = {}
         self.inflight: dict[Key, Turn] = {}
         # Completed turns whose base task has not finished yet; release waits for it (Q5).
@@ -144,8 +156,7 @@ class TurnEngine:
     def reset(self) -> None:
         """Disconnect: cancel timers and forget all state (tasks are cancelled by the owner)."""
         for turn in self.inflight.values():
-            if turn.safety is not None:
-                turn.safety.cancel()
+            turn.disarm()
         for handle in self._drain_timers.values():
             handle.cancel()
         self._drain_timers.clear()
@@ -191,8 +202,7 @@ class TurnEngine:
         if self.inflight.get(key) is not turn:
             return
         del self.inflight[key]
-        if turn.safety is not None:
-            turn.safety.cancel()
+        turn.disarm()
         asyncio.get_running_loop().call_soon(self._release_next, key)
 
     # ------------------------------------------------------------ dispatch
@@ -274,7 +284,10 @@ class TurnEngine:
         log.error("linear: turn %s hit the safety timeout (%ss) without completing; "
                   "freeing its queue", turn.mid, constants.TURN_SAFETY_TIMEOUT_S)
         turn.safety = None
-        self._free(key, turn)
+        try:
+            self._on_safety_expired(turn)
+        finally:
+            self._free(key, turn)
 
     # ------------------------------------------------------------ base hooks
 
@@ -305,8 +318,7 @@ class TurnEngine:
         if self.inflight.get(key) is not turn:
             return
         del self.inflight[key]
-        if turn.safety is not None:
-            turn.safety.cancel()
+        turn.disarm()
         self.draining.add(key)
         loop = asyncio.get_running_loop()
         self._drain_deadlines[key] = (turn, loop.call_later(
@@ -369,7 +381,7 @@ class TurnEngine:
             if turn.decision.agent_session_id != agent_session_id:
                 continue
             if turn.handed_off:
-                self._spawn(self._send_stop(turn))  # the gateway posts the stop notice
+                self._spawn(self._send_stop(key, turn))  # the gateway posts the stop notice
                 gateway_stop = True
             else:  # still preparing: cancel it here, nothing reached the gateway
                 if turn.task is not None:
@@ -381,10 +393,13 @@ class TurnEngine:
             self._spawn(self._post_response(agent_session_id, renderer.response(STOPPED_TEXT),
                                             timeout_s=ACK_TIMEOUT_S))
 
-    async def _send_stop(self, turn: Turn) -> None:
+    async def _send_stop(self, key: Key, turn: Turn) -> None:
         d = turn.decision
         mid = f"{d.agent_session_id}:stop:{uuid.uuid4().hex[:12]}"
         self.stop_message_ids[mid] = d.agent_session_id
+        if turn.stop_settle is None and self.inflight.get(key) is turn:
+            turn.stop_settle = asyncio.get_running_loop().call_later(
+                constants.STOP_SETTLE_S, self._stop_settle_expired, key, turn)
         source = self._build_source(chat_id=d.chat_id, chat_type="dm", user_id=d.user_id,
                                     user_name=d.user_name, thread_id=d.thread_id, message_id=mid)
         stop = MessageEvent(text="/stop", source=source, message_id=mid, user_id=d.user_id,
@@ -393,6 +408,17 @@ class TurnEngine:
             await self._handle_message(stop)
         except Exception as exc:  # noqa: BLE001
             log.error("linear: stop for %s failed: %s", d.agent_session_id, type(exc).__name__)
+
+    def _stop_settle_expired(self, key: Key, turn: Turn) -> None:
+        turn.stop_settle = None
+        if self.inflight.get(key) is not turn:
+            return
+        log.warning("linear: stopped turn %s not completed by the gateway %ss after /stop; "
+                    "answering it and freeing its queue", turn.mid, constants.STOP_SETTLE_S)
+        try:
+            self._on_stop_unsettled(turn)
+        finally:
+            self._free(key, turn)
 
 
 __all__ = ["Key", "QUEUED_ACK", "STOPPED_TEXT", "Turn", "TurnEngine", "human_creator",

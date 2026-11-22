@@ -251,16 +251,16 @@ class ActivityWriter:
     async def set_external_url(
         self, agent_session_id: str, label: str, url: str, *, timeout_s: float | None = None
     ) -> bool:
-        """Set the session's external link.
+        """Add the session's external link.
 
-        Note: ``externalUrls`` is a full replace — this sets the list to exactly
-        this one ``{label, url}`` and drops any links previously on the session.
+        Uses ``addedExternalUrls`` (incremental), so links already on the session — a PR
+        link, for instance — are kept.
         """
         return await self._call(
             "external url update",
             agent_session_id,
             lambda: self.client.update_session(
-                agent_session_id, external_urls=[{"label": label, "url": url}]
+                agent_session_id, added_external_urls=[{"label": label, "url": url}]
             ),
             timeout_s,
         )

@@ -7,8 +7,11 @@ are bound), copies the event, and hands it to each connected adapter's loop with
 ``loop.call_soon_threadsafe``. Store lookups, adapter selection and Linear writes all happen
 on the loop; nothing here blocks or does I/O.
 
-Adapter selection (Task 12 brief): the adapter whose store has ``turn(HERMES_SESSION_MESSAGE_ID)``,
-else the one with ``latest_turn_for_chat(HERMES_SESSION_CHAT_ID, HERMES_SESSION_THREAD_ID)``.
+Adapter selection: when ``HERMES_SESSION_KEY`` is bound, only adapters whose session namespace
+(``<ns>:linear:``, ``LinearAdapter.session_namespace``) prefixes it are candidates, so two
+profiles serving the same chat never cross. Among the candidates: the adapter whose store has
+``turn(HERMES_SESSION_MESSAGE_ID)``, else the one with
+``latest_turn_for_chat(HERMES_SESSION_CHAT_ID, HERMES_SESSION_THREAD_ID)``.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ def _session(kw: dict) -> dict | None:
     if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
         return None
     return {
+        "session_key": get_session_env("HERMES_SESSION_KEY") or None,
         "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID") or None,
         "chat_id": get_session_env("HERMES_SESSION_CHAT_ID") or None,
         "thread_id": get_session_env("HERMES_SESSION_THREAD_ID") or None,
@@ -57,9 +61,20 @@ def _route(adapters: list, phase: str, env: dict, ev: dict) -> None:
     log.debug("linear: tool event for an unknown turn dropped")
 
 
+def _owns_key(ad: Any, session_key: str | None) -> bool:
+    if not session_key:
+        return True  # unknown key: fall back to message id / chat lookup
+    try:
+        return session_key.startswith(f"{ad.session_namespace}:{PLATFORM}:")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _schedule(phase: str, env: dict, ev: dict) -> None:
     groups: dict[asyncio.AbstractEventLoop, list] = {}
     for ad in list(adapter_mod.ADAPTERS.values()):
+        if not _owns_key(ad, env.get("session_key")):
+            continue
         loop = getattr(ad, "event_loop", None)
         if loop is not None and not loop.is_closed():
             groups.setdefault(loop, []).append(ad)
