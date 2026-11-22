@@ -14,7 +14,9 @@ import logging
 
 import pytest
 
-from test_adapter_inbound import D_ISSUE, D_SID, DELEGATION, M_ISSUE, MENTION, deliver
+from test_adapter_inbound import (
+    D_ISSUE, D_SID, DELEGATION, M_ISSUE, MENTION, complete, deliver,
+)
 from test_adapter_outbound import (  # noqa: F401  (fixtures)
     D_CHAT, approval_prompt, env, session_env, settle,
 )
@@ -361,3 +363,112 @@ async def test_transform_refuses_rows_of_another_turn(env, session_env):
         "terminal", {"command": "rm -rf build"}, APPROVAL_TIMEOUT) is None
     assert hooks.on_transform_tool_result("clarify", {}, _answered()) is None
     assert store.control("clar-1") is not None and store.control("req-1") is not None
+
+
+# ----------------------------------- T6: re-post after the final response (spec §5)
+
+
+def _session_acts(client, sid=D_SID):
+    return [(c["type"], c.get("body"), signal, sm)
+            for s, c, _eph, signal, sm in client.activities if s == sid]
+
+
+async def _deferred_clarify(a, client, gw, session_env):
+    mid = await _delegated(a, gw, session_env)
+    await _clarify(a, client)
+    original = _session_acts(client)[-1]
+    await a.retire_clarify_card("clar-1", "expired")
+    await settle(a)
+    assert a._store.control("clar-1").state == "pending"
+    return mid, original
+
+
+async def test_final_response_then_repost(env, session_env):
+    a, client, gw, store, order = env
+    _, original = await _deferred_clarify(a, client, gw, session_env)
+    r = await a.send(D_CHAT, "Waiting for your answer.", metadata=META)
+    await settle(a)
+    assert r.success
+    acts = _session_acts(client)
+    assert acts[-2][:2] == ("response", "Waiting for your answer.")
+    assert acts[-1] == original
+    assert original[2] == "select" and original[3] == {
+        "options": [{"label": "staging", "value": "staging"},
+                    {"label": "prod", "value": "prod"}]}
+    row = store.control("clar-1")
+    assert row is not None and row.state == "pending"  # same row, state kept
+    # A further response of the answered turn does not post the question again.
+    await a.send(D_CHAT, "more", metadata={**META, "notify": True})
+    await settle(a)
+    assert sum(1 for t, *_ in _session_acts(client) if t == "elicitation") == 2
+
+
+async def test_no_repost_without_pending(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    await a.send(D_CHAT, "done", metadata=META)
+    await settle(a)
+    assert _session_acts(client)[-1][:2] == ("response", "done")
+
+
+async def test_no_repost_for_live_row(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    await _clarify(a, client)
+    await a.send(D_CHAT, "done", metadata=META)
+    await settle(a)
+    acts = _session_acts(client)
+    assert acts[-1][:2] == ("response", "done")
+    assert sum(1 for t, *_ in acts if t == "elicitation") == 1
+
+
+async def test_repost_after_promoted_thought(env, session_env):
+    a, client, gw, store, order = env
+    mid, original = await _deferred_clarify(a, client, gw, session_env)
+    # Commentary while the question is pending: not posted (it would hide the select), but
+    # kept as the turn-end fallback.
+    await a.send(D_CHAT, "the answer", metadata={**META, "reply_to_message_id": mid,
+                                                "_interim_send": True})
+    await complete(a, gw.events[0])  # SUCCESS; the final send was deduplicated
+    await settle(a)
+    acts = _session_acts(client)
+    assert acts[-2][:2] == ("response", "the answer")
+    assert acts[-1] == original
+
+
+async def test_repost_survives_memory_loss(env, session_env):
+    a, client, gw, store, order = env
+    _, original = await _deferred_clarify(a, client, gw, session_env)
+    a.outbound.elicited.clear()
+    await a.send(D_CHAT, "done", metadata=META)
+    await settle(a)
+    acts = _session_acts(client)
+    assert acts[-2][:2] == ("response", "done") and acts[-1] == original
+
+
+async def test_repost_pending_approval(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    await a._send_exec_approval_prompt(_approval())
+    original = _session_acts(client)[-1]
+    await a.edit_message(D_CHAT, "approval:req-1", "timed out")
+    await settle(a)
+    await a.send(D_CHAT, "done", metadata=META)
+    await settle(a)
+    acts = _session_acts(client)
+    assert acts[-2][:2] == ("response", "done") and acts[-1] == original
+    assert original[2] == "select" and original[3]["options"]
+
+
+async def test_repost_clarify_without_choices(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    await a.send_clarify(D_CHAT, "Free text?", None, "clar-9", "sk", metadata=META)
+    original = _session_acts(client)[-1]
+    assert original[2] is None
+    await a.retire_clarify_card("clar-9", "expired")
+    await settle(a)
+    await a.send(D_CHAT, "done", metadata=META)
+    await settle(a)
+    acts = _session_acts(client)
+    assert acts[-2][:2] == ("response", "done") and acts[-1] == original

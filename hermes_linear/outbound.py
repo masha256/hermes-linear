@@ -30,7 +30,9 @@ Q8, Q10).
   session's latest activity. While a control this adapter elicited is pending (row present,
   its turn in flight), ``_post`` drops every ``thought`` / ``action`` for that session
   (typing, heartbeat, interim sends, tool actions). Elicitations, errors and responses still
-  post; the expiry thought posts after the row is dropped.
+  post; the expiry thought posts after the row is dropped. The turn's first response (sent or
+  promoted at turn end) would land after a *pending* question and hide its select, so the
+  question is queued again right after it (same row, ``_repost_pending``).
 * Tool events from ``hooks.py`` (already on the loop): start/finish actions with the fast-tool
   skip, todo -> plan, and the session link.
 
@@ -50,7 +52,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from collections import deque
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Sequence
 from urllib.parse import unquote, urlparse
 
 from gateway.platforms.base import SendResult
@@ -347,7 +349,10 @@ class Outbound:
             first = kind == "response"
             if first:
                 self.responded.add(target.mid)
-            ok = await self._shielded_response(target, renderer.response(body), first)
+            fut = self._shielded_response(target, renderer.response(body), first)
+            if first:
+                self._repost_pending(target.sid)  # queued now: lands right after the response
+            ok = await fut
             kind = "response"
         else:
             if kind == "thought" and target.via == "reply_to_message_id":
@@ -360,13 +365,14 @@ class Outbound:
             return SendResult(success=False, error="linear write failed")
         return SendResult(success=True, message_id=f"{target.sid}:{kind}:{target.mid}")
 
-    async def _shielded_response(self, t: Target, content: dict, first: bool) -> bool:
-        """Write a response; a cancelled caller (``/stop`` during the final send) never
-        unqueues it. If the turn's first response fails, the turn is unanswered again."""
+    def _shielded_response(self, t: Target, content: dict, first: bool) -> Awaitable[bool]:
+        """Queue a response (synchronously); a cancelled caller (``/stop`` during the final
+        send) never unqueues it. If the turn's first response fails, the turn is unanswered
+        again."""
         fut = self._respond(t.sid, content)
         if first:
             fut.add_done_callback(lambda f: self._response_done(f, t))
-        return await asyncio.shield(fut)
+        return asyncio.shield(fut)
 
     def _response_done(self, fut: asyncio.Future, t: Target) -> None:
         if not fut.cancelled() and fut.result():
@@ -425,6 +431,7 @@ class Outbound:
             # Q1 caveat: the final send was deduplicated against commentary; promote it.
             self.responded.add(mid)
             self._respond(sid, renderer.response(last))
+            self._repost_pending(sid)
 
     def stop_unsettled(self, turn: Turn) -> None:
         """Q6 safety net: the gateway never completed a stopped turn within STOP_SETTLE_S."""
@@ -492,6 +499,32 @@ class Outbound:
                           turn_mid=t.mid)
         self.elicited.setdefault(t.sid, {})[rid] = t.mid  # gates _post until resolved
 
+    def _elicit(self, sid: str, kind: str, question: str, choices: Sequence[str]
+                ) -> asyncio.Future:
+        """Queue the elicitation of a control (the original post and the re-post): approvals
+        offer ``renderer.approval_options()`` narrowed to ``choices``; a clarify offers its
+        choices, and no select at all when it has none."""
+        if kind == "approval":
+            options = [o for o in renderer.approval_options() if o["value"] in choices]
+        else:
+            options = [{"label": v, "value": v} for v in choices]
+        kw: dict[str, Any] = {}
+        if kind == "approval" or options:
+            kw = {"signal": "select", "signal_metadata": {"options": options}}
+        return self._post(sid, renderer.elicitation(question), timeout_s=ACK_TIMEOUT_S, **kw)
+
+    def _repost_pending(self, sid: str) -> None:
+        """Spec §5: right after the turn's first response is queued, queue the session's
+        pending question again (same row and request id) so it is the last activity and
+        Linear keeps showing its select. A live row is never re-posted."""
+        store = self.a._store
+        row = store.control_for_session(sid) if store is not None else None
+        if row is None or row.state != "pending":
+            return
+        log.info("linear: re-posting pending %s %s after the response", row.kind,
+                 row.request_id)
+        self._elicit(sid, row.kind, row.question or "", row.choices)
+
     def _drop_pending(self, sid: str) -> None:
         store = self.a._store
         session = store.session(sid) if store is not None else None
@@ -513,12 +546,10 @@ class Outbound:
             log.warning("linear: approval prompt dropped (no linear session or request id)")
             return SendResult(success=False, error=NO_SESSION)
         choices = [c for c in _APPROVAL_CHOICES if c in prompt.choices]  # Q8: keep narrowing
-        options = [o for o in renderer.approval_options() if o["value"] in choices]
         rid = str(prompt.request_id)
         self._put_control(rid, "approval", target, choices, prompt.session_key,
                           question=prompt.text, command=prompt.command)
-        ok = await self._post(target.sid, renderer.elicitation(prompt.text), signal="select",
-                              signal_metadata={"options": options}, timeout_s=ACK_TIMEOUT_S)
+        ok = await self._elicit(target.sid, "approval", prompt.text, choices)
         if not ok:
             self._drop_control(rid)
             return SendResult(success=False, error="linear write failed")
@@ -533,12 +564,7 @@ class Outbound:
         values = [str(c) for c in (choices or [])]
         self._put_control(str(clarify_id), "clarify", target, values, session_key,
                           question=str(question))
-        kw: dict[str, Any] = {}
-        if values:
-            kw = {"signal": "select",
-                  "signal_metadata": {"options": [{"label": v, "value": v} for v in values]}}
-        ok = await self._post(target.sid, renderer.elicitation(str(question)),
-                              timeout_s=ACK_TIMEOUT_S, **kw)
+        ok = await self._elicit(target.sid, "clarify", str(question), values)
         if not ok:
             self._drop_control(str(clarify_id))
             return SendResult(success=False, error="linear write failed")
