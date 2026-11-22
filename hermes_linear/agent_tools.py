@@ -23,11 +23,13 @@ import concurrent.futures
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
+from . import sync
 from .constants import TOOL_TIMEOUT_S
 from .linear_client import LinearError
 
@@ -531,10 +533,42 @@ async def _comment(ctx: ToolContext, a: dict) -> dict:
     return done(await ctx.client.comment_create(issue["id"], text), False)
 
 
+# -- linear_sync_spec (RET-77)
+
+
+def _read_source(args: dict) -> tuple[Path, str]:
+    """The agent's ``path`` (relative to the process cwd) and its UTF-8 text, or BAD_ARGS."""
+    raw = _req_str(args, "path").strip()
+    try:
+        p = Path(raw).expanduser()
+        p = p if p.is_absolute() else Path.cwd() / p
+        return p, p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
+        raise _Refusal("BAD_ARGS") from None
+
+
+def _parse_sync_spec(args: dict) -> dict:
+    """In the tool thread, off the loop: read the file, its header, and git (sync.py)."""
+    p, text = _read_source(args)
+    ticket = sync.read_linear_header(text)
+    if ticket is None:
+        raise _Refusal("NO_LINEAR_HEADER")
+    description, inline = sync.spec_description(text, sync.source_info(p))
+    return {"ticket": ticket, "description": description, "inline": inline}
+
+
+async def _sync_spec(ctx: ToolContext, a: dict) -> dict:
+    issue = await _writable(ctx, a["ticket"])
+    out = await ctx.client.issue_update(issue["id"], {"description": a["description"]})
+    return {"ok": True, "issue": out.get("identifier") or issue.get("identifier"),
+            "url": out.get("url") or issue.get("url"), "inline": a["inline"]}
+
+
 linear_issue_get = _tool(_parse_get, _get)
 linear_issue_create = _tool(_parse_create, _create)
 linear_issue_update = _tool(_parse_update, _update)
 linear_comment = _tool(_parse_comment, _comment)
+linear_sync_spec = _tool(_parse_sync_spec, _sync_spec)
 
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
 
@@ -591,6 +625,17 @@ TOOL_SCHEMAS: dict[str, dict] = {
                             "description": "Stable key, e.g. status (letters, digits, _.:-)."},
         }, "required": ["id", "body"]},
     },
+    "linear_sync_spec": {
+        "name": "linear_sync_spec",
+        "description": ("Mirror a committed spec file onto the Linear ticket named by its "
+                        "'Linear: <ID>' header, as the Linear app: overwrites the ticket "
+                        "description with the file plus a source footer (only section 1 and "
+                        "a link if the spec is over 200,000 chars). Commit the file first."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string",
+                     "description": "Spec file path (relative to the working directory)."},
+        }, "required": ["path"]},
+    },
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
@@ -598,9 +643,11 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_issue_create": linear_issue_create,
     "linear_issue_update": linear_issue_update,
     "linear_comment": linear_comment,
+    "linear_sync_spec": linear_sync_spec,
 }
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_comment", "linear_issue_create", "linear_issue_get", "linear_issue_update",
+           "linear_sync_spec",
            "resolve_context", "resolve_state", "run_on_adapter"]
