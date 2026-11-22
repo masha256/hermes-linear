@@ -118,11 +118,22 @@ def test_register_platform_kwargs(ctx):
     assert kw["platform_hint"] == EXPECTED_HINT == plugin.PLATFORM_HINT
     assert kw["emoji"] == "📐"
     assert kw["max_message_length"] == 0
+    # Tool progress renders as Linear `action` activities (hooks.py); the
+    # gateway's text progress lines would otherwise post as `response`s.
+    assert kw["display_overrides"] == {"tool_progress": "off"}
     for fn in ("adapter_factory", "check_fn", "validate_config", "setup_fn"):
         assert callable(kw[fn]), fn
     # The real registry entry accepts every kwarg we pass (unknown keys raise TypeError).
     entry = PlatformEntry(source="plugin", plugin_name="linear", **kw)
     assert entry.name == "linear"
+
+
+def test_linear_tool_progress_defaults_off_real_resolver(ctx):
+    from gateway.display_config import resolve_display_setting
+
+    platform_registry.register(PlatformEntry(source="plugin", plugin_name="linear",
+                                             **ctx.platforms[0]))
+    assert resolve_display_setting({}, "linear", "tool_progress") == "off"
 
 
 def test_adapter_factory_builds_profile_adapter(ctx):

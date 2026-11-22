@@ -182,6 +182,13 @@ Use `hermes -p <profile> linear …` for other profiles.
 - **404s.** The profile in the URL doesn't exist or the Linear channel isn't enabled for it.
 - **"Not authorized" replies.** Add the user to `allowed_users` (UUID or email).
 - **Agent can't see a private team.** Add the team on the app's page in Linear settings.
+- **Tool names like "📐 linear_issue_get..." posted as replies.** Tool calls already show as Linear *action* activities. The plugin defaults `tool_progress` to off for Linear, but a global `display.tool_progress` in your config overrides that default. Add this to the profile's `config.yaml`:
+  ```yaml
+  display:
+    platforms:
+      linear:
+        tool_progress: "off"
+  ```
 - **Token errors.** `hermes linear status` shows token state. Rotating the client secret in Linear invalidates tokens; update `LINEAR_CLIENT_SECRET` and restart the gateway.
 
 ## Security notes

@@ -153,6 +153,11 @@ def register(ctx) -> None:
         platform_hint=PLATFORM_HINT,
         emoji=EMOJI,
         max_message_length=0,
+        # Tool calls render as Linear `action` activities via hooks.py. Gateway
+        # text progress lines would post as extra `response`s (which end the
+        # turn in Linear's UI). An operator's global display.tool_progress still
+        # wins; README says to set display.platforms.linear.tool_progress: off.
+        display_overrides={"tool_progress": "off"},
     )
     _pin_platform_member()
     for name, schema in agent_tools.TOOL_SCHEMAS.items():
