@@ -134,10 +134,30 @@ def test_done_posts_summary(pin_ctx, ws):
     (cid, c), = ws.comments.items()
     assert (c["issue"], c["body"], c["user"]) == (TASK, "Shipped in abc123.", VIEWER)
     assert sorted(_kinds(ws)) == ["comment_create", "issue_update"]
-    # already done: the summary is still posted, the state is not rewritten
+    # retried with the same summary (modulo surrounding whitespace): nothing is posted again
+    out = linear_task_state({"id": "RET-2", "state": "done", "summary": "  Shipped in abc123.\n"})
+    assert out["ok"] is True and out["summary_posted"] is False and out["state"] == "Done"
+    assert len(ws.comments) == 1 and sorted(_kinds(ws)) == ["comment_create", "issue_update"]
+    # a different summary is posted; the state is not rewritten
     out = linear_task_state({"id": "RET-2", "state": "done", "summary": "Follow-up."})
-    assert out["ok"] is True and _kinds(ws).count("issue_update") == 1
-    assert _kinds(ws).count("comment_create") == 2
+    assert out["ok"] is True and out["summary_posted"] is True
+    assert _kinds(ws).count("issue_update") == 1 and _kinds(ws).count("comment_create") == 2
+
+
+def test_done_summary_dedupe_ignores_human_comments(pin_ctx, ws):
+    ws.add_comment(TASK, "Shipped in abc123.", user="human-1")
+    ws.add_comment(SELF, "Shipped in abc123.")  # the app's, but on another ticket
+    out = linear_task_state({"id": "RET-2", "state": "done", "summary": "Shipped in abc123."})
+    assert out["ok"] is True and out["summary_posted"] is True
+    assert _kinds(ws).count("comment_create") == 1
+
+
+def test_done_keeps_any_completed_state(pin_ctx, ws):
+    ws.states["team-1"].append({"id": "st-shipped", "name": "Shipped", "type": "completed"})
+    ws.issues[TASK]["state"] = "st-shipped"
+    out = linear_task_state({"id": "RET-2", "state": "done"})
+    assert out["ok"] is True and out["state"] == "Shipped"
+    assert ws.issues[TASK]["state"] == "st-shipped" and ws.writes() == []
 
 
 def test_done_without_summary_posts_nothing(pin_ctx, ws):

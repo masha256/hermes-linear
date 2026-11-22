@@ -860,8 +860,9 @@ def _target_state(states: list[dict], current: dict, state: str) -> dict:
         if found is None:  # no review state: stay in a started state, else move to one
             found = current if (current.get("type") or "") == "started" \
                 else _first_of_type(states, "started")
-    else:  # done
-        found = _first_of_type(states, "completed")
+    else:  # done: any completed state is kept, as for in_review
+        found = current if (current.get("type") or "") == "completed" \
+            else _first_of_type(states, "completed")
     if found is None or not found.get("id"):
         raise _Refusal("BAD_ARGS")  # the team has no such state, as for _state_id
     return found
@@ -885,7 +886,12 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
     if state in {"in_progress", "in_review", "done"}:
         target = _target_state(await client.team_states(team), current, state)
         summary = (a["summary"] or "").strip() if state == "done" else ""
-        if summary:  # first: a crash in between repeats the summary rather than losing it
+        if state == "done":
+            out["summary_posted"] = False
+        # First: a crash in between repeats the call, and the retry finds the summary already
+        # posted (the app's own comments only; bodies round-trip byte-exact) and skips it.
+        if summary and not any((c.get("body") or "").strip() == summary
+                               for c in await client.app_comments(task["id"])):
             await client.comment_create(task["id"], a["summary"])
             out["summary_posted"] = True
         if target["id"] != current.get("id"):
