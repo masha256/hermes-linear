@@ -205,10 +205,30 @@ def test_tools_registered_in_hermes_linear_toolset(ctx):
         assert t["toolset"] == "hermes_linear", t["name"]
         assert t["schema"] is agent_tools.TOOL_SCHEMAS[t["name"]]
         assert t["schema"]["name"] == t["name"] and t["schema"]["parameters"]["properties"]
-        assert t["handler"] is agent_tools.TOOL_HANDLERS[t["name"]]
+        assert t["handler"] is plugin.tool_handler(t["name"])
         assert t["description"] == t["schema"]["description"]
         assert t["emoji"] == "📐"
         assert t["is_async"] is False and t["override"] is False
+
+
+def test_registered_handlers_return_json_strings_real_registry(monkeypatch):
+    # Hermes's registry only accepts str (or the multimodal envelope) from a tool
+    # handler; a bare dict becomes a "tool_result_contract" error at dispatch.
+    import json as _json
+
+    from tools.registry import ToolRegistry
+
+    from hermes_linear import adapter as adapter_mod
+    from hermes_linear import agent_tools
+
+    monkeypatch.setattr(adapter_mod, "ADAPTERS", {})
+    for name in agent_tools.TOOL_SCHEMAS:
+        handler = plugin.tool_handler(name)
+        raw = handler({"id": "RET-1"}, session_id="s")
+        assert isinstance(raw, str), name
+        normalized = ToolRegistry._normalize_handler_result(name, raw)
+        assert "tool_result_contract" not in normalized, name
+        assert _json.loads(raw)["ok"] is False
 
 
 def test_manifest_declares_every_tool():

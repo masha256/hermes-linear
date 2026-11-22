@@ -13,6 +13,8 @@ API contracts (``docs/hermes-integration-notes.md``; Hermes ``hermes_cli/plugins
 
 from __future__ import annotations
 
+import json
+
 import logging
 from pathlib import Path
 from typing import Any, Callable
@@ -93,6 +95,25 @@ def _pin_platform_member() -> None:
                     "a gateway restart", PLATFORM, type(exc).__name__)
 
 
+_JSON_HANDLERS: dict = {}
+
+
+def tool_handler(name: str):
+    """The registered handler for tool ``name``: the agent_tools handler with its
+    dict result serialized to a JSON string. Hermes's tool registry only accepts
+    a ``str`` (or the multimodal envelope) from a handler; a bare dict becomes a
+    ``tool_result_contract`` error. One wrapper per name, so it is stable."""
+    if name not in _JSON_HANDLERS:
+        inner = agent_tools.TOOL_HANDLERS[name]
+
+        def handler(args=None, **kw):
+            return json.dumps(inner(args, **kw), ensure_ascii=False, default=str)
+
+        handler.__name__ = f"{name}_json"
+        _JSON_HANDLERS[name] = handler
+    return _JSON_HANDLERS[name]
+
+
 def register(ctx) -> None:
     """Register the Linear platform, agent tools, skill, tool hooks and ``hermes linear``."""
     from . import setup_cli  # deferred: keeps CLI helpers out of the adapter import path
@@ -136,7 +157,7 @@ def register(ctx) -> None:
     _pin_platform_member()
     for name, schema in agent_tools.TOOL_SCHEMAS.items():
         ctx.register_tool(name, toolset=TOOLSET, schema=schema,
-                          handler=agent_tools.TOOL_HANDLERS[name],
+                          handler=tool_handler(name),
                           description=schema["description"], emoji=EMOJI)
     ctx.register_skill(SKILL_NAME, SKILL_PATH, description=SKILL_DESCRIPTION)
     ctx.register_hook("pre_tool_call", hooks.on_pre_tool_call)
