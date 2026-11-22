@@ -69,6 +69,15 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                  client: LinearClient | None = None, store: Store | None = None,
                  listener: Any = None, get_config: Callable[[str, Any], Any] | None = None) -> None:
         super().__init__(config, Platform(PLATFORM))
+        # Gateway operational notices (home-channel prompt, first-contact setup notes) are for
+        # chat platforms; in a Linear ticket they'd land mid-turn as agent activity. Route them
+        # through send_private_notice (run_notifications._deliver_platform_notice honours the
+        # adapter's own ``notice_delivery``), which drops them.
+        extra = getattr(self.config, "extra", None)
+        if not isinstance(extra, dict):
+            extra = {}
+            self.config.extra = extra
+        extra["notice_delivery"] = "private"
         self._settings_override = settings
         self._settings: Settings | None = settings
         self._client = client
@@ -268,6 +277,13 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:
         return await self.outbound.send(chat_id, content, reply_to, metadata)
+
+    async def send_private_notice(self, chat_id: str, user_id: Optional[str], content: str,
+                                  reply_to: Optional[str] = None,
+                                  metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        """Drop gateway operational notices; Linear has no private channel and no home chat."""
+        log.debug("linear: dropped gateway notice for %s (%d chars)", chat_id, len(content or ""))
+        return SendResult(success=True)
 
     # Media (Ruling 35): rendered as markdown and sent through ``send`` with the caller's
     # metadata, so a final reply's attachments (notify, no reply_to) classify as content.
