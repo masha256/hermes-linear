@@ -17,11 +17,17 @@ already ended), the fallback is the adapter whose store has
 ``latest_turn_for_chat(HERMES_SESSION_CHAT_ID, HERMES_SESSION_THREAD_ID)``, skipping a turn
 that is in flight under a different known key, so two profiles serving the same chat never
 cross.
+
+The ``clarify`` tool posts no action at all (neither phase): its elicitation is its rendering,
+and anything posted after the elicitation would hide Linear's select input. The Tool Search
+bridge normally unwraps ``tool_call`` to the real name before hooks run; a call it leaves
+wrapped (scope / probe block) is recognised by its ``calls`` entries.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -32,6 +38,29 @@ from . import adapter as adapter_mod
 log = logging.getLogger(__name__)
 
 PLATFORM = "linear"
+_SILENT_TOOLS = frozenset({"clarify"})  # rendered as an elicitation by outbound.clarify
+_BRIDGE_TOOL = "tool_call"  # tools/tool_search_catalog.py TOOL_CALL_NAME
+
+
+def _silent(tool_name: Any, args: Any) -> bool:
+    """True for ``clarify``, directly or wrapped in a ``tool_call`` bridge call."""
+    if tool_name in _SILENT_TOOLS:
+        return True
+    if tool_name != _BRIDGE_TOOL or not isinstance(args, dict):
+        return False
+    calls = args.get("calls")
+    if calls is None:
+        calls = [args]
+    elif isinstance(calls, str):
+        try:
+            calls = json.loads(calls)
+        except ValueError:
+            return False
+    if isinstance(calls, dict):
+        calls = [calls]
+    names = [str(c.get("name") or "").strip() for c in calls if isinstance(c, dict)] \
+        if isinstance(calls, list) else []
+    return bool(names) and all(n in _SILENT_TOOLS for n in names)
 
 
 def _session(kw: dict) -> dict | None:
@@ -93,7 +122,7 @@ def _schedule(phase: str, env: dict, ev: dict) -> None:
 def on_pre_tool_call(tool_name: str, args: Any = None, task_id: Any = None, **kw: Any) -> None:
     """Observer only: always returns None (never blocks or approves a tool)."""
     try:
-        env = _session(kw)
+        env = None if _silent(tool_name, args) else _session(kw)
         if env is not None:
             _schedule("start", env, {"tool_name": tool_name, "args": _copy_args(args),
                                      "task_id": task_id, "tool_call_id": kw.get("tool_call_id"),
@@ -106,7 +135,7 @@ def on_pre_tool_call(tool_name: str, args: Any = None, task_id: Any = None, **kw
 def on_post_tool_call(tool_name: str, args: Any = None, result: Any = None, task_id: Any = None,
                       duration_ms: int = 0, **kw: Any) -> None:
     try:
-        env = _session(kw)
+        env = None if _silent(tool_name, args) else _session(kw)
         if env is not None:
             _schedule("finish", env, {
                 "tool_name": tool_name, "args": _copy_args(args),

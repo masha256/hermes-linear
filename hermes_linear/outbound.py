@@ -22,6 +22,11 @@ Q8, Q10).
   the caller.
 * Approvals / clarify: ``elicitation`` (+ ``select``) and a ``pending_controls`` row; expiry
   posts a fixed ``thought`` and drops the row (Q10).
+* Pending elicitation: Linear shows a select input only while the elicitation is the agent
+  session's latest activity. While a control this adapter elicited is pending (row present,
+  its turn in flight), ``_post`` drops every ``thought`` / ``action`` for that session
+  (typing, heartbeat, interim sends, tool actions). Elicitations, errors and responses still
+  post; the expiry thought posts after the row is dropped.
 * Tool events from ``hooks.py`` (already on the loop): start/finish actions with the fast-tool
   skip, todo -> plan, and the session link.
 
@@ -200,6 +205,7 @@ class Outbound:
         self.retired_stops = _Bounded()  # synthesized stop ids already handled
         self.stop_skipped = _Bounded()  # stopped turn mids whose Stopped. a response replaced
         self.writes = _SessionWrites(lambda coro: self.a._spawn(coro))
+        self.elicited: dict[str, dict[str, str]] = {}  # agent session -> {request id: turn mid}
 
     def reset(self) -> None:
         """Disconnect: cancel timers and forget state (tasks are cancelled by the adapter)."""
@@ -209,6 +215,7 @@ class Outbound:
         self.heartbeats.clear()
         self.last_thought.clear()
         self.typing_at.clear()
+        self.elicited.clear()
         self.writes.reset()
 
     # ------------------------------------------------------------ writers
@@ -219,8 +226,31 @@ class Outbound:
         writer = self.a._activity_writer
         if writer is None:
             return _done(False)
+        if self._suppressed(sid, content):
+            log.debug("linear: %s for session %s dropped (elicitation pending)",
+                      content.get("type"), sid)
+            return _done(True)
         self.typing_at.put(sid, self.clock())
         return self.writes.submit(sid, lambda: writer.post(sid, content, **kw))
+
+    def _suppressed(self, sid: str, content: dict) -> bool:
+        """True while an elicitation of ``sid`` is pending: a thought or action posted now
+        would supersede it and hide Linear's select input (on the loop: store access)."""
+        return content.get("type") in ("thought", "action") and bool(self._live_controls(sid))
+
+    def _live_controls(self, sid: str) -> dict[str, str]:
+        """The controls elicited for ``sid`` that are still pending (row present: not
+        answered, expired or dropped) for a turn still in flight; forgets the rest."""
+        pending = self.elicited.get(sid)
+        if not pending:
+            return {}
+        store = self.a._store
+        for rid, mid in list(pending.items()):
+            if store is None or store.control(rid) is None or self.a.turns.find(mid) is None:
+                del pending[rid]
+        if not pending:
+            del self.elicited[sid]
+        return pending
 
     def _respond(self, sid: str, content: dict, **kw) -> asyncio.Future:
         self.typing_at.put(sid, self.clock())
@@ -374,6 +404,7 @@ class Outbound:
         key, turn = found
         mid, sid = turn.mid, turn.decision.agent_session_id
         self.stop_heartbeat(mid)
+        self._live_controls(sid)  # forget controls this (now finished) turn abandoned
         stop_ids = self._retire_stops(sid)
         last = self.last_thought.pop(mid, None)
         if stop_ids:
@@ -450,8 +481,11 @@ class Outbound:
         assert store is not None
         store.put_control(rid, kind, t.sid, _generation(t.key[0]), choices,
                           session_key=session_key)
+        self.elicited.setdefault(t.sid, {})[rid] = t.mid  # gates _post until resolved
 
     def _drop_control(self, rid: str) -> None:
+        for pending in self.elicited.values():
+            pending.pop(rid, None)
         if self.a._store is not None:
             self.a._store.drop_control(rid)
 
