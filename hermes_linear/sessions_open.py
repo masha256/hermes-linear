@@ -118,11 +118,14 @@ class SessionOpener:
         ticket = store.ticket(issue_id)
         if ticket is None or ticket.mode != "delegated" or not actor_id:
             return
-        try:  # bounded: this runs on the event worker
-            existing = await asyncio.wait_for(client.app_sessions_on_issue(issue_id),
-                                              ACK_TIMEOUT_S)
-            sid = existing[0]["id"] if existing else await asyncio.wait_for(
-                client.create_session_on_issue(issue_id), ACK_TIMEOUT_S)
+
+        async def reuse_or_create() -> str:
+            existing = await client.app_sessions_on_issue(issue_id)
+            return existing[0]["id"] if existing else await client.create_session_on_issue(
+                issue_id)
+
+        try:  # bounded: this runs on the event worker; both calls share one deadline
+            sid = await asyncio.wait_for(reuse_or_create(), ACK_TIMEOUT_S)
         except Exception as exc:  # noqa: BLE001 - includes TimeoutError
             log.error("linear: opening a session on %s failed: %s", issue_id, type(exc).__name__)
             return

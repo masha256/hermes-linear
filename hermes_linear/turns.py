@@ -39,6 +39,7 @@ STOPPED_TEXT = "Stopped."
 TURN_FAILED_TEXT = "Hermes could not start this turn. Please try again."
 RELEASE_RETRY_S = 0.05  # re-check interval while the base still holds the session guard
 RELEASE_MAX_TRIES = 200
+DRAIN_DEADLINE_S = 30.0  # a key still draining this long after complete() is released anyway
 
 Key = tuple[str, Optional[str]]  # (hermes chat_id, thread_id) == one Hermes session
 Post = Callable[..., Awaitable[Any]]  # (agent_session_id, content, **writer kwargs)
@@ -117,6 +118,8 @@ class TurnEngine:
         # Completed turns whose base task has not finished yet; release waits for it (Q5).
         self.draining: set[Key] = set()
         self._drain_timers: dict[Key, asyncio.TimerHandle] = {}
+        self._drain_deadlines: dict[Key, tuple[Turn, asyncio.TimerHandle]] = {}
+        self.closing = False  # disconnect in progress: nothing is released any more
         self.last_outcome: dict[Key, ProcessingOutcome] = {}
         self.stop_message_ids: dict[str, str] = {}  # synthesized stop message_id -> agent session
         self._unadmitted_logged = False
@@ -134,7 +137,9 @@ class TurnEngine:
         return key in self.inflight or key in self.draining or bool(self.queues.get(key))
 
     def close(self) -> None:
-        pass
+        """Disconnect, step 1 (before dispatches are cancelled): stop all releases."""
+        self.closing = True
+        self.queues.clear()
 
     def reset(self) -> None:
         """Disconnect: cancel timers and forget all state (tasks are cancelled by the owner)."""
@@ -144,11 +149,15 @@ class TurnEngine:
         for handle in self._drain_timers.values():
             handle.cancel()
         self._drain_timers.clear()
+        for _turn, handle in self._drain_deadlines.values():
+            handle.cancel()
+        self._drain_deadlines.clear()
         self.draining.clear()
         self.queues.clear()
         self.inflight.clear()
         self.last_outcome.clear()
         self.stop_message_ids.clear()
+        self.closing = False  # ready for a reconnect
 
     # ------------------------------------------------------------ queue
 
@@ -165,7 +174,7 @@ class TurnEngine:
 
     def _release_next(self, key: Key) -> None:
         """Start the next queued turn for ``key`` if none is in flight (synchronous)."""
-        if key in self.inflight or key in self.draining:
+        if self.closing or key in self.inflight or key in self.draining:
             return
         queue = self.queues.get(key)
         if not queue:
@@ -300,25 +309,48 @@ class TurnEngine:
             turn.safety.cancel()
         self.draining.add(key)
         loop = asyncio.get_running_loop()
+        self._drain_deadlines[key] = (turn, loop.call_later(
+            DRAIN_DEADLINE_S, self._drain_deadline_hit, key, turn))
         task = asyncio.current_task()
         if task is None:
-            loop.call_soon(self._release_after_drain, key, turn.session_key, 0)
+            loop.call_soon(self._release_after_drain, key, turn, 0)
         else:
             task.add_done_callback(lambda _t: loop.call_soon(
-                self._release_after_drain, key, turn.session_key, 0))
+                self._release_after_drain, key, turn, 0))
 
-    def _release_after_drain(self, key: Key, session_key: str | None, tries: int) -> None:
+    def _release_after_drain(self, key: Key, turn: Turn, tries: int) -> None:
+        entry = self._drain_deadlines.get(key)
+        if key not in self.draining or entry is None or entry[0] is not turn:
+            return  # disconnected, or already released by the drain deadline
         self._drain_timers.pop(key, None)
-        if key not in self.draining:
-            return  # disconnected meanwhile
+        session_key = turn.session_key
         if session_key and self._base_busy(session_key):
             if tries < RELEASE_MAX_TRIES:
                 self._drain_timers[key] = asyncio.get_running_loop().call_later(
-                    RELEASE_RETRY_S, self._release_after_drain, key, session_key, tries + 1)
+                    RELEASE_RETRY_S, self._release_after_drain, key, turn, tries + 1)
                 return
             log.warning("linear: session %s still busy in the gateway after %.0fs; releasing "
                         "the next turn anyway", session_key, RELEASE_RETRY_S * RELEASE_MAX_TRIES)
+        self._end_drain(key)
+        self._release_next(key)
+
+    def _end_drain(self, key: Key) -> None:
         self.draining.discard(key)
+        entry = self._drain_deadlines.pop(key, None)
+        if entry is not None:
+            entry[1].cancel()
+        handle = self._drain_timers.pop(key, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _drain_deadline_hit(self, key: Key, turn: Turn) -> None:
+        entry = self._drain_deadlines.get(key)
+        if entry is None or entry[0] is not turn or key not in self.draining:
+            return
+        log.warning("linear: turn %s still draining %.0fs after completion (the gateway's "
+                    "processing task has not ended); releasing the next turn", turn.mid,
+                    DRAIN_DEADLINE_S)
+        self._end_drain(key)
         self._release_next(key)
 
     # ------------------------------------------------------------ stop (Q6)
