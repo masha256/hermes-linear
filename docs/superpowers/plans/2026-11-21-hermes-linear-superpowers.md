@@ -21,7 +21,7 @@ public plugin API.
 
 **Branch:** `superpowers-integration`, rebased onto `m1`. The tools need the
 channel plugin's adapter, client and hooks. Work in
-`.worktrees/superpowers-integration`.
+`.worktrees/sp`.
 
 ## Global Constraints
 
