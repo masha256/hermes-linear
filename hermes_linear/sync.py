@@ -1,8 +1,11 @@
 """Spec/plan rendering for the Linear sync tools (RET-77; Task 4 extends it for plans).
 
-Pure text helpers, plus small git helpers whose subprocess runner (``git``) is injectable.
-Nothing here touches Linear or the event loop: callers run the git helpers in the tool
-thread, before scheduling the Linear write on the adapter loop.
+Pure text helpers, small git helpers whose subprocess runner (``git``) is injectable, and
+the bounded source-file reader (``source_path`` / ``read_source``) shared by the spec and
+plan tools. Nothing here touches Linear or the event loop: callers run the file and git
+helpers in the tool thread, never on a running loop, before scheduling the Linear write on
+the adapter loop. Lengths are measured in UTF-16 code units (``utf16_len``), as Linear
+(JavaScript) measures strings.
 """
 
 from __future__ import annotations
@@ -20,10 +23,16 @@ log = logging.getLogger(__name__)
 #: Probe P1: Linear accepts 200,000-char descriptions (rejects 400,000); the limit applies
 #: to the rendered text including the footer.
 SPEC_INLINE_MAX = 200_000
+#: Largest spec/plan file the tools read (bytes); larger files are refused (BAD_ARGS).
+MAX_SOURCE_BYTES = 2 * 1024 * 1024
 GIT_TIMEOUT_S = 10.0
 UNCOMMITTED = "uncommitted"
 
-HEADER_RE = re.compile(r"^Linear:\s*(\S+)", re.MULTILINE)
+#: A whole header line: ``Linear: <identifier | UUID>`` and nothing else.
+HEADER_RE = re.compile(
+    r"^Linear:[ \t]*([A-Z][A-Z0-9]*-\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}"
+    r"-[0-9a-f]{12})[ \t]*$", re.MULTILINE)
+_FENCE_RE = re.compile(r"^ {0,3}```")
 _SECTION_ONE_RE = re.compile(r"^## 1\.", re.MULTILINE)
 _NEXT_SECTION_RE = re.compile(r"^## ", re.MULTILINE)
 _GITHUB_RE = re.compile(
@@ -45,12 +54,72 @@ def run_git(args: list[str]) -> str | None:
     return res.stdout.strip() if res.returncode == 0 else None
 
 
+# ----------------------------------------------------------------- source files
+
+
+def source_path(raw: object) -> Path | None:
+    """``raw`` as a ``Path`` if it is an absolute path string, else ``None`` (BAD_ARGS).
+
+    Relative paths are refused: the gateway's cwd is not the agent's working directory.
+    """
+    if not isinstance(raw, str) or not raw.strip() or "\0" in raw:
+        return None
+    p = Path(raw.strip())
+    return p if p.is_absolute() else None
+
+
+def read_source(path: Path, max_bytes: int = MAX_SOURCE_BYTES) -> str | None:
+    """The UTF-8 text of regular file ``path`` if at most ``max_bytes`` long, else ``None``."""
+    try:
+        if not path.is_file() or path.stat().st_size > max_bytes:
+            return None
+        with path.open("rb") as fh:
+            data = fh.read(max_bytes + 1)  # bounded even if the file grew since the stat
+        if len(data) > max_bytes:
+            return None
+        return data.decode("utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
 # ----------------------------------------------------------------- text
 
 
+def utf16_len(s: str) -> int:
+    """``s``'s length in UTF-16 code units (JavaScript ``String.length``)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def utf16_truncate(s: str, units: int) -> str:
+    """The longest prefix of ``s`` of at most ``units`` UTF-16 code units (no split pairs)."""
+    if units <= 0:
+        return ""
+    return s.encode("utf-16-le")[:2 * units].decode("utf-16-le", errors="ignore")
+
+
+def _header_block(text: str) -> str:
+    """The lines before the first ``## `` heading, without fenced (```) code blocks."""
+    out: list[str] = []
+    fenced = False
+    for line in text.splitlines():
+        if _FENCE_RE.match(line):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        if line.startswith("## "):
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
 def read_linear_header(text: str) -> str | None:
-    """The ID on the first line starting ``Linear:``, else ``None``."""
-    m = HEADER_RE.search(text or "")
+    """The ID on the first ``Linear: <ID>`` header line, else ``None``.
+
+    Only whole lines in the header block (before the first ``## `` heading, outside code
+    fences) count; the ID must be an issue identifier (``RET-12``) or a lowercase UUID.
+    """
+    m = HEADER_RE.search(_header_block(text or ""))
     return m.group(1) if m else None
 
 
@@ -84,9 +153,17 @@ class SourceInfo:
 
 
 def git_short_commit(path: str | Path, git: Git = run_git) -> str | None:
-    """``git log -1 --format=%h -- <file>`` in the file's directory; ``None`` if none."""
+    """``git log -1 --format=%h -- <file>`` in the file's directory; ``None`` if none.
+
+    Also ``None`` when the working copy differs from HEAD (``git status --porcelain`` not
+    empty, or it fails): the commit would not name the content being synced.
+    """
     p = Path(path)
-    return git(["-C", str(p.parent), "log", "-1", "--format=%h", "--", str(p)]) or None
+    commit = git(["-C", str(p.parent), "log", "-1", "--format=%h", "--", str(p)]) or None
+    if commit is None:
+        return None
+    dirty = git(["-C", str(p.parent), "status", "--porcelain", "--", str(p)])
+    return commit if dirty == "" else None
 
 
 def github_repo(remote_url: str | None) -> str | None:
@@ -124,17 +201,18 @@ def spec_description(text: str, info: SourceInfo) -> tuple[str, bool]:
     full file, then the same footer, with §1 cut short if even that would not fit.
     """
     full = render_spec(text, info.path, info.commit)
-    if len(full) <= SPEC_INLINE_MAX:
+    if utf16_len(full) <= SPEC_INLINE_MAX:
         return full, True
     tail = (f"\n\nFull spec (too long to show here): {info.link}"
             f"\n\n---\n{footer(info.path, info.commit)}")
     summary = spec_summary(text)
-    room = SPEC_INLINE_MAX - len(tail)
-    if len(summary) > room:
-        summary = summary[:max(room - len(TRUNCATED), 0)].rstrip() + TRUNCATED
+    room = SPEC_INLINE_MAX - utf16_len(tail)
+    if utf16_len(summary) > room:
+        summary = utf16_truncate(summary, room - utf16_len(TRUNCATED)).rstrip() + TRUNCATED
     return (summary + tail).lstrip(), False
 
 
-__all__ = ["SPEC_INLINE_MAX", "SourceInfo", "footer", "git_short_commit", "github_repo",
-           "read_linear_header", "render_spec", "run_git", "source_info", "spec_description",
-           "spec_summary"]
+__all__ = ["MAX_SOURCE_BYTES", "SPEC_INLINE_MAX", "SourceInfo", "footer", "git_short_commit",
+           "github_repo",
+           "read_linear_header", "read_source", "render_spec", "run_git", "source_info",
+           "source_path", "spec_description", "spec_summary", "utf16_len", "utf16_truncate"]

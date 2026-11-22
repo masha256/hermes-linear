@@ -22,6 +22,7 @@ import asyncio
 import concurrent.futures
 import logging
 import re
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -343,11 +344,39 @@ def _opt_names(args: dict, key: str) -> list[str]:
     return [v.strip() for v in val]
 
 
+def _has_running_loop() -> bool:
+    try:
+        asyncio.get_running_loop()
+        return True
+    except RuntimeError:
+        return False
+
+
+def _on_any_loop() -> bool:
+    """True on a thread running an event loop (any loop, or a live adapter's loop thread)."""
+    if _has_running_loop():
+        return True
+    me = threading.get_ident()
+    for ad in list(adapter_mod.ADAPTERS.values()):
+        loop = _live_loop(ad)
+        if loop is not None and getattr(loop, "_thread_id", None) == me:
+            return True
+    return False
+
+
 def _tool(parse: Callable[[dict], dict],
-          body: Callable[[ToolContext, dict], Coroutine[Any, Any, dict]]) -> Callable[..., dict]:
-    """Wrap ``parse`` (sync arg validation) and ``body`` (loop coroutine) into a handler."""
+          body: Callable[[ToolContext, dict], Coroutine[Any, Any, dict]], *,
+          blocking_parse: bool = False) -> Callable[..., dict]:
+    """Wrap ``parse`` (sync arg validation) and ``body`` (loop coroutine) into a handler.
+
+    With ``blocking_parse`` (``parse`` reads files / runs git), a call on an event-loop
+    thread (the ``PluginContext.dispatch_tool`` path) is refused with ``WRONG_THREAD``
+    before ``parse`` runs, so no blocking I/O ever runs on the gateway loop.
+    """
     def handler(args: Any = None, **kw: Any) -> dict:
         try:
+            if blocking_parse and _on_any_loop():
+                return _err("WRONG_THREAD")
             if not isinstance(args, dict):
                 return _err("BAD_ARGS")
             try:
@@ -536,15 +565,18 @@ async def _comment(ctx: ToolContext, a: dict) -> dict:
 # -- linear_sync_spec (RET-77)
 
 
-def _read_source(args: dict) -> tuple[Path, str]:
-    """The agent's ``path`` (relative to the process cwd) and its UTF-8 text, or BAD_ARGS."""
-    raw = _req_str(args, "path").strip()
-    try:
-        p = Path(raw).expanduser()
-        p = p if p.is_absolute() else Path.cwd() / p
-        return p, p.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError, ValueError, RuntimeError):
-        raise _Refusal("BAD_ARGS") from None
+def _read_source(args: dict, key: str = "path") -> tuple[Path, str]:
+    """``args[key]`` as an absolute path and its UTF-8 text (≤ MAX_SOURCE_BYTES), or BAD_ARGS.
+
+    Shared by the spec and plan sync tools; call only off the loop (``blocking_parse``).
+    """
+    p = sync.source_path(args.get(key))
+    if p is None:
+        raise _Refusal("BAD_ARGS")  # missing, non-str, empty, or relative (Ruling S15)
+    text = sync.read_source(p)
+    if text is None:
+        raise _Refusal("BAD_ARGS")  # not a regular file, too large, unreadable or not UTF-8
+    return p, text
 
 
 def _parse_sync_spec(args: dict) -> dict:
@@ -568,7 +600,7 @@ linear_issue_get = _tool(_parse_get, _get)
 linear_issue_create = _tool(_parse_create, _create)
 linear_issue_update = _tool(_parse_update, _update)
 linear_comment = _tool(_parse_comment, _comment)
-linear_sync_spec = _tool(_parse_sync_spec, _sync_spec)
+linear_sync_spec = _tool(_parse_sync_spec, _sync_spec, blocking_parse=True)
 
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
 
@@ -630,10 +662,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "description": ("Mirror a committed spec file onto the Linear ticket named by its "
                         "'Linear: <ID>' header, as the Linear app: overwrites the ticket "
                         "description with the file plus a source footer (only section 1 and "
-                        "a link if the spec is over 200,000 chars). Commit the file first."),
+                        "a link if the spec is over 200,000 chars). Commit the file first; "
+                        "uncommitted edits are marked as such."),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string",
-                     "description": "Spec file path (relative to the working directory)."},
+                     "description": "Absolute path to the spec file."},
         }, "required": ["path"]},
     },
 }
