@@ -383,3 +383,10 @@ def test_grant_is_one_use(store):
     assert store.take_grant("K", "c") is None
     assert store.take_grant("K2", "c") is None
     assert store.take_grant("K", "d") == ("once", "u1")
+
+
+def test_grant_not_offered_stays(store):
+    store.put_grant("K", "c", "once", "u1", "m1")
+    assert store.take_grant("K", "c", offered=["deny"]) is None
+    assert store.take_grant("K", "c", offered=["once", "deny"]) == ("once", "u1")
+    assert store.take_grant("K", "c") is None

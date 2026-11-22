@@ -710,15 +710,18 @@ class Store:
             "actor_id, turn_mid, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             (session_key, command, choice, actor_id, turn_mid, time.time())))
 
-    def take_grant(self, session_key: str, command: str) -> tuple[str, str] | None:
-        """Consume the grant: ``(choice, actor_id)`` and delete it, or None."""
+    def take_grant(
+        self, session_key: str, command: str, offered: Sequence[str] | None = None
+    ) -> tuple[str, str] | None:
+        """Consume the grant: ``(choice, actor_id)`` and delete it, or None. With
+        ``offered``, a grant whose choice is not among them is left in place (None)."""
 
         def go() -> tuple[str, str] | None:
             r = self._one(
                 "SELECT choice, actor_id FROM approval_grants "
                 "WHERE session_key = ? AND command = ?",
                 (session_key, command))
-            if r is None:
+            if r is None or (offered is not None and r["choice"] not in offered):
                 return None
             self.conn.execute(
                 "DELETE FROM approval_grants WHERE session_key = ? AND command = ?",

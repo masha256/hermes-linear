@@ -687,3 +687,106 @@ async def test_redelegation_drops_pending_but_not_live(env, session_env):
     assert store.control("clar-1") is None
     assert store.control("live-1") is not None  # live rows are Hermes's to cancel
     assert _removed(client) == [(D_ISSUE, [BLOCKED])]
+
+
+# --- T8: one-shot grant on the re-run (spec §7, Review Focus 4) ----------------------------
+
+def _rerun(rid="req-2", key="K", command=RM):
+    return dataclasses.replace(_approval(rid), session_key=key, command=command,
+                               text=f"Run `{command}`?")
+
+
+def _stub_grant_path(monkeypatch, refusal=None, resolved=1):
+    calls = []
+    monkeypatch.setattr(sessions_open_mod, "_approval_refusal",
+                        lambda sk, actor, **k: calls.append(("refusal", sk, actor, k)) or refusal)
+    monkeypatch.setattr(sessions_open_mod, "_resolve_approval_card",
+                        lambda *a, **k: calls.append(("resolve", a, k)) or resolved)
+    return calls
+
+
+def _elicitations(client, since=0):
+    return [c for _, c, *_ in client.activities[since:] if c["type"] == "elicitation"]
+
+
+async def test_grant_auto_approves_exact_rerun(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    calls = _stub_grant_path(monkeypatch)
+    await _delegated(a, gw, session_env)
+    store.put_grant("K", RM, "once", "u1", "answer-mid")
+    n = len(client.activities)
+    res = await a._send_exec_approval_prompt(_rerun())
+    assert res.success and res.message_id == "approval:req-2"
+    assert calls == [("refusal", "K", "u1", {"request_id": "req-2"}),
+                     ("resolve", ("K", "once", "req-2"), {"actor_id": "u1"})]
+    assert len(client.activities) == n  # nothing posted
+    assert store.control("req-2") is None
+    assert _grants(store) == []
+
+
+@pytest.mark.parametrize("key,command", [("K", RM + "2"), ("K2", RM), ("K", RM + " ")])
+async def test_grant_ignores_other_command_and_key(env, session_env, monkeypatch, key, command):
+    a, client, gw, store, order = env
+    calls = _stub_grant_path(monkeypatch)
+    await _delegated(a, gw, session_env)
+    store.put_grant("K", RM, "once", "u1", "answer-mid")
+    n = len(client.activities)
+    assert (await a._send_exec_approval_prompt(_rerun(key=key, command=command))).success
+    assert calls == []
+    assert [e["body"] for e in _elicitations(client, n)] == [f"Run `{command}`?"]
+    assert store.control("req-2").state == "live"
+    assert _grants(store) == [("K", RM, "once", "u1", "answer-mid")]
+
+
+async def test_grant_refused_falls_back(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    calls = _stub_grant_path(monkeypatch, refusal="Alice")
+    await _delegated(a, gw, session_env)
+    store.put_grant("K", RM, "once", "u1", "answer-mid")
+    n = len(client.activities)
+    assert (await a._send_exec_approval_prompt(_rerun())).success
+    assert [c[0] for c in calls] == ["refusal"]  # never resolved
+    assert len(_elicitations(client, n)) == 1
+    assert store.control("req-2").state == "live"
+    assert _grants(store) == []  # one use, even when refused
+
+
+async def test_grant_resolve_fails_falls_back(env, session_env, monkeypatch):
+    """Task 1 concern 2: the resolve returns 0 (the actor is not this turn's requester)."""
+    a, client, gw, store, order = env
+    calls = _stub_grant_path(monkeypatch, resolved=0)
+    await _delegated(a, gw, session_env)
+    store.put_grant("K", RM, "once", "u1", "answer-mid")
+    n = len(client.activities)
+    assert (await a._send_exec_approval_prompt(_rerun())).success
+    assert [c[0] for c in calls] == ["refusal", "resolve"]
+    assert len(_elicitations(client, n)) == 1
+    assert store.control("req-2").state == "live"
+    assert _grants(store) == []
+
+
+async def test_grant_kept_on_deny_only_card(env, session_env, monkeypatch):
+    """Task 1 concern 1: the Deny-only mark stayed (truncated command), so "once" is not
+    offered; the grant is not consumed and the normal (deny-only) select is posted."""
+    a, client, gw, store, order = env
+    calls = _stub_grant_path(monkeypatch)
+    await _delegated(a, gw, session_env)
+    store.put_grant("K", RM, "once", "u1", "answer-mid")
+    n = len(client.activities)
+    prompt = dataclasses.replace(_rerun(), actions=[("Deny", "deny", "danger")])
+    assert (await a._send_exec_approval_prompt(prompt)).success
+    assert calls == []
+    assert len(_elicitations(client, n)) == 1
+    assert client.activities[-1][4]["options"][0]["value"] == "deny"
+    assert _grants(store) == [("K", RM, "once", "u1", "answer-mid")]
+
+
+async def test_grant_dropped_at_turn_end(env, session_env):
+    a, client, gw, store, order = env
+    mid = await _delegated(a, gw, session_env)
+    store.put_grant("K", RM, "once", "u1", "another-turn")
+    store.put_grant("K", "ls", "once", "u1", mid)
+    await complete(a, gw.events[0])  # the turn `mid` ends
+    await settle(a)
+    assert store.take_grant("K", "ls") is None
+    assert _grants(store) == [("K", RM, "once", "u1", "another-turn")]

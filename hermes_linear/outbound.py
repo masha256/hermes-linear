@@ -60,6 +60,7 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.event import ProcessingOutcome
 
 from . import questions, renderer
+from . import sessions_open as sessions_open_mod  # grant path, stubbable in tests
 from .constants import ACK_TIMEOUT_S, FAST_TOOL_SKIP_S, HEARTBEAT_S, TYPING_MIN_INTERVAL_S
 from .router import _session_key as router_session_key  # the chat id a session routes to
 from .turns import STOPPED_TEXT, Key, Turn
@@ -417,6 +418,8 @@ class Outbound:
             return
         key, turn = found
         mid, sid = turn.mid, turn.decision.agent_session_id
+        if self.a._store is not None:
+            self.a._store.drop_grants_for_turn(mid)  # §7: only this turn's own grants
         self.stop_heartbeat(mid)
         self._live_controls(sid)  # forget controls this (now finished) turn abandoned
         stop_ids = self._retire_stops(sid)
@@ -549,6 +552,8 @@ class Outbound:
             return SendResult(success=False, error=NO_SESSION)
         choices = [c for c in _APPROVAL_CHOICES if c in prompt.choices]  # Q8: keep narrowing
         rid = str(prompt.request_id)
+        if self._use_grant(prompt, rid):
+            return SendResult(success=True, message_id=f"approval:{rid}")  # no row, no post
         self._put_control(rid, "approval", target, choices, prompt.session_key,
                           question=prompt.text, command=prompt.command)
         ok = await self._elicit(target.sid, "approval", prompt.text, choices)
@@ -556,6 +561,32 @@ class Outbound:
             self._drop_control(rid)
             return SendResult(success=False, error="linear write failed")
         return SendResult(success=True, message_id=f"approval:{rid}")
+
+    def _use_grant(self, prompt: Any, rid: str) -> bool:
+        """Spec §7: the re-run of a command approved while pending resolves at once with the
+        stored one-use grant. Exact ``(session_key, command)`` match only. A grant whose choice
+        the card does not offer (Deny-only mark kept) stays unused; a refused or failed
+        resolve falls back to the normal prompt (the grant is spent)."""
+        store = self.a._store
+        if store is None or not prompt.command:
+            return False
+        key, command = str(prompt.session_key), str(prompt.command)
+        grant = store.take_grant(key, command, offered=list(prompt.choices))
+        if grant is None:
+            return False
+        choice, actor = grant
+        if sessions_open_mod._approval_refusal(key, actor, request_id=rid) is not None:
+            log.info("linear: approval grant for %s refused, asking again", rid)
+            return False
+        try:
+            resolved = sessions_open_mod._resolve_approval_card(key, choice, rid, actor_id=actor)
+        except Exception:
+            log.exception("linear: approval grant for %s failed, asking again", rid)
+            return False
+        if not resolved:
+            log.info("linear: approval grant for %s not accepted, asking again", rid)
+            return False
+        return True
 
     async def clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
                       session_key: str, metadata: Optional[dict]) -> SendResult:
