@@ -19,7 +19,14 @@ The gateway loads the plugin from one dedicated worktree:
 ~/.hermes/profiles/<profile>/plugins/linear -> ~/git/hermes-linear/.worktrees/live
 ```
 
-The symlink never changes. Deploying means moving the live worktree's HEAD:
+The symlink never changes. Hermes keys the plugin's dependency environment on the
+resolved plugin path; repointing it forces a re-stage, and a failed re-stage makes
+Hermes auto-disable the plugin (`plugins.disabled_by_update` in `config.yaml`) so the
+next restart comes up without Linear. If you ever must repoint it, run
+`hermes -p <profile> plugins enable linear` right after and check `hermes linear status`
+before restarting.
+
+Deploying means moving the live worktree's HEAD:
 
 ```bash
 scripts/deploy-live <branch|sha> [<branch|sha> ...]
