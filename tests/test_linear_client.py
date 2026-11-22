@@ -570,14 +570,17 @@ async def test_client_team_labels_pages(fake, client):
     assert [c.variables["after"] for c in fake.gql_calls("TeamLabels")] == [None, "cur-1"]
 
 
-async def test_client_viewer_teams_pages(fake, client):
-    fake.on("ViewerTeams",
-            {"data": {"viewer": {"teams": _page([{"id": "t1", "key": "ENG", "name": "Eng"}],
-                                                "cur-1")}}},
-            {"data": {"viewer": {"teams": _page([{"id": "t2", "key": "OPS", "name": "Ops"}])}}})
-    assert await client.viewer_teams() == [{"id": "t1", "key": "ENG", "name": "Eng"},
-                                           {"id": "t2", "key": "OPS", "name": "Ops"}]
-    assert [c.variables["after"] for c in fake.gql_calls("ViewerTeams")] == [None, "cur-1"]
+async def test_client_teams_pages_workspace_connection(fake, client):
+    # The app user is not a team member: viewer.teams is empty in production (P11),
+    # so teams come from the root `teams` connection.
+    fake.on("Teams",
+            {"data": {"teams": _page([{"id": "t1", "key": "ENG", "name": "Eng"}], "cur-1")}},
+            {"data": {"teams": _page([{"id": "t2", "key": "RET", "name": "Ret"}])}})
+    assert await client.teams() == [{"id": "t1", "key": "ENG", "name": "Eng"},
+                                    {"id": "t2", "key": "RET", "name": "Ret"}]
+    calls = fake.gql_calls("Teams")
+    assert [c.variables["after"] for c in calls] == [None, "cur-1"]
+    assert "viewer" not in calls[0].json["query"]
 
 
 async def test_client_paging_stops_at_cap(fake, client):

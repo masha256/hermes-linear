@@ -280,16 +280,16 @@ class FakeClient:
         self.expires_in = expires_in
         self.token_expires_at = None
         self.closed = False
-        self.teams = teams if teams is not None else [
+        self._teams = teams if teams is not None else [
             {"id": "t1", "key": "ENG", "name": "Engineering"}]
         self.labels = labels if labels is not None else {
             "t1": [{"id": "l1", "name": "Blocked"}]}
         self.labels_fail = labels_fail
 
-    async def viewer_teams(self):
+    async def teams(self):  # root `teams` connection: the workspace teams the app can see
         if self.labels_fail:
             raise self.labels_fail
-        return list(self.teams)
+        return list(self._teams)
 
     async def team_labels(self, team_id):
         if self.closed:
@@ -477,7 +477,16 @@ def test_setup_warns_missing_blocked_label():
 def test_setup_no_blocked_warning_when_every_team_has_it():
     h = Harness(answers=["", CLIENT_ID, UUID_A], hidden=[CLIENT_SECRET, WEBHOOK_SECRET])
     assert run_setup(h) == 0
-    assert "has no \"Blocked\" label" not in h.text
+    assert "Blocked" not in h.text  # neither a missing-label nor an error/skip line
+
+
+def test_setup_reports_when_no_teams_visible():
+    h = Harness(answers=["", CLIENT_ID, UUID_A], hidden=[CLIENT_SECRET, WEBHOOK_SECRET],
+                client=FakeClient(teams=[]))
+    assert run_setup(h) == 0
+    assert "No Linear teams visible to the app; skipped the Blocked label check." in h.lines
+    assert [ln for ln in h.lines if "Blocked" in ln] == [
+        "No Linear teams visible to the app; skipped the Blocked label check."]
 
 
 def test_setup_blocked_label_check_error_is_advisory():

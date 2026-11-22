@@ -136,14 +136,16 @@ QUERY_TEAM_STATES = """query TeamStates($teamId: String!) {
   team(id: $teamId) { states(first: 250) { nodes { id name type position } } }
 }"""
 
-# Team labels plus workspace labels (no team); group labels cannot be applied. Paged.
-QUERY_VIEWER_TEAMS = """query ViewerTeams($after: String) {
-  viewer { teams(first: 250, after: $after) {
+# Workspace teams visible to the app (root connection; the app user is usually not a
+# team member, so viewer.teams is empty). Paged.
+QUERY_TEAMS = """query Teams($after: String) {
+  teams(first: 250, after: $after) {
     nodes { id key name }
     pageInfo { hasNextPage endCursor }
-  } }
+  }
 }"""
 
+# Team labels plus workspace labels (no team); group labels cannot be applied. Paged.
 QUERY_TEAM_LABELS = """query TeamLabels($teamId: ID!, $after: String) {
   issueLabels(first: 250, after: $after,
               filter: { or: [{ team: { id: { eq: $teamId } } }, { team: { null: true } }] }) {
@@ -536,10 +538,9 @@ class LinearClient:
                 for s in nodes]
         return [dict(s) for s in self._team_states[team_id]]
 
-    async def viewer_teams(self) -> list[dict]:
-        """``[{id, key, name}]``: the teams the app user belongs to."""
-        nodes = await self._paged(QUERY_VIEWER_TEAMS, {},
-                                  lambda d: (d.get("viewer") or {}).get("teams"))
+    async def teams(self) -> list[dict]:
+        """``[{id, key, name}]``: the workspace's teams visible to the app."""
+        nodes = await self._paged(QUERY_TEAMS, {}, lambda d: d.get("teams"))
         return [{"id": t["id"], "key": t.get("key") or "", "name": t.get("name") or ""}
                 for t in nodes]
 

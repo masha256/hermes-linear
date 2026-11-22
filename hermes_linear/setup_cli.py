@@ -148,10 +148,14 @@ async def _check_app(client) -> dict:
 BLOCKED_LABEL = "Blocked"
 
 
-async def _missing_blocked(client) -> list[str]:
-    """Keys of the viewer's teams with no ``Blocked`` label (team or workspace, any case)."""
+async def _missing_blocked(client) -> list[str] | None:
+    """Keys of the workspace teams (visible to the app) with no ``Blocked`` label (team or
+    workspace label, any case); ``None`` when no team is visible."""
+    teams = await client.teams()
+    if not teams:
+        return None
     missing: list[str] = []
-    for team in await client.viewer_teams():
+    for team in teams:
         labels = await client.team_labels(team["id"])
         if not any((lb.get("name") or "").strip().casefold() == BLOCKED_LABEL.casefold()
                    for lb in labels):
@@ -159,13 +163,13 @@ async def _missing_blocked(client) -> list[str]:
     return missing
 
 
-async def _check_setup(client) -> tuple[dict, list[str] | BaseException]:
+async def _check_setup(client) -> tuple[dict, list[str] | None | BaseException]:
     """Token + viewer (raises on failure), then the advisory label check (error returned)."""
     try:
         await client.token()
         viewer = await client.viewer()
         try:
-            missing: list[str] | BaseException = await _missing_blocked(client)
+            missing: list[str] | None | BaseException = await _missing_blocked(client)
         except Exception as exc:  # noqa: BLE001 - advisory only
             missing = exc
         return viewer, missing
@@ -271,6 +275,8 @@ def interactive_setup(ctx: Any = None, *, env: CliEnv | None = None) -> int:
     out(f"✓ App user: {_viewer_text(viewer)}")
     if isinstance(missing, BaseException):
         out(f"⚠ Could not check team labels for \"{BLOCKED_LABEL}\": {_err_text(missing)}")
+    elif missing is None:
+        out(f"No Linear teams visible to the app; skipped the {BLOCKED_LABEL} label check.")
     else:
         for key in missing:
             out(f"Team {key} has no \"{BLOCKED_LABEL}\" label — create it in Linear "
