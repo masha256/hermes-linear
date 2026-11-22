@@ -41,14 +41,14 @@ happens in Linear:
 | D5 | IDs link both ways. Spec and plan headers carry `Linear: <ID>`; each `### Task N` heading carries `— <sub-ticket ID>`; the SDD ledger names both. |
 | D6 | Approval gates are Linear select prompts (Approve / Request changes; execution method). |
 | D7 | Activation: the phrase "manage with hermes-linear" loads the skill. The skill commits `.hermes-linear.yaml`, and later sessions on that repo load the skill from the file. |
-| D8 | Git: one branch per sub-project, named after its ticket (`ret-72-listener-split`), worked in a worktree. One PR at the end; commit messages carry the sub-ticket ID. |
+| D8 | Git: one branch per sub-project, named after its ticket (e.g. `ret-95-secret-reload`), worked in a worktree. One PR at the end; commit messages carry the sub-ticket ID. |
 | D9 | Each sub-ticket moves In Progress → In Review → Done and gets a summary comment when Done. A task waiting on the user gets the **Blocked** label; the question is asked in the project ticket's thread. |
 | D10 | Build approach: a skill decides *when*, and tested plugin tools do the Linear writes. Re-running a tool is safe. |
 | D11 | Milestone 1 covers a single sub-project. Large projects, repo lookup from the project link, and BMAD are milestone 2 (§9). |
 
 ## 3. End-to-end flow (milestone 1)
 
-1. **Kickoff.** The user creates a ticket in a Linear project, e.g. "Listener split".
+1. **Kickoff.** The user creates a ticket in a Linear project, e.g. "Reload the webhook secret".
    The ticket contains "manage with hermes-linear" and is delegated to the app. The
    plugin opens one Hermes session for the ticket.
 2. **Setup.** The agent loads `linear:manage-superpowers`. If the repo has no
@@ -171,7 +171,7 @@ Committed at the repo root during first setup:
 framework: superpowers        # bmad in milestone 2
 linear:
   team: RET
-  project: Valkyrie
+  project: hermes linear test project
 repo: https://github.com/masha256/hermes-linear   # M1 stand-in; M2 reads the project link
 ```
 
@@ -186,8 +186,10 @@ the spec, plan and ledger headers, so the marker never changes as work progresse
   never presents an unsynced spec or plan for approval; instead it asks "Linear sync
   failed (<code>); retry now or approve from the file link?"
 - **Webhooks stop arriving.** The agent cannot detect this; the user sees no reply.
-  Two mitigations: the listener split (§8 dogfood), and `hermes linear status`
-  showing the time of the last real event. Nothing is corrupted. Work resumes on the
+  Mitigation: `hermes linear status` shows the time of the last real Linear event.
+  (The M1 outage this guarded against was a listener dedup bug keyed on the
+  constant payload `webhookId`, fixed in `c92dbde`; Linear does not pause
+  deliveries across gateway restarts.) Nothing is corrupted. Work resumes on the
   next delivered prompt.
 - **Manual edits in Linear.**
   - *Description:* overwritten on the next sync; the footer says so.
@@ -246,10 +248,10 @@ The probe tickets (RET-70…72) were canceled.
 - The skill: `hermes plugins validate` and a frontmatter check. Its behaviour is
   tested by the dogfood run.
 
-### Milestone 1 exit: dogfood the listener split end to end
+### Milestone 1 exit: dogfood end to end in the test project
 
-1. A "Listener split" ticket in Valkyrie, containing "manage with hermes-linear", is
-   delegated to the app. The setup questions are answered and
+1. A ticket for a small real change, in the Linear project "hermes linear test
+   project" and containing "manage with hermes-linear", is delegated to the app. The setup questions are answered and
    `.hermes-linear.yaml` is committed.
 2. The brainstorm happens in the ticket thread. Every multiple-choice question and
    approval is a select.
@@ -262,8 +264,8 @@ The probe tickets (RET-70…72) were canceled.
 6. A PR is opened and the ticket is In Review.
 7. Running `linear_sync_plan` again afterwards changes nothing.
 
-Until the listener split ships, gateway restarts may pause Linear's webhook
-deliveries. The dogfood accepts this and re-enables the webhook by hand.
+All dogfooding happens in "hermes linear test project"; the "hermes-linear"
+project (formerly Valkyrie) tracks the plugin's own development.
 
 ## 9. Milestone 2 (outline, not designed)
 
@@ -307,7 +309,7 @@ brainstorm.
 
 ## 11. Tracking
 
-Top-level ticket: **RET-73** (Linear project Valkyrie). Its sub-tickets, in build
+Top-level ticket: **RET-73** (Linear project hermes-linear, formerly Valkyrie). Its sub-tickets, in build
 order:
 
 | Ticket | Work item | Spec |

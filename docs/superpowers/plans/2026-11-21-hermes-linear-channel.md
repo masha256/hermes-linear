@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md` (read it first; section refs below are `§n`).
 
-**Tracking:** Linear project *Valkyrie*. One issue per task (named in each task heading, titled `T<n> · <task>`); milestone exit is RET-60. Move an issue to In Progress when its task starts and Done when its commit lands.
+**Tracking:** Linear project *hermes-linear* (formerly Valkyrie). One issue per task (named in each task heading, titled `T<n> · <task>`); milestone exit is RET-60. Move an issue to In Progress when its task starts and Done when its commit lands.
 
 ## Global Constraints
 

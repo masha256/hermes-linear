@@ -57,7 +57,7 @@ Every tool is safe to re-run.
    project link labelled `repo` (the tools cannot edit projects).
 4. Find a local clone whose `origin` matches (the workspace, then `~/git/*`). If none,
    clone it into `~/git/<name>`.
-5. Branch `<identifier lowercase>-<slug>` (e.g. `ret-72-listener-split`), worked in
+5. Branch `<identifier lowercase>-<slug>` (e.g. `ret-95-secret-reload`), worked in
    `.worktrees/<branch>`; load `superpowers:using-git-worktrees` for the mechanics.
 6. Commit `.hermes-linear.yaml` at the repo root with real values:
 

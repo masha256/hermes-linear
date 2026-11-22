@@ -198,4 +198,4 @@ Use `hermes -p <profile> linear …` for other profiles.
 
 ## Development
 
-Design spec: [`docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md`](docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md). Work is tracked in the Linear project **Valkyrie**.
+Design spec: [`docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md`](docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md). Work is tracked in the Linear project **hermes-linear** (formerly Valkyrie); dogfooding happens in **hermes linear test project**.
