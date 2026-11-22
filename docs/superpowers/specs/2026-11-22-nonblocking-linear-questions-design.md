@@ -95,7 +95,8 @@ session id; a row's ticket comes from `sessions.issue_id`), with
 `set_open_task(issue_id, task_id, open: bool)` and `open_tasks(issue_id) -> list[str]`.
 
 New table `approval_grants(session_key TEXT, command TEXT, choice TEXT, actor_id TEXT,
-created_at REAL, PRIMARY KEY (session_key, command))`. One use per row.
+turn_mid TEXT, created_at REAL, PRIMARY KEY (session_key, command))`. One use per row;
+`turn_mid` is the answer turn, whose end drops the grant.
 
 ### 2. Switch to pending (`outbound.py`)
 
@@ -178,7 +179,8 @@ consume it (delete), run `approval_refusal(session_key, grant.actor_id, request_
 on no refusal call `resolve_gateway_approval_card(session_key, grant.choice, rid,
 actor_id=grant.actor_id)`. No select is posted. If the resolve fails, fall through to a
 normal prompt. A command that differs in any byte gets a normal prompt. Grants left unused are
-deleted when the answer turn ends (`turn_finished` for that session key), so a grant never
+deleted when the answer turn ends (`turn_finished` for that turn's message id, not for any other
+turn of the shared ticket session), so a grant never
 outlives the turn it was made for.
 
 **Feasibility gate (plan task 1):** a unit test against the real `tools.approval` must show

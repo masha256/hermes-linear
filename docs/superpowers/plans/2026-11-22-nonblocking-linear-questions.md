@@ -95,9 +95,10 @@ the re-run's `approval_prompt`.
   - `controls_for_session_key(session_key: str) -> list[ControlRow]` (newest first)
   - `controls_for_issue(issue_id: str) -> list[ControlRow]` (joined through `sessions.issue_id`)
   - `set_open_task(issue_id: str, task_id: str, open: bool) -> None`; `open_tasks(issue_id: str) -> list[str]`
-  - `put_grant(session_key: str, command: str, choice: str, actor_id: str) -> None` (replaces);
+  - `put_grant(session_key: str, command: str, choice: str, actor_id: str, turn_mid: str) -> None`
+    (replaces; `turn_mid` is the answer turn's message id, a column of `approval_grants`);
     `take_grant(session_key: str, command: str) -> tuple[str, str] | None` (choice, actor_id;
-    deletes the row); `drop_grants(session_key: str) -> None`
+    deletes the row); `drop_grants_for_turn(turn_mid: str) -> None`
 
 - [ ] **Step 1: Failing tests.**
   - `test_migrates_old_pending_controls`: a db created with the old `pending_controls` DDL (no
@@ -107,8 +108,9 @@ the re-run's `approval_prompt`.
     only the other one; `mark_control_pending("gone", None)` is False.
   - `test_controls_for_issue_and_key`.
   - `test_open_tasks_set_and_clear`: set A and B, clear A → `["B"]`; idempotent.
-  - `test_grant_is_one_use`: `put_grant` → `take_grant` returns `("once", "u1")` → second
-    `take_grant` is None; `drop_grants` clears all for the key only.
+  - `test_grant_is_one_use`: `put_grant("K", "c", "once", "u1", "m1")` → `take_grant("K", "c")`
+    returns `("once", "u1")` → a second `take_grant` is None; `drop_grants_for_turn("m1")` clears
+    only that turn's grants.
 - [ ] **Step 2:** run, expect FAIL.
 - [ ] **Step 3: Implement.** Use `ALTER TABLE … ADD COLUMN` guarded by `PRAGMA table_info`, as
   for `session_key`. New tables go in `_SCHEMA` with `CREATE TABLE IF NOT EXISTS`. All writes go
@@ -278,7 +280,7 @@ the re-run's `approval_prompt`.
 - Produces:
   - `SessionOpener.answer_pending(d: ResolveControl, row: ControlRow) -> None`: clarify →
     `StartTurn` with text `f"{turn_header(ident, root_comment_id, user_name)}\n\nAnswer to \"{row.question}\": {d.answer}"`.
-    The approval branches are as in spec §6 (grant via `store.put_grant`; refusal keeps the row;
+    The approval branches are as in spec §6 (grant via `store.put_grant(…, turn_mid=<the answer turn's mid: router.message_id(sid, activity_id)>)`; refusal keeps the row;
     an unparseable answer re-asks). Each branch drops the row and spawns
     `set_blocked(row.ticket_id, False)` when `ticket_id` is set. `ResolveControl` needs
     `user_name`: add `user_name: str | None = None` to it and set it in the router.
@@ -322,15 +324,16 @@ the re-run's `approval_prompt`.
 - Test: `tests/test_pending_questions.py`
 
 **Interfaces:**
-- Consumes: `Store.take_grant`, `Store.drop_grants`, `sessions_open._approval_refusal`,
+- Consumes: `Store.take_grant`, `Store.drop_grants_for_turn`, `sessions_open._approval_refusal`,
   `sessions_open._resolve_approval_card` (module-level, stubbable).
 - Produces: in `approval_prompt`, before `_put_control`:
   `grant = store.take_grant(prompt.session_key, prompt.command)`. With a grant, and
   `_approval_refusal(session_key, actor, request_id=rid)` returning None, and
   `_resolve_approval_card(session_key, choice, rid, actor_id=actor)` returning truthy: return
   `SendResult(success=True, message_id=f"approval:{rid}")` without posting. Otherwise continue
-  with the normal prompt. `turn_finished` calls `store.drop_grants(turn.session_key)` when the
-  turn has a session key.
+  with the normal prompt. `turn_finished` calls `store.drop_grants_for_turn(turn.mid)`: only the
+  answer turn's own end drops its grant, never another turn of the shared ticket session that
+  happened to be in flight.
 
 - [ ] **Step 1: Failing tests** (Review Focus 4).
   - `test_grant_auto_approves_exact_rerun`: grant `("K", "rm -rf build", "once", "u1")`; an
@@ -339,7 +342,8 @@ the re-run's `approval_prompt`.
   - `test_grant_ignores_other_command_and_key`: `rm -rf build2`, or key `K2` → a normal
     elicitation, and the grant stays.
   - `test_grant_refused_falls_back`: the refusal stub returns a name → a normal elicitation.
-  - `test_grant_dropped_at_turn_end`: `turn_finished` → `take_grant` is None.
+  - `test_grant_dropped_at_turn_end`: `turn_finished` of the answer turn → `take_grant` is None;
+    `turn_finished` of another turn on the same session key leaves the grant.
 - [ ] **Step 2:** run, expect FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4:** the new tests, Task 1's test and the full suite: PASS.
