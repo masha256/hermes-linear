@@ -290,3 +290,125 @@ def test_control_session_key_migrates_old_db(tmp_path):
     s.put_control("R1", "approval", "S1", 1, [], session_key="sk")
     assert s.control_for_session("S1").session_key == "sk"
     s.close()
+
+
+# --------------------------------------------- pending questions (RET-94 T2)
+
+
+def test_migrates_old_pending_controls(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE pending_controls (request_id TEXT PRIMARY KEY, kind TEXT NOT NULL, "
+        "agent_session_id TEXT NOT NULL, execution_generation INTEGER NOT NULL, "
+        "choices TEXT NOT NULL, created_at REAL NOT NULL, session_key TEXT)")
+    conn.execute(
+        "INSERT INTO pending_controls VALUES ('R1', 'clarify', 'S1', 1, '[]', 1.0, 'sk')")
+    conn.commit()
+    conn.close()
+    s = Store.open(path)
+    c = s.control("R1")
+    assert c is not None
+    assert c.state == "live"
+    assert c.question is None and c.command is None
+    assert c.ticket_id is None and c.turn_mid is None
+    assert c.authority is None
+    assert c.session_key == "sk"
+    s.close()
+
+
+def test_put_control_new_fields_roundtrip(store):
+    store.put_control("R1", "clarify", "S1", 1, ["a", "b"], session_key="K",
+                      question="Which?", turn_mid="m1")
+    store.put_control("R2", "approval", "S1", 1, ["once"], command="make deploy")
+    c1, c2 = store.control("R1"), store.control("R2")
+    assert (c1.state, c1.question, c1.command, c1.turn_mid) == ("live", "Which?", None, "m1")
+    assert (c2.state, c2.question, c2.command, c2.turn_mid) == ("live", None, "make deploy", None)
+
+
+def test_put_control_authority_roundtrip(store):
+    """Final review 1: the approval's asking-time authority is kept as JSON, survives the
+    switch to pending, and is absent (None) when not captured."""
+    auth = {"request_id": "R1", "requester_id": "u1", "requester_name": "Alice",
+            "approvers": ["u2"], "chat_type": "dm"}
+    store.put_control("R1", "approval", "S1", 1, ["once"], command="ls", authority=auth)
+    store.put_control("R2", "approval", "S1", 1, ["once"], command="ls")
+    assert store.control("R1").authority == auth
+    assert store.control("R2").authority is None
+    assert store.mark_control_pending("R1", "ISSUE") is True
+    assert store.control("R1").authority == auth
+
+
+def test_mark_pending_and_queries(store):
+    store.put_control("R1", "clarify", "S1", 1, [], question="q1")
+    store.put_control("R2", "approval", "S2", 1, ["once"], command="ls")
+    assert store.mark_control_pending("R1", "ISSUE") is True
+    c = store.control("R1")
+    assert c.state == "pending" and c.ticket_id == "ISSUE"
+    assert [r.request_id for r in store.live_controls()] == ["R2"]
+    assert store.mark_control_pending("gone", None) is False
+    # put_control always (re)writes a live row
+    store.put_control("R1", "clarify", "S1", 1, [], question="q1")
+    assert store.control("R1").state == "live"
+
+
+def test_controls_for_issue_and_key(store):
+    store.record_session("S1", "I1", None, "delegation")
+    store.record_session("S2", "I1", None, "mention")
+    store.record_session("S3", "I2", None, "mention")
+    store.put_control("R1", "clarify", "S1", 1, [], session_key="K1")
+    store.put_control("R2", "approval", "S2", 1, [], session_key="K1")
+    store.put_control("R3", "clarify", "S3", 1, [], session_key="K2")
+    store.put_control("R4", "clarify", "S-unknown", 1, [], session_key="K3")
+    store.conn.execute("UPDATE pending_controls SET created_at = 10 WHERE request_id = 'R1'")
+    store.conn.execute("UPDATE pending_controls SET created_at = 20 WHERE request_id = 'R2'")
+    store.conn.commit()
+    assert sorted(r.request_id for r in store.controls_for_issue("I1")) == ["R1", "R2"]
+    assert [r.request_id for r in store.controls_for_issue("I2")] == ["R3"]
+    assert store.controls_for_issue("nope") == []
+    assert [r.request_id for r in store.controls_for_session_key("K1")] == ["R2", "R1"]
+    assert [r.request_id for r in store.controls_for_session_key("K3")] == ["R4"]
+    assert store.controls_for_session_key("nope") == []
+
+
+def test_open_tasks_set_and_clear(store):
+    store.set_open_task("I1", "A", True)
+    store.set_open_task("I1", "B", True)
+    store.set_open_task("I1", "B", True)  # idempotent open
+    store.set_open_task("I2", "C", True)
+    assert sorted(store.open_tasks("I1")) == ["A", "B"]
+    store.set_open_task("I1", "A", False)
+    store.set_open_task("I1", "A", False)  # idempotent clear
+    assert store.open_tasks("I1") == ["B"]
+    assert store.open_tasks("I2") == ["C"]
+    assert store.open_tasks("none") == []
+
+
+def test_grant_is_one_use(store):
+    store.put_grant("K", "c", "once", "u1", "m1")
+    assert store.take_grant("K", "c") == ("once", "u1")
+    assert store.take_grant("K", "c") is None
+    store.put_grant("K", "c", "once", "u1", "m1")
+    store.put_grant("K", "c", "always", "u2", "m1")  # replaces
+    store.put_grant("K", "d", "once", "u1", "m2")
+    store.put_grant("K2", "c", "once", "u1", "m1")
+    store.drop_grants_for_turn("m1")
+    assert store.take_grant("K", "c") is None
+    assert store.take_grant("K2", "c") is None
+    assert store.take_grant("K", "d") == ("once", "u1")
+
+
+def test_grant_not_offered_stays(store):
+    store.put_grant("K", "c", "once", "u1", "m1")
+    assert store.take_grant("K", "c", offered=["deny"]) is None
+    assert store.take_grant("K", "c", offered=["once", "deny"]) == ("once", "u1")
+    assert store.take_grant("K", "c") is None
+
+
+def test_drop_all_grants(store):
+    store.put_grant("K", "c", "once", "u1", "m1")
+    store.put_grant("K2", "d", "always", "u2", "m2")
+    store.drop_all_grants()
+    assert store.take_grant("K", "c") is None and store.take_grant("K2", "d") is None
+    store.drop_all_grants()  # idempotent on an empty table

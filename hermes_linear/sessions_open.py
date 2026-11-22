@@ -18,12 +18,12 @@ import logging
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
-from . import renderer
+from . import questions, renderer
 from .constants import ACK_TIMEOUT_S
 from .models import AwaitDelegation, OpenSessionOnComment, ResolveControl, StartTurn
-from .router import ACK_TEXT, DEFAULT_AUTHOR, ticket_chat_id, turn_header
+from .router import ACK_TEXT, DEFAULT_AUTHOR, _session_key, message_id, ticket_chat_id, turn_header
 from .settings import Settings
-from .store import Store
+from .store import ControlRow, Store
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +40,37 @@ _APPROVAL_CHOICES = ("once", "session", "deny")
 def _approval_refusal(session_key: str, actor_id: str, *, request_id: str | None) -> str | None:
     from gateway.approval_actor import approval_refusal
     return approval_refusal(session_key, actor_id, request_id=request_id)
+
+
+def _approval_authority(session_key: str, request_id: str) -> dict | None:
+    """Who may answer approval ``request_id`` (Hermes's entry: requester, approvers, chat type),
+    read while it is still pending in Hermes; None if Hermes has no such entry or fails."""
+    try:
+        from tools.approval import list_gateway_approval_authority
+        for entry in list_gateway_approval_authority(session_key):
+            if entry.get("request_id") == request_id:
+                return dict(entry)
+    except Exception as exc:  # noqa: BLE001 - unknown authority: a pending answer is refused
+        log.warning("linear: approval authority for %s unavailable: %s", request_id,
+                    type(exc).__name__)
+    return None
+
+
+def _may_answer(authority: dict, actor_id: str) -> bool:
+    # The live path's ``approval_refusal`` passes no platform extra / admin ids: same here.
+    from gateway.approval_actor import may_answer
+    return may_answer(authority, actor_id)
+
+
+def _requester_of(authority: dict | None) -> str:
+    """The name ``refusal_text`` words the refusal with (as ``answerable_request_ids`` does);
+    no requester recorded, or no authority at all: the admins/approvers-only wording."""
+    try:
+        from gateway.approval_actor import _NO_REQUESTER as none
+    except ImportError:  # pragma: no cover - older Hermes
+        none = "the requester"
+    a = authority or {}
+    return str(a.get("requester_name") or a.get("requester_id") or none)
 
 
 def _refusal_text(requester: str) -> str:
@@ -68,6 +99,7 @@ class SessionOpener:
         enqueue: Callable[..., Awaitable[None]],
         submit: Callable[[Callable[[], Awaitable[None]]], bool],
         wait_override: Callable[[], Optional[float]],
+        spawn: Callable[[Any], Any] | None = None,
     ) -> None:
         self._store = store
         self._client = client
@@ -76,6 +108,7 @@ class SessionOpener:
         self._enqueue = enqueue  # (StartTurn, *, human) -> enqueue on the turn engine
         self._submit = submit  # run a coroutine factory on the event worker; False if stopped
         self._wait_override = wait_override
+        self._spawn = spawn  # fire-and-forget label writes (never block the event worker)
         self.delegation_timers: dict[str, asyncio.TimerHandle | None] = {}
 
     # ------------------------------------------------------------ delegation timers
@@ -183,6 +216,9 @@ class SessionOpener:
         if row is None or row.request_id != d.request_id:
             log.info("linear: control %s no longer pending", d.request_id)
             return
+        if row.state == "pending":  # the store row is authoritative over ``d.state``
+            await self.answer_pending(d, row)
+            return
         if d.kind == "clarify":
             ok = _resolve_clarify(d.request_id, d.answer)
             store.drop_control(d.request_id)
@@ -208,6 +244,87 @@ class SessionOpener:
         store.drop_control(d.request_id)
         if not resolved:
             await post(sid, renderer.thought(STALE_APPROVAL_TEXT))
+
+    # ------------------------------------------------------------ pending questions
+
+    async def answer_pending(self, d: ResolveControl, row: ControlRow) -> None:
+        """Spec §6: an answer to a pending question drops the row and starts the next turn.
+
+        The row is dropped before the turn is enqueued, so no response of that turn
+        re-posts the answered question (outbound ``_repost_pending``). An approval is checked
+        against the authority captured when it was asked (Hermes no longer has it); its
+        grant is written only once the answer turn is enqueued (the turn engine drops it if
+        that turn never starts)."""
+        store, post = self._store(), self._post_ack
+        assert store is not None
+        sid = d.agent_session_id
+        if row.kind == "clarify":
+            self.drop_pending([row])
+            await self._start_answer_turn(d, f'Answer to "{row.question}": {d.answer}')
+            return
+        allowed = [c for c in _APPROVAL_CHOICES if c in row.choices] or list(_APPROVAL_CHOICES)
+        choice = renderer.parse_approval_answer(d.answer)
+        if choice is None or choice not in allowed:  # re-ask; the question still stands
+            options = [o for o in renderer.approval_options() if o["value"] in allowed]
+            await post(sid, renderer.elicitation(REASK_TEXT), signal="select",
+                       signal_metadata={"options": options})
+            return
+        head = f"Answer to approval for `{row.command}`:"
+        if choice == "deny":
+            self.drop_pending([row])
+            await self._start_answer_turn(d, f"{head} denied")
+            return
+        if row.authority is None or not _may_answer(row.authority, d.actor_id):
+            await post(sid, renderer.thought(_refusal_text(_requester_of(row.authority))))
+            return  # keep the row: someone allowed may still answer
+        grantable = bool(row.session_key and row.command)
+        if not grantable:  # no grant possible: the re-run is simply asked again
+            log.warning("linear: approval %s has no session key or command; no grant",
+                        d.request_id)
+        self.drop_pending([row])
+        if await self._start_answer_turn(d, f"{head} approved ({choice})") and grantable:
+            # After the enqueue (no await in between, so the turn has not run yet); the turn
+            # engine drops it if this turn is freed before hand-off.
+            store.put_grant(row.session_key, row.command, choice, d.actor_id,
+                            message_id(sid, d.activity_id))
+
+    async def _start_answer_turn(self, d: ResolveControl, body: str) -> bool:
+        """Enqueue the answer turn; False (nothing enqueued) without a session or ticket."""
+        store = self._store()
+        assert store is not None
+        sid = d.agent_session_id
+        session = store.session(sid)
+        ticket = store.ticket(session.issue_id) if session is not None else None
+        if session is None or ticket is None:
+            log.warning("linear: answer to %s has no session or ticket; no turn", d.request_id)
+            return False
+        chat_id, thread_id = _session_key(session, ticket)
+        author = d.user_name or DEFAULT_AUTHOR
+        header = turn_header(ticket.identifier or ticket.issue_id, session.root_comment_id, author)
+        await self._enqueue(StartTurn(
+            agent_session_id=sid, activity_id=d.activity_id, issue_id=ticket.issue_id,
+            chat_id=chat_id, thread_id=thread_id, user_id=d.actor_id, user_name=author,
+            text=f"{header}\n\n{body}", first_turn=False, ack=ACK_TEXT,
+        ), human=True)
+        return True
+
+    def drop_pending(self, rows: list[ControlRow]) -> None:
+        """Drop the *pending* rows among ``rows`` and remove their ``Blocked`` label.
+
+        Live rows are left alone (Hermes cancels its own waiters)."""
+        store, client = self._store(), self._client()
+        assert store is not None
+        tickets: list[str] = []
+        for row in rows:
+            if row.state != "pending":
+                continue
+            store.drop_control(row.request_id)
+            if row.ticket_id and row.ticket_id not in tickets:
+                tickets.append(row.ticket_id)
+        if client is None or self._spawn is None:
+            return
+        for ticket_id in tickets:
+            self._spawn(questions.set_blocked(client, ticket_id, False))
 
     # ------------------------------------------------------------ ticket helpers
 

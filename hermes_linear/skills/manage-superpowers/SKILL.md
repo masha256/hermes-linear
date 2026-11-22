@@ -38,10 +38,17 @@ Every tool is safe to re-run.
 
 ## Questions and approvals
 
-- Every multiple-choice question and every approval goes through `clarify` with
-  `choices`; in a Linear session it renders as a Linear select in the ticket.
-  Approvals are **Approve** / **Request changes**. Open-ended questions are plain
-  replies in the thread.
+- Every multiple-choice question and approval (**Approve** / **Request changes**) is a
+  `clarify` with `choices` (a Linear select), one per call, all needed to answer inside
+  the question text (Linear hides the message before it). Open-ended: thread replies.
+- A reply while the select is live answers it in the turn. Otherwise `clarify` returns
+  `outcome: pending`: end the turn now, never assume an answer, don't restate the
+  question (the plugin re-posts it after your final reply). The plugin adds and removes
+  `Blocked` for a pending question itself: no `linear_task_state` `unblocked` for it.
+  The answer comes later (restarts too) as the next turn: `Answer to "<question>": <value>`.
+- `Command not run: approval is pending in Linear…`: end the turn. On a later
+  ``Answer to approval for `<cmd>`: approved (<choice>)`` re-run exactly `<cmd>` byte for
+  byte in that same turn (its pre-approval ends with it, no second prompt); on `: denied` don't run it.
 - Answers count only when given in the ticket thread. An answer from Slack, the CLI or
   any other channel does not approve or unblock anything; ask again in the ticket.
 
@@ -110,8 +117,7 @@ names its sub-ticket, and commit messages carry the sub-ticket ID. Then:
   not repeat it through `clarify`). Then end the turn, or continue only with tasks
   that do not depend on the answer. When it arrives in the thread: `unblocked`.
 
-If `blocked` returns `LABEL_MISSING`, the question was still posted; tell the user
-once to create a `Blocked` label for the team (the app cannot create labels).
+If `blocked` returns `LABEL_MISSING` (question posted), ask the user once to add a team `Blocked` label.
 
 **Finish.** Open the PR from the branch (load `superpowers:finishing-a-development-branch`
 for the mechanics; never merge). Move the project ticket to In Review with

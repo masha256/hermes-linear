@@ -20,8 +20,20 @@ Q8, Q10).
   interrupted by ``/stop``, …) is dropped once nothing is in flight for that session.
 * Typing / heartbeat: spawned ephemeral thoughts, bounded by ``ACK_TIMEOUT_S``; never awaited by
   the caller.
-* Approvals / clarify: ``elicitation`` (+ ``select``) and a ``pending_controls`` row; expiry
-  posts a fixed ``thought`` and drops the row (Q10).
+* Approvals / clarify: ``elicitation`` (+ ``select``) and a ``pending_controls`` row. When
+  Hermes's wait ends unanswered (``retire_clarify``, the approval-timeout ``edit_message``) the
+  live row becomes *pending* (RET-94): nothing is posted and ``Blocked`` is added to the
+  target issue. A plugin-issued stop for the session or a stale generation keeps the expiry:
+  a fixed ``thought`` and the row dropped (Q10). A new elicitation, once posted, drops the
+  session's pending rows and removes their ``Blocked`` (a failed post leaves them standing).
+* Pending elicitation: Linear shows a select input only while the elicitation is the agent
+  session's latest activity. While a control this adapter elicited is pending (row present,
+  its turn in flight), ``_post`` drops every ``thought`` / ``action`` for that session
+  (typing, heartbeat, interim sends, tool actions). Elicitations, errors and responses still
+  post; the expiry thought posts after the row is dropped. Every response of the turn (the
+  first, sent or promoted at turn end, and each ``more`` one: attachments, a late final) would
+  land after a *pending* question and hide its select, so the question is queued again right
+  after each (same row, ``_repost_pending``).
 * Tool events from ``hooks.py`` (already on the loop): start/finish actions with the fast-tool
   skip, todo -> plan, and the session link.
 
@@ -41,14 +53,16 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from collections import deque
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Sequence
 from urllib.parse import unquote, urlparse
 
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import ProcessingOutcome
 
-from . import renderer
+from . import questions, renderer
+from . import sessions_open as sessions_open_mod  # grant path, stubbable in tests
 from .constants import ACK_TIMEOUT_S, FAST_TOOL_SKIP_S, HEARTBEAT_S, TYPING_MIN_INTERVAL_S
+from .router import _session_key as router_session_key  # the chat id a session routes to
 from .turns import STOPPED_TEXT, Key, Turn
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -200,6 +214,7 @@ class Outbound:
         self.retired_stops = _Bounded()  # synthesized stop ids already handled
         self.stop_skipped = _Bounded()  # stopped turn mids whose Stopped. a response replaced
         self.writes = _SessionWrites(lambda coro: self.a._spawn(coro))
+        self.elicited: dict[str, dict[str, str]] = {}  # agent session -> {request id: turn mid}
 
     def reset(self) -> None:
         """Disconnect: cancel timers and forget state (tasks are cancelled by the adapter)."""
@@ -209,6 +224,7 @@ class Outbound:
         self.heartbeats.clear()
         self.last_thought.clear()
         self.typing_at.clear()
+        self.elicited.clear()
         self.writes.reset()
 
     # ------------------------------------------------------------ writers
@@ -219,8 +235,32 @@ class Outbound:
         writer = self.a._activity_writer
         if writer is None:
             return _done(False)
+        if self._suppressed(sid, content):
+            log.debug("linear: %s for session %s dropped (elicitation pending)",
+                      content.get("type"), sid)
+            return _done(True)
         self.typing_at.put(sid, self.clock())
         return self.writes.submit(sid, lambda: writer.post(sid, content, **kw))
+
+    def _suppressed(self, sid: str, content: dict) -> bool:
+        """True while an elicitation of ``sid`` is pending: a thought or action posted now
+        would supersede it and hide Linear's select input (on the loop: store access)."""
+        return content.get("type") in ("thought", "action") and bool(self._live_controls(sid))
+
+    def _live_controls(self, sid: str) -> dict[str, str]:
+        """The controls elicited for ``sid`` that are still pending (row present in either
+        state, ``live`` or ``pending``: not answered, expired or dropped) for a turn still in
+        flight; forgets the rest."""
+        pending = self.elicited.get(sid)
+        if not pending:
+            return {}
+        store = self.a._store
+        for rid, mid in list(pending.items()):
+            if store is None or store.control(rid) is None or self.a.turns.find(mid) is None:
+                del pending[rid]
+        if not pending:
+            del self.elicited[sid]
+        return pending
 
     def _respond(self, sid: str, content: dict, **kw) -> asyncio.Future:
         self.typing_at.put(sid, self.clock())
@@ -311,7 +351,11 @@ class Outbound:
             first = kind == "response"
             if first:
                 self.responded.add(target.mid)
-            ok = await self._shielded_response(target, renderer.response(body), first)
+            fut = self._shielded_response(target, renderer.response(body), first)
+            # Every response of the turn (attachments, a late final): queued now, so the
+            # pending question lands right after it and stays the last activity.
+            self._repost_pending(target.sid)
+            ok = await fut
             kind = "response"
         else:
             if kind == "thought" and target.via == "reply_to_message_id":
@@ -324,13 +368,14 @@ class Outbound:
             return SendResult(success=False, error="linear write failed")
         return SendResult(success=True, message_id=f"{target.sid}:{kind}:{target.mid}")
 
-    async def _shielded_response(self, t: Target, content: dict, first: bool) -> bool:
-        """Write a response; a cancelled caller (``/stop`` during the final send) never
-        unqueues it. If the turn's first response fails, the turn is unanswered again."""
+    def _shielded_response(self, t: Target, content: dict, first: bool) -> Awaitable[bool]:
+        """Queue a response (synchronously); a cancelled caller (``/stop`` during the final
+        send) never unqueues it. If the turn's first response fails, the turn is unanswered
+        again."""
         fut = self._respond(t.sid, content)
         if first:
             fut.add_done_callback(lambda f: self._response_done(f, t))
-        return await asyncio.shield(fut)
+        return asyncio.shield(fut)
 
     def _response_done(self, fut: asyncio.Future, t: Target) -> None:
         if not fut.cancelled() and fut.result():
@@ -373,7 +418,10 @@ class Outbound:
             return
         key, turn = found
         mid, sid = turn.mid, turn.decision.agent_session_id
+        if self.a._store is not None:
+            self.a._store.drop_grants_for_turn(mid)  # §7: only this turn's own grants
         self.stop_heartbeat(mid)
+        self._live_controls(sid)  # forget controls this (now finished) turn abandoned
         stop_ids = self._retire_stops(sid)
         last = self.last_thought.pop(mid, None)
         if stop_ids:
@@ -388,6 +436,7 @@ class Outbound:
             # Q1 caveat: the final send was deduplicated against commentary; promote it.
             self.responded.add(mid)
             self._respond(sid, renderer.response(last))
+            self._repost_pending(sid)
 
     def stop_unsettled(self, turn: Turn) -> None:
         """Q6 safety net: the gateway never completed a stopped turn within STOP_SETTLE_S."""
@@ -445,13 +494,67 @@ class Outbound:
 
     # ------------------------------------------------------------ approvals / clarify
 
-    def _put_control(self, rid: str, kind: str, t: Target, choices: list, session_key: str):
+    def _put_control(self, rid: str, kind: str, t: Target, choices: list, session_key: str,
+                     *, question: str, command: Optional[str] = None,
+                     authority: Optional[dict] = None):
         store = self.a._store
         assert store is not None
         store.put_control(rid, kind, t.sid, _generation(t.key[0]), choices,
-                          session_key=session_key)
+                          session_key=session_key, question=question, command=command,
+                          turn_mid=t.mid, authority=authority)
+        self.elicited.setdefault(t.sid, {})[rid] = t.mid  # gates _post until resolved
+
+    def _elicit(self, sid: str, kind: str, question: str, choices: Sequence[str]
+                ) -> asyncio.Future:
+        """Queue the elicitation of a control (the original post and the re-post): approvals
+        offer ``renderer.approval_options()`` narrowed to ``choices``; a clarify offers its
+        choices, and no select at all when it has none."""
+        if kind == "approval":
+            options = [o for o in renderer.approval_options() if o["value"] in choices]
+        else:
+            options = [{"label": v, "value": v} for v in choices]
+        kw: dict[str, Any] = {}
+        if kind == "approval" or options:
+            kw = {"signal": "select", "signal_metadata": {"options": options}}
+        return self._post(sid, renderer.elicitation(question), timeout_s=ACK_TIMEOUT_S, **kw)
+
+    def _repost_pending(self, sid: str) -> None:
+        """Spec §5: right after each response of the turn is queued, queue the session's
+        pending question again (same row and request id) so it is the last activity and
+        Linear keeps showing its select. A live row is never re-posted. Never raises: the
+        response is already queued, and a raised ``send`` would invite a second final."""
+        try:
+            store = self.a._store
+            row = store.control_for_session(sid) if store is not None else None
+            if row is None or row.state != "pending":
+                return
+            log.info("linear: re-posting pending %s %s after the response", row.kind,
+                     row.request_id)
+            self._elicit(sid, row.kind, row.question or "", row.choices)
+        except Exception as exc:  # noqa: BLE001 - store error; the response stands
+            log.warning("linear: re-posting the pending question of %s failed: %s", sid,
+                        type(exc).__name__)
+
+    def _replace_pending(self, sid: str, rid: str) -> None:
+        """A new question ``rid`` of ``sid`` was posted: it replaces the session's pending
+        ones. Called only after a successful post (a failed one leaves them standing). Their
+        rows are dropped and their ``Blocked`` removed; the new question adds it again if it
+        goes pending (final review 3)."""
+        store = self.a._store
+        session = store.session(sid) if store is not None else None
+        if session is None:
+            return
+        rows = [r for r in store.controls_for_issue(session.issue_id)
+                if r.agent_session_id == sid and r.state == "pending" and r.request_id != rid]
+        for row in rows:
+            for pending in self.elicited.values():
+                pending.pop(row.request_id, None)
+        if rows:
+            self.a.opener.drop_pending(rows)
 
     def _drop_control(self, rid: str) -> None:
+        for pending in self.elicited.values():
+            pending.pop(rid, None)
         if self.a._store is not None:
             self.a._store.drop_control(rid)
 
@@ -461,15 +564,46 @@ class Outbound:
             log.warning("linear: approval prompt dropped (no linear session or request id)")
             return SendResult(success=False, error=NO_SESSION)
         choices = [c for c in _APPROVAL_CHOICES if c in prompt.choices]  # Q8: keep narrowing
-        options = [o for o in renderer.approval_options() if o["value"] in choices]
         rid = str(prompt.request_id)
-        self._put_control(rid, "approval", target, choices, prompt.session_key)
-        ok = await self._post(target.sid, renderer.elicitation(prompt.text), signal="select",
-                              signal_metadata={"options": options}, timeout_s=ACK_TIMEOUT_S)
+        if self._use_grant(prompt, rid):
+            return SendResult(success=True, message_id=f"approval:{rid}")  # no row, no post
+        # Who may answer, read now while Hermes still holds the entry (it is queued before
+        # notify): a pending answer comes after Hermes timed it out and forgot it.
+        authority = sessions_open_mod._approval_authority(str(prompt.session_key), rid)
+        self._put_control(rid, "approval", target, choices, prompt.session_key,
+                          question=prompt.text, command=prompt.command, authority=authority)
+        ok = await self._elicit(target.sid, "approval", prompt.text, choices)
         if not ok:
             self._drop_control(rid)
             return SendResult(success=False, error="linear write failed")
+        self._replace_pending(target.sid, rid)
         return SendResult(success=True, message_id=f"approval:{rid}")
+
+    def _use_grant(self, prompt: Any, rid: str) -> bool:
+        """Spec §7: the re-run of a command approved while pending resolves at once with the
+        stored one-use grant. Exact ``(session_key, command)`` match only. A grant whose choice
+        the card does not offer (Deny-only mark kept) stays unused; a refused or failed
+        resolve falls back to the normal prompt (the grant is spent)."""
+        store = self.a._store
+        if store is None or not prompt.command:
+            return False
+        key, command = str(prompt.session_key), str(prompt.command)
+        grant = store.take_grant(key, command, offered=list(prompt.choices))
+        if grant is None:
+            return False
+        choice, actor = grant
+        if sessions_open_mod._approval_refusal(key, actor, request_id=rid) is not None:
+            log.info("linear: approval grant for %s refused, asking again", rid)
+            return False
+        try:
+            resolved = sessions_open_mod._resolve_approval_card(key, choice, rid, actor_id=actor)
+        except Exception:
+            log.exception("linear: approval grant for %s failed, asking again", rid)
+            return False
+        if not resolved:
+            log.info("linear: approval grant for %s not accepted, asking again", rid)
+            return False
+        return True
 
     async def clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
                       session_key: str, metadata: Optional[dict]) -> SendResult:
@@ -478,23 +612,20 @@ class Outbound:
             log.warning("linear: clarify %s dropped, no linear session", clarify_id)
             return SendResult(success=False, error=NO_SESSION)
         values = [str(c) for c in (choices or [])]
-        self._put_control(str(clarify_id), "clarify", target, values, session_key)
-        kw: dict[str, Any] = {}
-        if values:
-            kw = {"signal": "select",
-                  "signal_metadata": {"options": [{"label": v, "value": v} for v in values]}}
-        ok = await self._post(target.sid, renderer.elicitation(str(question)),
-                              timeout_s=ACK_TIMEOUT_S, **kw)
+        self._put_control(str(clarify_id), "clarify", target, values, session_key,
+                          question=str(question))
+        ok = await self._elicit(target.sid, "clarify", str(question), values)
         if not ok:
             self._drop_control(str(clarify_id))
             return SendResult(success=False, error="linear write failed")
+        self._replace_pending(target.sid, str(clarify_id))
         return SendResult(success=True, message_id=f"clarify:{clarify_id}")
 
     async def _expire(self, rid: str, kind: str, text: str) -> bool:
         store = self.a._store
         row = store.control(rid) if store is not None else None
-        if row is None or row.kind != kind:
-            return False  # already answered or dropped
+        if row is None or row.kind != kind or row.state != "live":
+            return False  # already answered, dropped or pending
         self._drop_control(rid)
         await self._post(row.agent_session_id, renderer.thought(text), timeout_s=ACK_TIMEOUT_S)
         return True
@@ -503,11 +634,46 @@ class Outbound:
         """Q10: only the approval-timeout edit; its body is never echoed."""
         if not str(message_id).startswith("approval:"):
             return SendResult(success=False, error="Not supported")
-        await self._expire(str(message_id).split(":", 1)[1], "approval", APPROVAL_EXPIRED_TEXT)
+        rid = str(message_id).split(":", 1)[1]
+        if not await self.defer(rid, "approval"):
+            await self._expire(rid, "approval", APPROVAL_EXPIRED_TEXT)
         return SendResult(success=True, message_id=message_id)
 
     async def retire_clarify(self, clarify_id: str) -> None:
-        await self._expire(str(clarify_id), "clarify", EXPIRED_TEXT)
+        if not await self.defer(str(clarify_id), "clarify"):
+            await self._expire(str(clarify_id), "clarify", EXPIRED_TEXT)
+
+    def _cancelled(self, row: Any) -> bool:
+        """The wait ended because the plugin stopped the session, or the row is stale: its
+        generation is not the one the session's chat id carries now (re-delegation, or a
+        mention thread now routed to the delegated ticket). Such a question must not stay
+        pending."""
+        if row.agent_session_id in self.a.turns.stop_message_ids.values():
+            return True
+        store = self.a._store
+        session = store.session(row.agent_session_id) if store is not None else None
+        ticket = store.ticket(session.issue_id) if session is not None else None
+        if ticket is None:
+            return False
+        # The generation the session's chat id carries now (a mention thread's: none, 0).
+        current = _generation(router_session_key(session, ticket)[0])
+        return row.execution_generation != current
+
+    async def defer(self, rid: str, kind: str) -> bool:
+        """Hermes's wait for ``rid`` ended unanswered: a live, not cancelled row becomes
+        pending (nothing posted) and ``Blocked`` is spawned onto its target. True if deferred."""
+        store = self.a._store
+        row = store.control(rid) if store is not None else None
+        if row is None or row.kind != kind or row.state != "live" or self._cancelled(row):
+            return False
+        ticket = questions.blocked_target(store, row)
+        if not store.mark_control_pending(rid, ticket):
+            return False
+        client = self.a._client
+        if ticket is not None and client is not None:
+            self.a._spawn(questions.set_blocked(client, ticket, True))
+        log.info("linear: %s %s pending (target %s)", kind, rid, ticket)
+        return True
 
     # ------------------------------------------------------------ tool events (hooks.py)
 

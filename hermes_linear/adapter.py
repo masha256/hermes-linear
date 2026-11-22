@@ -29,7 +29,7 @@ from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
 from gateway.platforms.base import BasePlatformAdapter, ExecApprovalPrompt, SendResult
 from gateway.platforms.event import MessageEvent, ProcessingOutcome
 
-from . import renderer
+from . import questions, renderer
 from .access import AccessPolicy, gateway_allow_from
 from .constants import ACK_TIMEOUT_S
 from .linear_client import LinearClient
@@ -51,6 +51,10 @@ PLATFORM = "linear"
 
 #: profile name -> connected adapter (registered on connect, removed on disconnect).
 ADAPTERS: dict[str, "LinearAdapter"] = {}
+# Profiles whose store this process has swept (T9). Hermes waiters live in the process: only
+# the first connect of a process may turn live controls pending; a reconnect (a fresh adapter,
+# same process) would orphan the waiters still running.
+_SWEPT_PROFILES: set[str] = set()
 
 _CONFIG_GETTER: Callable[[str, Any], Any] | None = None
 
@@ -117,7 +121,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             store=lambda: self._store, client=lambda: self._client,
             settings=lambda: self._settings, post_ack=self._post_ack,
             enqueue=self._enqueue_turn, submit=self._submit,
-            wait_override=lambda: self.delegation_wait_s)
+            wait_override=lambda: self.delegation_wait_s, spawn=self._spawn)
         self.outbound = Outbound(self)
 
     last_outcome = property(lambda self: self.turns.last_outcome)
@@ -207,6 +211,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         if self._store is None:
             self._store = Store.open(None)
         store = self._store
+        self._sweep_live_controls()
         self._policy = AccessPolicy(settings.allowed_users, settings.allow_all_users)
         self._allow_from = gateway_allow_from(settings.allowed_users, self._policy.open)
         self._router_ctx = RouterContext(store, str(viewer["id"]), self._allowed,
@@ -242,6 +247,28 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         ADAPTERS[self._profile] = self
         self._mark_connected()
         return True
+
+    def _sweep_live_controls(self) -> None:
+        """Restart sweep (spec §8): the Hermes waiters of an earlier process are gone, so every
+        ``live`` control becomes a ``pending`` question (answered as the next turn) and its
+        target gets ``Blocked``; nothing is posted. Grants are cleared. Once per process."""
+        if self._profile in _SWEPT_PROFILES:
+            return
+        _SWEPT_PROFILES.add(self._profile)
+        store, client = self._store, self._client
+        try:
+            store.drop_all_grants()
+            for row in store.live_controls():
+                if not row.question:  # pre-RET-94 row: cannot be framed as an answer
+                    log.info("linear: dropping live control %s without question at restart",
+                             row.request_id)
+                    store.drop_control(row.request_id)
+                    continue
+                ticket = questions.blocked_target(store, row)
+                if store.mark_control_pending(row.request_id, ticket) and ticket:
+                    self._spawn(questions.set_blocked(client, ticket, True))
+        except Exception as exc:  # noqa: BLE001 - the sweep never fails connect
+            log.warning("linear: restart sweep failed: %s", type(exc).__name__)
 
     def _unregister(self) -> None:
         if self._registered and self._listener is not None:
@@ -431,10 +458,17 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         elif isinstance(d, AddContext):
             store.add_context(list(d.items))
         elif isinstance(d, SetMode):
+            before = store.ticket(d.issue_id)
             store.set_mode(d.issue_id, d.mode, d.generation)  # type: ignore[arg-type]
+            after = store.ticket(d.issue_id)
+            if d.mode == "untouched" or (before is not None and after is not None
+                                         and before.generation != after.generation):
+                self.opener.drop_pending(store.controls_for_issue(d.issue_id))
         elif isinstance(d, ResolveControl):
             await self.opener.resolve_control(d)
         elif isinstance(d, Interrupt):
+            # Drop pending questions first: the stop's own response must not re-post them.
+            self.opener.drop_pending(self._session_controls(d.agent_session_id))
             try:
                 self.turns.interrupt(d.agent_session_id)
             finally:
@@ -451,6 +485,14 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             log.debug("linear: ignored (%s)", d.reason)
         else:  # pragma: no cover - exhaustive over models.Decision
             log.warning("linear: unknown decision %s", type(d).__name__)
+
+    def _session_controls(self, agent_session_id: str) -> list:
+        store = self._store
+        session = store.session(agent_session_id) if store is not None else None
+        if session is None:
+            return []
+        return [r for r in store.controls_for_issue(session.issue_id)
+                if r.agent_session_id == agent_session_id]
 
     # ------------------------------------------------------------ turn engine glue
 

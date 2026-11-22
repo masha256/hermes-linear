@@ -201,6 +201,9 @@ class TurnEngine:
     def close(self) -> None:
         """Disconnect, step 1 (before dispatches are cancelled): stop all releases."""
         self.closing = True
+        for queue in self.queues.values():
+            for turn in queue:
+                self._drop_grants(turn)  # dropped unstarted
         self.queues.clear()
 
     def reset(self) -> None:
@@ -253,7 +256,20 @@ class TurnEngine:
             return
         del self.inflight[key]
         turn.disarm()
+        if not turn.handed_off:  # it never ran: an approval grant for it must not outlive it
+            self._drop_grants(turn)
         asyncio.get_running_loop().call_soon(self._release_next, key)
+
+    def _drop_grants(self, turn: Turn) -> None:
+        """RET-94 §7: drop the approval grants written for ``turn`` (its answer turn's mid)
+        when it is freed without running; ``outbound.turn_finished`` covers turns that ran."""
+        store = self._store()
+        if store is None:
+            return
+        try:
+            store.drop_grants_for_turn(turn.mid)
+        except Exception as exc:  # noqa: BLE001 - never wedge the FIFO
+            log.warning("linear: dropping grants of %s failed: %s", turn.mid, type(exc).__name__)
 
     # ------------------------------------------------------------ dispatch
 
@@ -437,6 +453,9 @@ class TurnEngine:
         """Drop the session's queued turns; stop its in-flight turn. Never awaits Linear."""
         for key in list(self.queues):
             queue = self.queues[key]
+            for t in queue:
+                if t.decision.agent_session_id == agent_session_id:
+                    self._drop_grants(t)  # dropped unstarted
             keep = deque(t for t in queue if t.decision.agent_session_id != agent_session_id)
             if keep:
                 self.queues[key] = keep

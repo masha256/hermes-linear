@@ -875,6 +875,14 @@ async def _blocked_label(ctx: ToolContext, team: str) -> str | None:
                  if (lb.get("name") or "").casefold() == want and lb.get("id")), None)
 
 
+def _track_open_task(ctx: ToolContext, task_id: str, open_: bool) -> None:
+    """Record (RET-94) whether ``task_id`` is an open task of the session ticket; called
+    only after the transition's Linear writes succeeded. No adapter or store: skipped."""
+    store = getattr(ctx.adapter, "_store", None)  # None adapter: None
+    if store is not None and ctx.session_issue_id:
+        store.set_open_task(ctx.session_issue_id, task_id, open_)
+
+
 async def _task_state(ctx: ToolContext, a: dict) -> dict:
     client, state = ctx.client, a["state"]
     task = await _writable(ctx, a["id"])
@@ -897,6 +905,7 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
         if target["id"] != current.get("id"):
             await client.issue_update(task["id"], {"stateId": target["id"]})
         out["state"] = target.get("name")
+        _track_open_task(ctx, task["id"], state != "done")
         return out
 
     label = await _blocked_label(ctx, team)
@@ -906,6 +915,7 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
             out["label_missing"] = True
         elif carried:
             await client.issue_update(task["id"], {"removedLabelIds": [label]})
+        _track_open_task(ctx, task["id"], True)  # ruling R12: work resumes, the task is open
         return out  # nothing to remove: zero writes
 
     # blocked: the question goes to the project ticket (the session issue), scope-checked
@@ -915,6 +925,7 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
         await client.issue_update(task["id"], {"addedLabelIds": [label]})
     await client.comment_create(
         project["id"], f"**{task.get('identifier')} needs input:** {a['question']}")
+    _track_open_task(ctx, task["id"], False)  # posted: blocked, even with LABEL_MISSING
     if label is None:  # Ruling S18: the question is posted, the label could not be
         return {"ok": False, "error": "LABEL_MISSING", "issue": task.get("identifier"),
                 "label_missing": True, "question_posted": True}
