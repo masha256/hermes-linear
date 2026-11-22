@@ -35,7 +35,9 @@ channel plugin's adapter, client and hooks. Work in
 - No tool ever raises into the agent. Failure is `{"ok": false, "error": "<CODE>"}`,
   where `<CODE>` is a `LinearError.code` or one of `NOT_LINEAR_SESSION`,
   `OUT_OF_SCOPE`, `NOT_FOUND`, `LABEL_MISSING`, `NO_LINEAR_HEADER`, `TIMEOUT`,
-  `BAD_ARGS`.
+  `BAD_ARGS`, `NOT_CONNECTED`, `WRONG_THREAD`.
+- Toolset name: `hermes_linear` (integration notes Q1; a `linear` toolset shadows
+  the Linear MCP server's tools).
 - `SPEC_INLINE_MAX = 200_000` chars (probe P1).
 - Sub-ticket order uses `subIssueSortOrder`, never `sortOrder` (probe P2).
 - The app cannot create labels (probe P3). `Blocked` must already exist; if it
@@ -123,7 +125,10 @@ under a throwaway `HERMES_HOME`:
   - `def run_on_adapter(ctx, coro_factory, *, timeout_s: float = TOOL_TIMEOUT_S) -> dict`:
     calls `run_coroutine_threadsafe` on `ctx.adapter.event_loop` and waits.
     `TimeoutError` → `{"ok": false, "error": "TIMEOUT"}`, and the future is
-    cancelled. `LinearError` → its `code`. Any other exception →
+    cancelled. If no adapter is found, or its loop is not running →
+    `NOT_CONNECTED`. If called on the adapter's own loop thread (possible via
+    `PluginContext.dispatch_tool`, notes Q3) → `WRONG_THREAD`, without
+    scheduling (this guard is mandatory). `LinearError` → its `code`. Any other exception →
     `type(exc).__name__`.
   - `async def check_write_scope(ctx, issue_id: str) -> str | None`: returns `None`
     when allowed, else `"NOT_LINEAR_SESSION"` or `"OUT_OF_SCOPE"`. A target is
@@ -143,6 +148,9 @@ under a throwaway `HERMES_HOME`:
     `error == "RATELIMITED"`.
   - `test_resolve_context_by_session_key`: two adapters; the key belongs to the
     second.
+  - `test_wrong_thread_guard`: calling `run_on_adapter` from a callback running on
+    the adapter's loop returns `WRONG_THREAD` immediately.
+  - `test_not_connected`: no adapters, or a stopped loop, returns `NOT_CONNECTED`.
 
   Use the existing fakes: `tests/fake_linear.py`, and the adapter builder from
   `tests/test_adapter_inbound.py` running on a real loop in a thread.
@@ -347,16 +355,21 @@ This task also covers the RET-82 scope (project setup), which was canceled into 
 - Consumes: `TOOL_SCHEMAS` and the handlers from Tasks 2–5; the Task 0 Q1/Q4/Q5
   answers.
 - Produces:
-  - `register(ctx)` additionally calls `ctx.register_tool(name, toolset="linear", schema, handler, description, emoji="📐")`
+  - `register(ctx)` additionally calls `ctx.register_tool(name, toolset="hermes_linear", schema, handler, description, emoji="📐")`
     for each of the 7 tools, and
     `ctx.register_skill("manage-superpowers", <path>, description)`.
   - `plugin.yaml` gains `provides_tools`.
   - `PLATFORM_HINT` gains this sentence, verbatim: "If the repo has
     `.hermes-linear.yaml`, load `linear:manage-superpowers` first."
 
-The SKILL.md frontmatter description, verbatim: "Use when a Linear ticket says
-'manage with hermes-linear', or in a repo with .hermes-linear.yaml. Runs
-superpowers through Linear." The body covers:
+The SKILL.md frontmatter description, verbatim (58 chars; the skill index clips at
+60): "Use when a repo has .hermes-linear.yaml or ticket says so." The frontmatter
+must NOT carry `requires_tools`, `requires_toolsets`, `fallback_for_tools` or
+`fallback_for_toolsets` (notes Q4: deferred tools would hide the skill). The body
+covers:
+- **Calling the tools** (notes Q1): the `linear_*` tools are deferred behind tool
+  search. Load each with `tool_describe` and call it with `tool_call` using the
+  exact name; a direct call fails as an unknown tool.
 - **Setup** (spec §3 step 2 and §5.1, the RET-82 scope):
   - two selects via `clarify`: framework, then repo;
   - clone the repo if it is missing, into `~/git/<name>`;
@@ -372,11 +385,13 @@ superpowers through Linear." The body covers:
     approval while unsynced (§6).
 
 - [ ] **Step 1: Write the failing tests.**
-  - `test_tools_registered_in_linear_toolset`: 7 names, all with schemas.
+  - `test_tools_registered_in_hermes_linear_toolset`: 7 names, all with schemas,
+    toolset `hermes_linear`.
   - `test_skill_registered`.
   - `test_platform_hint_mentions_marker`.
-  - `test_skill_frontmatter_valid`: name `manage-superpowers`, description of 60
-    chars or fewer per house style, or the Hermes limit.
+  - `test_skill_frontmatter_valid`: name `manage-superpowers`; description equals
+    the verbatim text above and is ≤ 60 chars; no `requires_*`/`fallback_for_*`
+    keys.
 - [ ] **Step 2: Run.** Expected: FAIL.
 - [ ] **Step 3: Implement.** Write SKILL.md as an overlay of at most about 150
   lines: it says "load `superpowers:<stage>`, then apply these differences" and
