@@ -8,16 +8,24 @@ per operation) is what checks the GraphQL documents themselves; this fake checks
 Model (all ids are opaque strings; issue ids are UUID-like, identifiers are ``TEAM-n``):
 
 - issues: ``id identifier title description state team project parent labels
-  subIssueSortOrder``; ``children`` are derived from ``parent``.
+  subIssueSortOrder``; ``children`` are derived from ``parent`` and returned in insertion
+  order, *not* sorted (real Linear does not sort them either; ``LinearClient.issue_get``
+  does, and the fake's callers must not rely on it).
 - comments: ``id issue body user`` (``user`` is ``VIEWER`` for the app's own comments,
-  any other id for a human).
-- states / labels: per team, ``{"id", "name", "type"}`` / ``{"id", "name"}``.
+  any other id for a human); ``app_comments`` is oldest first, as the client returns it.
+- states / labels: per team, ``{"id", "name", "type"}`` / ``{"id", "name"}``, plus
+  workspace-level labels (``workspace_labels``, no team) that every team can apply.
+- ``issue_create`` without ``stateId`` uses the team's first ``backlog``/``unstarted``
+  state in workflow order. Assumption: that is the team's default issue state, which it
+  is for a stock Linear team (we do not model ``Team.defaultIssueState``).
 
 Every client call is appended to ``calls`` as ``(method, args)``; ``writes()`` filters the
 mutating ones. Return shapes are the client's normalized ones (connections flattened to
 lists: ``labels``, ``children``, ``project.externalLinks``). Inputs are checked against the
 SDL input field names (unknown keys raise ``AssertionError``), and an unknown issue/comment
-raises ``LinearError(code="NOT_FOUND")``.
+raises what ``LinearClient`` raises for Linear's ``Entity not found`` error:
+``LinearError("Entity not found: Issue", code="NOT_FOUND", status=200)``. Everything
+returned is a copy; mutating a result never changes the workspace.
 
 Usage::
 
@@ -31,6 +39,7 @@ Later tasks extend it (relations, documents, …); keep each addition small and 
 
 from __future__ import annotations
 
+import copy
 import itertools
 from typing import Any
 
@@ -54,16 +63,17 @@ DEFAULT_LABELS = [
     {"id": "lb-feature", "name": "Feature"},
     {"id": "lb-plan", "name": "superpowers:plan"},
 ]
+WORKSPACE_LABELS = [{"id": "lb-ws-blocked", "name": "Blocked"}]
 
 # SDL input field names (schema.graphql): IssueCreateInput / IssueUpdateInput subsets we use.
 CREATE_FIELDS = {"title", "description", "teamId", "projectId", "parentId", "labelIds",
-                 "stateId"}
+                 "stateId", "subIssueSortOrder"}
 UPDATE_FIELDS = {"title", "description", "stateId", "addedLabelIds", "removedLabelIds",
-                 "labelIds", "parentId", "projectId"}
+                 "labelIds", "parentId", "projectId", "subIssueSortOrder"}
 
 
 def _not_found(what: str) -> LinearError:
-    return LinearError(f"Entity not found: {what}", code="NOT_FOUND")
+    return LinearError(f"Entity not found: {what}", code="NOT_FOUND", status=200)
 
 
 class FakeWorkspace:
@@ -72,6 +82,7 @@ class FakeWorkspace:
         self.comments: dict[str, dict] = {}
         self.states: dict[str, list[dict]] = {TEAM: [dict(s) for s in DEFAULT_STATES]}
         self.labels: dict[str, list[dict]] = {TEAM: [dict(lb) for lb in DEFAULT_LABELS]}
+        self.workspace_labels: list[dict] = [dict(lb) for lb in WORKSPACE_LABELS]
         self.calls: list[tuple[str, Any]] = []
         self._ids = itertools.count(1)
         self._numbers = itertools.count(100)
@@ -85,7 +96,8 @@ class FakeWorkspace:
         iid = uuid or f"uuid-{next(self._ids)}"
         self.issues[iid] = {
             "id": iid, "identifier": identifier or f"RET-{next(self._numbers)}",
-            "title": title, "description": description, "team": team, "project": project,
+            "title": title, "description": description, "team": team,
+            "project": copy.deepcopy(project),
             "parent": parent, "labels": list(labels), "state": state,
             "subIssueSortOrder": sort_order,
         }
@@ -111,25 +123,27 @@ class FakeWorkspace:
         return [c for c in self.calls if c[0] in {"issue_create", "issue_update",
                                                   "comment_create", "comment_update"}]
 
+    def default_state(self, team: str) -> str:
+        """The team's first ``backlog``/``unstarted`` state (see the module docstring)."""
+        return next(s["id"] for s in self.states[team] if s["type"] in {"backlog", "unstarted"})
+
     def _state(self, team: str, sid: str) -> dict:
         return next(s for s in self.states[team] if s["id"] == sid)
 
     def _label(self, team: str, lid: str) -> dict:
-        found = next((lb for lb in self.labels[team] if lb["id"] == lid), None)
+        found = next((lb for lb in [*self.labels.get(team, []), *self.workspace_labels]
+                      if lb["id"] == lid), None)
         if found is None:
             raise LinearError("label not found", code="INVALID_INPUT")
         return found
 
     # -- LinearClient surface -------------------------------------------
     async def gql(self, query: str, variables: dict | None = None) -> dict:
-        """Only the scope walk's ``issue(id) { id parent { id } }``."""
+        """Only the scope walk's ``issue(id) { id parent { id } }`` (unknown: NOT_FOUND)."""
         self.calls.append(("gql", variables))
         if "IssueParent" not in query:
             raise AssertionError(f"FakeWorkspace.gql: unsupported document {query[:40]!r}")
-        try:
-            i = self.issue((variables or {})["id"])
-        except LinearError:
-            return {"issue": None}
+        i = self.issue((variables or {})["id"])
         return {"issue": {"id": i["id"], "parent": {"id": i["parent"]} if i["parent"] else None}}
 
     async def viewer_id(self) -> str:
@@ -139,14 +153,13 @@ class FakeWorkspace:
         self.calls.append(("issue_get", issue_id))
         i = self.issue(issue_id)
         parent = self.issues.get(i["parent"]) if i["parent"] else None
-        children = sorted((c for c in self.issues.values() if c["parent"] == i["id"]),
-                          key=lambda c: c["subIssueSortOrder"])
+        children = [c for c in self.issues.values() if c["parent"] == i["id"]]  # unsorted
         st = self._state(i["team"], i["state"])
         return {
             "id": i["id"], "identifier": i["identifier"], "title": i["title"],
             "description": i["description"],
             "url": f"https://linear.app/x/issue/{i['identifier']}",
-            "state": dict(st), "team": {"id": i["team"]}, "project": i["project"],
+            "state": dict(st), "team": {"id": i["team"]}, "project": copy.deepcopy(i["project"]),
             "parent": {"id": parent["id"], "identifier": parent["identifier"]} if parent else None,
             "labels": [dict(self._label(i["team"], lid)) for lid in i["labels"]],
             "children": [
@@ -169,10 +182,12 @@ class FakeWorkspace:
         for lid in inp.get("labelIds") or []:
             self._label(team, lid)
         project = PROJECT if inp.get("projectId") == PROJECT["id"] else None
+        state = inp.get("stateId") or self.default_state(team)
+        self._state(team, state)
         iid = self.add_issue(title=inp.get("title") or "", description=inp.get("description") or "",
                              team=team, project=project, parent=inp.get("parentId"),
-                             labels=tuple(inp.get("labelIds") or ()),
-                             state=inp.get("stateId") or "st-todo")
+                             labels=tuple(inp.get("labelIds") or ()), state=state,
+                             sort_order=inp.get("subIssueSortOrder") or 0.0)
         return self._summary(self.issues[iid])
 
     async def issue_update(self, issue_id: str, inp: dict) -> dict:
@@ -192,6 +207,8 @@ class FakeWorkspace:
         for lid in inp.get("removedLabelIds") or []:
             if lid in i["labels"]:
                 i["labels"].remove(lid)
+        if "subIssueSortOrder" in inp:
+            i["subIssueSortOrder"] = inp["subIssueSortOrder"]
         if "parentId" in inp:
             i["parent"] = self.issue(inp["parentId"])["id"] if inp["parentId"] else None
         return self._summary(i)
@@ -218,4 +235,4 @@ class FakeWorkspace:
 
     async def team_labels(self, team_id: str) -> list[dict]:
         self.calls.append(("team_labels", team_id))
-        return [dict(lb) for lb in self.labels.get(team_id, [])]
+        return [dict(lb) for lb in [*self.labels.get(team_id, []), *self.workspace_labels]]

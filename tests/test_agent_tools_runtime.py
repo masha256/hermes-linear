@@ -193,7 +193,27 @@ def test_linear_error_maps_to_code(bg_loop):
 
     out = agent_tools.run_on_adapter(ctx_for(a), boom)
     assert out["ok"] is False and out["error"] == "RATELIMITED"
-    assert agent_tools.run_on_adapter(ctx_for(a), other) == {"ok": False, "error": "KeyError"}
+    assert agent_tools.run_on_adapter(ctx_for(a), other) == {"ok": False,
+                                                             "error": "INTERNAL_ERROR"}
+
+
+def test_unexpected_error_is_internal_and_logged(bg_loop, caplog):
+    a = new_adapter(bg_loop)
+
+    async def other():
+        raise KeyError("secret-ish detail")
+
+    with caplog.at_level("WARNING", logger="hermes_linear.agent_tools"):
+        out = agent_tools.run_on_adapter(ctx_for(a), other)
+    assert out == {"ok": False, "error": "INTERNAL_ERROR"}
+    msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("KeyError" in m for m in msgs)
+    assert not any("secret-ish" in m for m in msgs)
+
+    def bad_factory():
+        raise ValueError("x")
+    assert agent_tools.run_on_adapter(ctx_for(a), bad_factory) == {"ok": False,
+                                                                   "error": "INTERNAL_ERROR"}
 
 
 def test_result_passthrough_and_runs_on_loop(bg_loop):

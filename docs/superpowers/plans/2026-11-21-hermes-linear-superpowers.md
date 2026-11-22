@@ -35,7 +35,7 @@ channel plugin's adapter, client and hooks. Work in
 - No tool ever raises into the agent. Failure is `{"ok": false, "error": "<CODE>"}`,
   where `<CODE>` is a `LinearError.code` or one of `NOT_LINEAR_SESSION`,
   `OUT_OF_SCOPE`, `NOT_FOUND`, `LABEL_MISSING`, `NO_LINEAR_HEADER`, `TIMEOUT`,
-  `BAD_ARGS`, `NOT_CONNECTED`, `WRONG_THREAD`.
+  `BAD_ARGS`, `NOT_CONNECTED`, `WRONG_THREAD`, `INTERNAL_ERROR`.
 - Toolset name: `hermes_linear` (integration notes Q1; a `linear` toolset shadows
   the Linear MCP server's tools).
 - `SPEC_INLINE_MAX = 200_000` chars (probe P1).

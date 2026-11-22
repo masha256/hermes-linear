@@ -57,6 +57,12 @@ def _err(code: str) -> dict:
     return {"ok": False, "error": code}
 
 
+def _internal(exc: BaseException, where: str) -> dict:
+    """An unexpected (non-Linear) failure: logged by type only, answered ``INTERNAL_ERROR``."""
+    log.warning("linear: %s failed: %s", where, type(exc).__name__)
+    return _err("INTERNAL_ERROR")
+
+
 def _issue_of(chat_id: Any) -> str | None:
     """The Linear issue id of a Hermes chat id (``<issue>[:<suffix>]``, as adapter.py)."""
     return str(chat_id).split(":", 1)[0] if chat_id else None
@@ -191,7 +197,7 @@ def run_on_adapter(ctx: ToolContext, coro_factory: Callable[[], Coroutine[Any, A
     try:
         coro = coro_factory()
     except Exception as exc:  # noqa: BLE001
-        return _err(type(exc).__name__)
+        return _internal(exc, "tool call")
     try:
         fut = asyncio.run_coroutine_threadsafe(coro, loop)
     except RuntimeError:  # loop closed between the check and the call
@@ -200,7 +206,7 @@ def run_on_adapter(ctx: ToolContext, coro_factory: Callable[[], Coroutine[Any, A
     except Exception as exc:  # noqa: BLE001 - e.g. not a coroutine
         if hasattr(coro, "close"):
             coro.close()
-        return _err(type(exc).__name__)
+        return _internal(exc, "tool call")
     try:
         result = fut.result(timeout_s)
     except (TimeoutError, concurrent.futures.TimeoutError):
@@ -211,8 +217,7 @@ def run_on_adapter(ctx: ToolContext, coro_factory: Callable[[], Coroutine[Any, A
     except concurrent.futures.CancelledError:
         return _err("NOT_CONNECTED")  # task cancelled on the loop: the adapter disconnected
     except Exception as exc:  # noqa: BLE001
-        log.debug("linear: tool call failed: %s", type(exc).__name__)
-        return _err(type(exc).__name__)
+        return _internal(exc, "tool call")
     return result if isinstance(result, dict) else {"ok": True, "result": result}
 
 
@@ -281,6 +286,8 @@ async def _walk_scope(client: Any, issue_id: str, allowed: set[str]) -> str | No
 # checks and ``tool_created`` see the UUID Linear returns.
 
 MARKER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+#: Any hermes-linear marker, stripped from agent-supplied bodies before ours is appended.
+ANY_MARKER_RE = re.compile(r"[ \t]*<!--\s*hermes-linear:.*?-->", re.DOTALL)
 
 
 class _Refusal(Exception):
@@ -356,8 +363,7 @@ def _tool(parse: Callable[[dict], dict],
                     return _err(r.code)
             return run_on_adapter(ctx, run)
         except Exception as exc:  # noqa: BLE001 - Q3.4: a tool never raises
-            log.warning("linear: tool failed: %s", type(exc).__name__)
-            return _err(type(exc).__name__)
+            return _internal(exc, "tool")
     return handler
 
 
@@ -379,24 +385,31 @@ async def _state_id(ctx: ToolContext, team_id: str, name: str) -> str:
     return sid
 
 
-async def _label_ids(ctx: ToolContext, team_id: str, *groups: list[str]) -> list[list[str]]:
-    """Label ids for each list of names (case-insensitive); an unknown name: LABEL_MISSING."""
-    if not any(groups):
-        return [[] for _ in groups]
+async def _label_ids(ctx: ToolContext, team_id: str, add: list[str],
+                     remove: list[str] = ()) -> tuple[list[str], list[str]]:
+    """Label ids for names to ``add`` and ``remove`` (case-insensitive).
+
+    An unknown name to add is ``LABEL_MISSING`` (probe P3: the app cannot create labels);
+    an unknown name to remove is skipped, since no issue can carry it (Ruling S13).
+    """
+    if not add and not remove:
+        return [], []
     by_name: dict[str, str] = {}
     for lb in await ctx.client.team_labels(team_id):
         by_name.setdefault((lb.get("name") or "").casefold(), lb["id"])
-    out = []
-    for names in groups:
-        ids = []
+    out: list[list[str]] = []
+    for names, strict in ((add, True), (remove, False)):
+        ids: list[str] = []
         for n in names:
             lid = by_name.get(n.casefold())
             if lid is None:
-                raise _Refusal("LABEL_MISSING")  # probe P3: the app cannot create labels
+                if strict:
+                    raise _Refusal("LABEL_MISSING")
+                continue
             if lid not in ids:
                 ids.append(lid)
         out.append(ids)
-    return out
+    return out[0], out[1]
 
 
 def _team_of(issue: dict) -> str:
@@ -440,7 +453,7 @@ async def _create(ctx: ToolContext, a: dict) -> dict:
         inp["parentId"] = (await _writable(ctx, a["parent"].strip()))["id"]
     if a["state"] is not None:
         inp["stateId"] = await _state_id(ctx, team, a["state"])
-    (labels,) = await _label_ids(ctx, team, a["labels"])
+    labels, _ = await _label_ids(ctx, team, a["labels"])
     if labels:
         inp["labelIds"] = labels
     issue = await ctx.client.issue_create(inp)
@@ -493,21 +506,29 @@ def _parse_comment(args: dict) -> dict:
     return a
 
 
+def _with_marker(body: str, marker: str) -> str:
+    """``body`` without any hermes-linear marker, then exactly one ``marker`` tag."""
+    return f"{ANY_MARKER_RE.sub('', body).rstrip()}\n\n{_marker_tag(marker)}"
+
+
 async def _comment(ctx: ToolContext, a: dict) -> dict:
     issue = await _writable(ctx, a["id"])
     body, marker = a["body"], a["edit_marker"]
+
+    def done(comment_id: str, edited: bool) -> dict:
+        return {"ok": True, "comment_id": comment_id, "edited": edited,
+                "issue": issue.get("identifier"), "url": issue.get("url")}
+
     if marker is None:
-        return {"ok": True, "comment_id": await ctx.client.comment_create(issue["id"], body),
-                "edited": False}
+        return done(await ctx.client.comment_create(issue["id"], body), False)
     tag = _marker_tag(marker)
-    text = body if tag in body else f"{body.rstrip()}\n\n{tag}"
+    text = _with_marker(body, marker)
     # Only the app's own comments: a human quoting the marker is never edited.
     for c in await ctx.client.app_comments(issue["id"]):
         if tag in (c.get("body") or ""):
             await ctx.client.comment_update(c["id"], text)
-            return {"ok": True, "comment_id": c["id"], "edited": True}
-    return {"ok": True, "comment_id": await ctx.client.comment_create(issue["id"], text),
-            "edited": False}
+            return done(c["id"], True)
+    return done(await ctx.client.comment_create(issue["id"], text), False)
 
 
 linear_issue_get = _tool(_parse_get, _get)

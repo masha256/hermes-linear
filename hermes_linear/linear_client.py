@@ -24,6 +24,12 @@ _MAX_RETRY_AFTER_S = 60.0
 _DEFAULT_RETRY_AFTER_S = 1.0
 _AUTH_CODES = {"AUTHENTICATION_ERROR", "UNAUTHENTICATED"}
 _RATELIMIT_CODE = "RATELIMITED"
+#: Linear answers an unknown entity with a GraphQL error (``INPUT_ERROR``, HTTP 200)
+#: whose message starts with this (live probe); the client reports it as ``NOT_FOUND``.
+_NOT_FOUND_PREFIX = "Entity not found"
+_PAGE_SIZE = 250
+#: Upper bound on nodes read by a paged query (comments, labels).
+PAGE_CAP = 2000
 
 # -- GraphQL documents (verified against the Linear SDL) ---------------
 
@@ -87,7 +93,7 @@ QUERY_ISSUE_GET = """query IssueGet($id: String!) {
     project { id name externalLinks { nodes { label url } } }
     parent { id identifier }
     labels { nodes { id name } }
-    children { nodes { id identifier title subIssueSortOrder state { type } } }
+    children { nodes { id identifier title subIssueSortOrder createdAt state { type } } }
   }
 }"""
 
@@ -103,11 +109,12 @@ MUTATION_COMMENT_UPDATE = """mutation CommentUpdate($id: String!, $input: Commen
   commentUpdate(id: $id, input: $input) { success comment { id } }
 }"""
 
-# Server-side filter on the app user; ``user.id`` is re-checked client-side.
-QUERY_ISSUE_APP_COMMENTS = """query IssueAppComments($id: String!, $userId: ID!) {
+# Server-side filter on the app user; ``user.id`` is re-checked client-side. Paged.
+QUERY_ISSUE_APP_COMMENTS = """query IssueAppComments($id: String!, $userId: ID!, $after: String) {
   issue(id: $id) {
-    comments(first: 250, filter: { user: { id: { eq: $userId } } }) {
-      nodes { id body user { id } }
+    comments(first: 250, after: $after, filter: { user: { id: { eq: $userId } } }) {
+      nodes { id body createdAt user { id } }
+      pageInfo { hasNextPage endCursor }
     }
   }
 }"""
@@ -116,11 +123,12 @@ QUERY_TEAM_STATES = """query TeamStates($teamId: String!) {
   team(id: $teamId) { states(first: 250) { nodes { id name type position } } }
 }"""
 
-# Team labels plus workspace labels (no team); group labels cannot be applied.
-QUERY_TEAM_LABELS = """query TeamLabels($teamId: ID!) {
-  issueLabels(first: 250, filter: { or: [{ team: { id: { eq: $teamId } } },
-                                         { team: { null: true } }] }) {
+# Team labels plus workspace labels (no team); group labels cannot be applied. Paged.
+QUERY_TEAM_LABELS = """query TeamLabels($teamId: ID!, $after: String) {
+  issueLabels(first: 250, after: $after,
+              filter: { or: [{ team: { id: { eq: $teamId } } }, { team: { null: true } }] }) {
     nodes { id name isGroup }
+    pageInfo { hasNextPage endCursor }
   }
 }"""
 
@@ -280,6 +288,8 @@ class LinearClient:
                 continue
 
             if code is not None or message:
+                if message.startswith(_NOT_FOUND_PREFIX):
+                    code = "NOT_FOUND"  # Linear's INPUT_ERROR for an unknown entity
                 raise LinearError(message, code=code, status=status)
             if status >= 400 or not isinstance(body, dict) or not isinstance(body.get("data"), dict):
                 raise LinearError(f"unexpected GraphQL response (HTTP {status})", status=status)
@@ -410,6 +420,31 @@ class LinearClient:
     def _nodes(conn: Any) -> list[dict]:
         return list((conn or {}).get("nodes") or []) if isinstance(conn, dict) else []
 
+    async def _paged(self, query: str, variables: dict,
+                     conn_of: Callable[[dict], Any], *, cap: int = PAGE_CAP) -> list[dict]:
+        """All nodes of a cursor-paged connection (``pageInfo{hasNextPage endCursor}``),
+        at most ``cap``."""
+        out: list[dict] = []
+        after: str | None = None
+        while True:
+            data = await self.gql(query, {**variables, "after": after})
+            conn = conn_of(data)
+            out.extend(self._nodes(conn))
+            info = (conn or {}).get("pageInfo") if isinstance(conn, dict) else None
+            after = (info or {}).get("endCursor")
+            if not (info or {}).get("hasNextPage") or not after:
+                return out
+            if len(out) >= cap:
+                log.warning("linear: paged read stopped at %d nodes (cap)", len(out))
+                return out[:cap]
+
+    @staticmethod
+    def _child_order(c: dict) -> tuple:
+        """``subIssueSortOrder`` ascending (unset last), then ``createdAt``, identifier."""
+        sso = c.get("subIssueSortOrder")
+        return (sso is None, sso if isinstance(sso, (int, float)) else 0.0,
+                c.get("createdAt") or "", c.get("identifier") or "")
+
     async def issue_get(self, issue_id: str) -> dict:
         """An issue by UUID or identifier, connections flattened to lists
         (``labels``, ``children``, ``project.externalLinks``). Null issue: ``NOT_FOUND``."""
@@ -419,7 +454,8 @@ class LinearClient:
             raise LinearError("issue not found", code="NOT_FOUND")
         out = dict(i)
         out["labels"] = self._nodes(i.get("labels"))
-        out["children"] = self._nodes(i.get("children"))
+        # Linear returns children in no particular order (live probe): sort them.
+        out["children"] = sorted(self._nodes(i.get("children")), key=self._child_order)
         if isinstance(i.get("project"), dict):
             out["project"] = {**i["project"],
                               "externalLinks": self._nodes(i["project"].get("externalLinks"))}
@@ -448,13 +484,14 @@ class LinearClient:
         self._require_success(data, "commentUpdate")
 
     async def app_comments(self, issue_id: str) -> list[dict]:
-        """``[{id, body}]`` of the comments on ``issue_id`` authored by the app (viewer)."""
+        """``[{id, body}]`` of the comments on ``issue_id`` authored by the app (viewer),
+        every page (up to ``PAGE_CAP``), oldest first."""
         me = await self.viewer_id()
-        data = await self.gql(QUERY_ISSUE_APP_COMMENTS, {"id": issue_id, "userId": me})
-        issue = data.get("issue") or {}
-        return [{"id": c["id"], "body": c.get("body") or ""}
-                for c in self._nodes(issue.get("comments"))
-                if (c.get("user") or {}).get("id") == me]
+        nodes = await self._paged(QUERY_ISSUE_APP_COMMENTS, {"id": issue_id, "userId": me},
+                                  lambda d: (d.get("issue") or {}).get("comments"))
+        mine = [c for c in nodes if (c.get("user") or {}).get("id") == me]
+        mine.sort(key=lambda c: c.get("createdAt") or "")  # stable: ties keep page order
+        return [{"id": c["id"], "body": c.get("body") or ""} for c in mine]
 
     async def team_states(self, team_id: str) -> list[dict]:
         """``[{id, name, type}]`` in workflow position order; cached per client."""
@@ -469,6 +506,7 @@ class LinearClient:
 
     async def team_labels(self, team_id: str) -> list[dict]:
         """``[{id, name}]``: the team's and the workspace's labels, groups excluded."""
-        data = await self.gql(QUERY_TEAM_LABELS, {"teamId": team_id})
+        nodes = await self._paged(QUERY_TEAM_LABELS, {"teamId": team_id},
+                                  lambda d: d.get("issueLabels"))
         return [{"id": lb["id"], "name": lb.get("name") or ""}
-                for lb in self._nodes(data.get("issueLabels")) if not lb.get("isGroup")]
+                for lb in nodes if not lb.get("isGroup")]

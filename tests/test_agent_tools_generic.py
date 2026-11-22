@@ -15,6 +15,8 @@ import pytest
 from test_agent_tools_runtime import new_adapter
 from fake_workspace import PROJECT, TEAM, VIEWER, FakeWorkspace
 
+from hermes_linear.linear_client import LinearError
+
 from hermes_linear import agent_tools
 from hermes_linear.agent_tools import (TOOL_HANDLERS, TOOL_SCHEMAS, linear_comment,
                                        linear_issue_create, linear_issue_get,
@@ -115,6 +117,9 @@ def test_issue_get_shape(pin_ctx, ws):
     assert issue["labels"] == [{"id": "lb-bug", "name": "Bug"}]
     assert issue["parent"] is None
     assert [c["identifier"] for c in issue["children"]] == ["RET-2"]
+    issue["project"]["externalLinks"].clear()  # a copy: the workspace is untouched
+    assert ws.issues[SELF]["project"]["externalLinks"] == PROJECT["externalLinks"]
+    assert PROJECT["externalLinks"]
     assert issue["children"][0]["state"] == {"type": "unstarted"}
     assert ws.writes() == []
 
@@ -134,6 +139,22 @@ def test_issue_get_not_connected(pin_ctx, ws):
 
 def test_issue_get_unknown_is_linear_code(pin_ctx):
     assert linear_issue_get({"id": "NOPE-1"}) == {"ok": False, "error": "NOT_FOUND"}
+
+
+async def test_fake_not_found_matches_client(ws):
+    """The fake raises what LinearClient raises for Linear's 'Entity not found'."""
+    for call in (lambda: ws.issue_get("NOPE-1"),
+                 lambda: ws.gql(agent_tools.QUERY_ISSUE_PARENT, {"id": "NOPE-1"})):
+        with pytest.raises(LinearError) as ei:
+            await call()
+        assert (ei.value.code, ei.value.status, str(ei.value)) == (
+            "NOT_FOUND", 200, "Entity not found: Issue")
+
+
+def test_fake_children_are_unsorted(ws):
+    ws.add_issue("RET-5", parent=SELF, sort_order=-1.0)
+    kids = asyncio.run(ws.issue_get(SELF))["children"]
+    assert [c["identifier"] for c in kids] == ["RET-2", "RET-5"]  # insertion order
 
 
 # ----------------------------------------------------------------- linear_issue_create
@@ -158,6 +179,7 @@ def test_create_without_parent_then_update_created(pin_ctx, ws, adapter):
     assert out["ok"] is True
     new = ws.issues[out["issue"]["id"]]
     assert new["parent"] is None
+    assert new["state"] == "st-backlog"  # the fake's default: first backlog/unstarted state
     # created this session -> writable, by identifier too
     upd = linear_issue_update({"id": new["identifier"], "title": "Renamed"})
     assert upd["ok"] is True and new["title"] == "Renamed"
@@ -215,6 +237,23 @@ def test_labels_add_remove_by_name(pin_ctx, ws):
     assert inp == {"addedLabelIds": ["lb-feature", "lb-plan"], "removedLabelIds": ["lb-bug"]}
 
 
+def test_workspace_label_applies(pin_ctx, ws):
+    assert linear_issue_update({"id": "RET-2", "add_labels": ["blocked"]})["ok"] is True
+    assert ws.issues["uuid-child"]["labels"] == ["lb-ws-blocked"]
+
+
+def test_remove_unknown_label_is_noop(pin_ctx, ws):
+    ws.issues["uuid-child"]["labels"] = ["lb-bug"]
+    out = linear_issue_update({"id": "RET-2", "remove_labels": ["no-such-label", "Bug"]})
+    assert out["ok"] is True and ws.issues["uuid-child"]["labels"] == []
+    (_, (_, inp)), = [c for c in ws.writes() if c[0] == "issue_update"]
+    assert inp == {"removedLabelIds": ["lb-bug"]}
+    # only unknown names to remove, with another change: no label field at all
+    out = linear_issue_update({"id": "RET-2", "title": "T", "remove_labels": ["no-such"]})
+    assert out["ok"] is True
+    assert ws.writes()[-1][1][1] == {"title": "T"}
+
+
 def test_unknown_label_is_label_missing(pin_ctx, ws):
     out = linear_issue_update({"id": "RET-2", "add_labels": ["bug", "no-such-label"]})
     assert out == {"ok": False, "error": "LABEL_MISSING"}
@@ -234,7 +273,8 @@ def test_update_out_of_scope_refused(pin_ctx, ws):
 
 def test_comment_plain_creates(pin_ctx, ws):
     out = linear_comment({"id": "RET-2", "body": "hello"})
-    assert out["ok"] is True
+    assert out["ok"] is True and out["edited"] is False
+    assert out["issue"] == "RET-2" and out["url"] == "https://linear.app/x/issue/RET-2"
     c = ws.comments[out["comment_id"]]
     assert (c["issue"], c["body"], c["user"]) == ("uuid-child", "hello", VIEWER)
 
@@ -248,7 +288,8 @@ def test_comment_edit_marker_edits_existing(pin_ctx, ws):
     ws.add_comment(SELF, "unrelated app note")
     cid = ws.add_comment(SELF, "old status\n\n<!-- hermes-linear:status -->")
     out = linear_comment({"id": "RET-1", "body": "new status", "edit_marker": "status"})
-    assert out == {"ok": True, "comment_id": cid, "edited": True}
+    assert out == {"ok": True, "comment_id": cid, "edited": True, "issue": "RET-1",
+                   "url": "https://linear.app/x/issue/RET-1"}
     assert ws.comments[cid]["body"] == "new status\n\n<!-- hermes-linear:status -->"
     assert [c[0] for c in ws.writes()] == ["comment_update"]
 
@@ -260,7 +301,24 @@ def test_comment_edit_marker_creates_when_absent(pin_ctx, ws):
     assert ws.comments[out["comment_id"]]["body"] == "first\n\n<!-- hermes-linear:status -->"
     # a second call now edits the comment it created
     again = linear_comment({"id": SELF, "body": "second", "edit_marker": "status"})
-    assert again == {"ok": True, "comment_id": out["comment_id"], "edited": True}
+    assert again["comment_id"] == out["comment_id"] and again["edited"] is True
+    assert again["issue"] == "RET-1" and again["url"].endswith("/RET-1")
+
+
+def test_comment_marker_strips_other_markers(pin_ctx, ws):
+    other = ws.add_comment(SELF, "x <!-- hermes-linear:other -->")
+    body = ("status <!-- hermes-linear:other -->\n<!--hermes-linear:status-->\n"
+            "<!-- hermes-linear:a\nb -->tail\n\n<!-- hermes-linear:status -->")
+    out = linear_comment({"id": SELF, "body": body, "edit_marker": "status"})
+    assert out["ok"] is True and out["edited"] is False
+    text = ws.comments[out["comment_id"]]["body"]
+    assert text.count("hermes-linear:") == 1
+    assert text.endswith("\n\n<!-- hermes-linear:status -->")
+    assert text.startswith("status\n") and "tail" in text
+    assert ws.comments[other]["body"] == "x <!-- hermes-linear:other -->"  # not edited
+    # a later edit matches the one marker it kept
+    again = linear_comment({"id": SELF, "body": "v2", "edit_marker": "status"})
+    assert again["comment_id"] == out["comment_id"] and again["edited"] is True
 
 
 def test_human_comment_with_marker_text_not_edited(pin_ctx, ws):

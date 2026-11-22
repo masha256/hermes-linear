@@ -166,13 +166,13 @@ async def test_429_gives_up_after_write_retries(fake, client, sleeps):
 
 
 async def test_graphql_errors_raise(fake, client):
-    fake.on("Viewer", Resp(400, {"errors": [{"message": "Entity not found",
+    fake.on("Viewer", Resp(400, {"errors": [{"message": "Argument Validation Error",
                                              "extensions": {"code": "INVALID_INPUT"}}]}))
     with pytest.raises(LinearError) as ei:
         await client.viewer_id()
     assert ei.value.code == "INVALID_INPUT"
     assert ei.value.status == 400
-    assert "Entity not found" in str(ei.value)
+    assert "Argument Validation Error" in str(ei.value)
 
 
 async def test_graphql_errors_with_200_raise(fake, client):
@@ -456,7 +456,7 @@ async def test_client_app_comments_only_viewer(fake, client):
     ]}}}})
     assert await client.app_comments("uuid-1") == [{"id": "c1", "body": "mine"}]
     call = fake.gql_calls("IssueAppComments")[0]
-    assert call.variables == {"id": "uuid-1", "userId": APP_USER}
+    assert call.variables == {"id": "uuid-1", "userId": APP_USER, "after": None}
 
 
 async def test_client_team_states_cached(fake, client):
@@ -480,4 +480,86 @@ async def test_client_team_labels_team_and_workspace(fake, client):
     ]}}})
     assert await client.team_labels("t1") == [{"id": "l1", "name": "Bug"},
                                               {"id": "l2", "name": "superpowers:plan"}]
-    assert fake.gql_calls("TeamLabels")[0].variables == {"teamId": "t1"}
+    assert fake.gql_calls("TeamLabels")[0].variables == {"teamId": "t1", "after": None}
+
+
+# Shape of real Linear's answer for an unknown issue (live probe, app actor).
+NOT_FOUND_BODY = {"data": None, "errors": [{
+    "message": "Entity not found: Issue", "path": ["issue"],
+    "extensions": {"code": "INPUT_ERROR", "type": "invalid input",
+                   "userError": True, "userPresentableMessage": "Entity not found: Issue"}}]}
+
+
+@pytest.mark.parametrize("ref", ["RET-404", "00000000-0000-0000-0000-000000000000", "garbage"])
+async def test_client_entity_not_found_maps_to_not_found(fake, client, ref):
+    fake.on("IssueGet", NOT_FOUND_BODY)
+    with pytest.raises(LinearError) as ei:
+        await client.issue_get(ref)
+    assert ei.value.code == "NOT_FOUND" and ei.value.status == 200
+    assert str(ei.value) == "Entity not found: Issue"
+
+
+async def test_client_other_input_errors_keep_their_code(fake, client):
+    fake.on("IssueUpdate", {"data": None, "errors": [{
+        "message": "Argument Validation Error", "extensions": {"code": "INPUT_ERROR"}}]})
+    with pytest.raises(LinearError) as ei:
+        await client.issue_update("uuid-1", {"title": ""})
+    assert ei.value.code == "INPUT_ERROR"
+
+
+async def test_issue_get_sorts_children_by_sub_issue_sort_order(fake, client):
+    def child(ident, sso, created="2026-11-01T00:00:00.000Z"):
+        return {"id": f"u-{ident}", "identifier": ident, "title": ident, "createdAt": created,
+                "subIssueSortOrder": sso, "state": {"type": "unstarted"}}
+    # The order live Linear returned (RET-88:30, RET-87:150, ...), plus an unset and a tie.
+    nodes = [child("RET-88", 30), child("RET-87", 150), child("RET-89", None),
+             child("RET-86", 140), child("RET-85", 130), child("RET-84", 110),
+             child("RET-91", 110, "2026-11-02T00:00:00.000Z")]
+    fake.on("IssueGet", {"data": {"issue": {**ISSUE_NODE, "children": {"nodes": nodes}}}})
+    i = await client.issue_get("RET-1")
+    assert [c["identifier"] for c in i["children"]] == [
+        "RET-88", "RET-84", "RET-91", "RET-85", "RET-86", "RET-87", "RET-89"]
+    assert "createdAt" in fake.gql_calls("IssueGet")[0].json["query"]
+
+
+def _page(nodes, cursor=None):
+    return {"nodes": nodes, "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor}}
+
+
+async def test_client_app_comments_pages_oldest_first(fake, client):
+    def c(cid, created, user=APP_USER):
+        return {"id": cid, "body": cid, "createdAt": created, "user": {"id": user}}
+    fake.on("IssueAppComments",
+            {"data": {"issue": {"comments": _page([c("c3", "2026-11-03"), c("c2", "2026-11-02")],
+                                                  "cur-1")}}},
+            {"data": {"issue": {"comments": _page([c("c1", "2026-11-01"),
+                                                   c("h1", "2026-11-00", user="human")])}}})
+    assert await client.app_comments("uuid-1") == [
+        {"id": "c1", "body": "c1"}, {"id": "c2", "body": "c2"}, {"id": "c3", "body": "c3"}]
+    calls = fake.gql_calls("IssueAppComments")
+    assert [call.variables["after"] for call in calls] == [None, "cur-1"]
+    assert "pageInfo { hasNextPage endCursor }" in calls[0].json["query"]
+
+
+async def test_client_team_labels_pages(fake, client):
+    fake.on("TeamLabels",
+            {"data": {"issueLabels": _page([{"id": "l1", "name": "Bug", "isGroup": False}],
+                                           "cur-1")}},
+            {"data": {"issueLabels": _page([{"id": "l2", "name": "Blocked", "isGroup": False}])}})
+    assert await client.team_labels("t1") == [{"id": "l1", "name": "Bug"},
+                                              {"id": "l2", "name": "Blocked"}]
+    assert [c.variables["after"] for c in fake.gql_calls("TeamLabels")] == [None, "cur-1"]
+
+
+async def test_client_paging_stops_at_cap(fake, client):
+    from hermes_linear.linear_client import QUERY_TEAM_LABELS
+    n = iter(range(100))
+
+    def page(call):  # an endless connection
+        return {"data": {"issueLabels": _page(
+            [{"id": f"l{next(n)}", "name": "x", "isGroup": False} for _ in range(2)], "more")}}
+    fake.on("TeamLabels", page)
+    labels = await client._paged(QUERY_TEAM_LABELS, {"teamId": "t1"},
+                                 lambda d: d.get("issueLabels"), cap=3)
+    assert [lb["id"] for lb in labels] == ["l0", "l1", "l2"]
+    assert len(fake.gql_calls("TeamLabels")) == 2
