@@ -496,6 +496,26 @@ async def test_repost_clarify_without_choices(env, session_env):
     assert acts[-2][:2] == ("response", "done") and acts[-1] == original
 
 
+async def test_repost_store_error_still_returns_send_result(env, session_env, monkeypatch,
+                                                            caplog):
+    """Final review 5: a store error in the re-post never turns the queued response into a
+    raised send (the base would then send the final again)."""
+    a, client, gw, store, order = env
+    await _deferred_clarify(a, client, gw, session_env)
+
+    def boom(_sid):
+        raise RuntimeError("database is locked: secret detail")
+    monkeypatch.setattr(store, "control_for_session", boom)
+    with caplog.at_level(logging.WARNING, logger="hermes_linear.outbound"):
+        r = await a.send(D_CHAT, "Waiting for your answer.", metadata=META)
+    await settle(a)
+    assert r.success
+    assert _session_acts(client)[-1][:2] == ("response", "Waiting for your answer.")
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("RuntimeError" in m for m in msgs)
+    assert not any("secret detail" in m for m in msgs)
+
+
 # ----------------------------------- T7: the answer starts the next turn (spec §6)
 
 RM = "rm -rf build"

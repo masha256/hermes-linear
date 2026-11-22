@@ -521,14 +521,19 @@ class Outbound:
     def _repost_pending(self, sid: str) -> None:
         """Spec §5: right after each response of the turn is queued, queue the session's
         pending question again (same row and request id) so it is the last activity and
-        Linear keeps showing its select. A live row is never re-posted."""
-        store = self.a._store
-        row = store.control_for_session(sid) if store is not None else None
-        if row is None or row.state != "pending":
-            return
-        log.info("linear: re-posting pending %s %s after the response", row.kind,
-                 row.request_id)
-        self._elicit(sid, row.kind, row.question or "", row.choices)
+        Linear keeps showing its select. A live row is never re-posted. Never raises: the
+        response is already queued, and a raised ``send`` would invite a second final."""
+        try:
+            store = self.a._store
+            row = store.control_for_session(sid) if store is not None else None
+            if row is None or row.state != "pending":
+                return
+            log.info("linear: re-posting pending %s %s after the response", row.kind,
+                     row.request_id)
+            self._elicit(sid, row.kind, row.question or "", row.choices)
+        except Exception as exc:  # noqa: BLE001 - store error; the response stands
+            log.warning("linear: re-posting the pending question of %s failed: %s", sid,
+                        type(exc).__name__)
 
     def _drop_pending(self, sid: str) -> None:
         store = self.a._store
