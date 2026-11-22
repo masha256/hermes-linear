@@ -236,7 +236,9 @@ async def _agent_session_event(event: dict, ctx: RouterContext) -> list[Decision
     body = _d(activity.get("content")).get("body") or ""
     control = store.control_for_session(sid)
     if control is not None:
-        return [ResolveControl(sid, control.request_id, control.kind, actor, body)]
+        return [ResolveControl(sid, control.request_id, control.kind, actor, body,
+                               state=control.state, user_name=author,
+                               activity_id=activity.get("id") or "")]
     chat_id, thread_id = _session_key(store.session(sid), ticket)
     return [turn(chat_id, thread_id, body, False)]
 

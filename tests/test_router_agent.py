@@ -217,8 +217,21 @@ async def test_prompted_with_pending_control_resolves(ctx, store):
             kind="clarify",
             actor_id=PROMPTED["agentActivity"]["userId"],
             answer="second reply in thread",
+            state="live",
+            user_name=PROMPTED["agentActivity"]["user"]["name"],
+            activity_id=PROMPTED["agentActivity"]["id"],
         )
     ]
+
+
+async def test_prompted_with_pending_row_carries_state(ctx, store):
+    await route(copy.deepcopy(MENTION), ctx)
+    store.put_control("req-1", "clarify", M_SID, 1, ["a", "b"])
+    store.mark_control_pending("req-1", M_ISSUE)
+    (out,) = await route(copy.deepcopy(PROMPTED), ctx)
+    assert isinstance(out, ResolveControl)
+    assert (out.state, out.user_name, out.activity_id) == (
+        "pending", "Test User", PROMPTED["agentActivity"]["id"])
 
 
 async def test_chat_id_stable_across_store_reopen(tmp_path):

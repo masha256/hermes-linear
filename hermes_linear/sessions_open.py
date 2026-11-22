@@ -18,12 +18,12 @@ import logging
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
-from . import renderer
+from . import questions, renderer
 from .constants import ACK_TIMEOUT_S
 from .models import AwaitDelegation, OpenSessionOnComment, ResolveControl, StartTurn
-from .router import ACK_TEXT, DEFAULT_AUTHOR, ticket_chat_id, turn_header
+from .router import ACK_TEXT, DEFAULT_AUTHOR, _session_key, message_id, ticket_chat_id, turn_header
 from .settings import Settings
-from .store import Store
+from .store import ControlRow, Store
 
 log = logging.getLogger(__name__)
 
@@ -68,6 +68,7 @@ class SessionOpener:
         enqueue: Callable[..., Awaitable[None]],
         submit: Callable[[Callable[[], Awaitable[None]]], bool],
         wait_override: Callable[[], Optional[float]],
+        spawn: Callable[[Any], Any] | None = None,
     ) -> None:
         self._store = store
         self._client = client
@@ -76,6 +77,7 @@ class SessionOpener:
         self._enqueue = enqueue  # (StartTurn, *, human) -> enqueue on the turn engine
         self._submit = submit  # run a coroutine factory on the event worker; False if stopped
         self._wait_override = wait_override
+        self._spawn = spawn  # fire-and-forget label writes (never block the event worker)
         self.delegation_timers: dict[str, asyncio.TimerHandle | None] = {}
 
     # ------------------------------------------------------------ delegation timers
@@ -183,6 +185,9 @@ class SessionOpener:
         if row is None or row.request_id != d.request_id:
             log.info("linear: control %s no longer pending", d.request_id)
             return
+        if row.state == "pending":  # the store row is authoritative over ``d.state``
+            await self.answer_pending(d, row)
+            return
         if d.kind == "clarify":
             ok = _resolve_clarify(d.request_id, d.answer)
             store.drop_control(d.request_id)
@@ -208,6 +213,81 @@ class SessionOpener:
         store.drop_control(d.request_id)
         if not resolved:
             await post(sid, renderer.thought(STALE_APPROVAL_TEXT))
+
+    # ------------------------------------------------------------ pending questions
+
+    async def answer_pending(self, d: ResolveControl, row: ControlRow) -> None:
+        """Spec §6: an answer to a pending question drops the row and starts the next turn.
+
+        The row is dropped before the turn is enqueued, so no response of that turn
+        re-posts the answered question (outbound ``_repost_pending``)."""
+        store, post = self._store(), self._post_ack
+        assert store is not None
+        sid = d.agent_session_id
+        if row.kind == "clarify":
+            self.drop_pending([row])
+            await self._start_answer_turn(d, f'Answer to "{row.question}": {d.answer}')
+            return
+        allowed = [c for c in _APPROVAL_CHOICES if c in row.choices] or list(_APPROVAL_CHOICES)
+        choice = renderer.parse_approval_answer(d.answer)
+        if choice is None or choice not in allowed:  # re-ask; the question still stands
+            options = [o for o in renderer.approval_options() if o["value"] in allowed]
+            await post(sid, renderer.elicitation(REASK_TEXT), signal="select",
+                       signal_metadata={"options": options})
+            return
+        head = f"Answer to approval for `{row.command}`:"
+        if choice == "deny":
+            self.drop_pending([row])
+            await self._start_answer_turn(d, f"{head} denied")
+            return
+        if row.session_key and row.command:
+            requester = _approval_refusal(row.session_key, d.actor_id, request_id=d.request_id)
+            if requester is not None:
+                await post(sid, renderer.thought(_refusal_text(requester)))
+                return  # keep the row: someone allowed may still answer
+            store.put_grant(row.session_key, row.command, choice, d.actor_id,
+                            message_id(sid, d.activity_id))
+        else:  # no grant possible: the re-run is simply asked again
+            log.warning("linear: approval %s has no session key or command; no grant",
+                        d.request_id)
+        self.drop_pending([row])
+        await self._start_answer_turn(d, f"{head} approved ({choice})")
+
+    async def _start_answer_turn(self, d: ResolveControl, body: str) -> None:
+        store = self._store()
+        assert store is not None
+        sid = d.agent_session_id
+        session = store.session(sid)
+        ticket = store.ticket(session.issue_id) if session is not None else None
+        if session is None or ticket is None:
+            log.warning("linear: answer to %s has no session or ticket; no turn", d.request_id)
+            return
+        chat_id, thread_id = _session_key(session, ticket)
+        author = d.user_name or DEFAULT_AUTHOR
+        header = turn_header(ticket.identifier or ticket.issue_id, session.root_comment_id, author)
+        await self._enqueue(StartTurn(
+            agent_session_id=sid, activity_id=d.activity_id, issue_id=ticket.issue_id,
+            chat_id=chat_id, thread_id=thread_id, user_id=d.actor_id, user_name=author,
+            text=f"{header}\n\n{body}", first_turn=False, ack=ACK_TEXT,
+        ), human=True)
+
+    def drop_pending(self, rows: list[ControlRow]) -> None:
+        """Drop the *pending* rows among ``rows`` and remove their ``Blocked`` label.
+
+        Live rows are left alone (Hermes cancels its own waiters)."""
+        store, client = self._store(), self._client()
+        assert store is not None
+        tickets: list[str] = []
+        for row in rows:
+            if row.state != "pending":
+                continue
+            store.drop_control(row.request_id)
+            if row.ticket_id and row.ticket_id not in tickets:
+                tickets.append(row.ticket_id)
+        if client is None or self._spawn is None:
+            return
+        for ticket_id in tickets:
+            self._spawn(questions.set_blocked(client, ticket_id, False))
 
     # ------------------------------------------------------------ ticket helpers
 

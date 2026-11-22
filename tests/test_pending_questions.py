@@ -15,7 +15,8 @@ import logging
 import pytest
 
 from test_adapter_inbound import (
-    D_ISSUE, D_SID, DELEGATION, M_ISSUE, MENTION, complete, deliver,
+    APP, D_ISSUE, D_SID, DELEGATION, HUMAN, ISSUE_DELEGATED, M_ISSUE, MENTION, complete,
+    deliver, prompted,
 )
 from test_adapter_outbound import (  # noqa: F401  (fixtures)
     D_CHAT, approval_prompt, env, session_env, settle,
@@ -24,6 +25,9 @@ from test_adapter_outbound import (  # noqa: F401  (fixtures)
 from hermes_linear import hooks
 from hermes_linear import outbound as outbound_mod
 from hermes_linear import questions
+from hermes_linear import sessions_open as sessions_open_mod
+from hermes_linear.models import SetMode
+from hermes_linear.router import message_id
 
 META = {"thread_id": None}
 BLOCKED = "lb-blocked"
@@ -488,3 +492,198 @@ async def test_repost_clarify_without_choices(env, session_env):
     await settle(a)
     acts = _session_acts(client)
     assert acts[-2][:2] == ("response", "done") and acts[-1] == original
+
+
+# ----------------------------------- T7: the answer starts the next turn (spec §6)
+
+RM = "rm -rf build"
+
+
+def _removed(client):
+    return [(i, u["removedLabelIds"]) for i, u in client.issue_updates if "removedLabelIds" in u]
+
+
+async def _pending_clarify(a, client, gw, session_env, question="Workflow framework?",
+                           choices=("superpowers", "plain")):
+    await _delegated(a, gw, session_env)
+    await a.send_clarify(D_CHAT, question, list(choices), "clar-1", "sk", metadata=META)
+    await a.retire_clarify_card("clar-1", "expired")
+    await settle(a)
+    assert a._store.control("clar-1").state == "pending"
+    await complete(a, gw.events[0])  # the asking turn ends
+    await settle(a)
+    return len(gw.events)
+
+
+async def _pending_approval(a, client, gw, session_env, rid="req-1"):
+    await _delegated(a, gw, session_env)
+    prompt = dataclasses.replace(_approval(rid), command=RM, text=f"Run `{RM}`?")
+    assert (await a._send_exec_approval_prompt(prompt)).success
+    await a.edit_message(D_CHAT, f"approval:{rid}", "timed out")
+    await settle(a)
+    assert a._store.control(rid).state == "pending"
+    await complete(a, gw.events[0])
+    await settle(a)
+    return len(gw.events)
+
+
+def _grants(store):
+    return [tuple(r) for r in store.conn.execute(
+        "SELECT session_key, command, choice, actor_id, turn_mid FROM approval_grants")]
+
+
+async def test_click_answers_pending_clarify(env, session_env):
+    a, client, gw, store, order = env
+    n = await _pending_clarify(a, client, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "superpowers", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    ev = gw.events[-1]
+    assert ev.text.endswith('Answer to "Workflow framework?": superpowers')
+    assert ev.text.startswith("[Linear ")
+    assert ev.message_id == message_id(D_SID, "act-ans")
+    assert ev.source.chat_id == D_CHAT
+    assert store.control("clar-1") is None
+    assert _removed(client) == [(D_ISSUE, [BLOCKED])]
+
+
+async def test_prose_answers_pending_clarify(env, session_env):
+    a, client, gw, store, order = env
+    n = await _pending_clarify(a, client, gw, session_env)
+    before = len(client.activities)
+    await deliver(a, prompted(D_SID, D_ISSUE, "use the other repo please", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    assert gw.events[-1].text.endswith(
+        'Answer to "Workflow framework?": use the other repo please')
+    assert store.control("clar-1") is None
+    # never re-asked: no elicitation after the answer
+    assert not any(c["type"] == "elicitation" for _, c, *_ in client.activities[before:])
+
+
+async def test_live_answer_unchanged(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    got = []
+    monkeypatch.setattr(sessions_open_mod, "_resolve_clarify",
+                        lambda rid, answer: got.append((rid, answer)) or True)
+    await _delegated(a, gw, session_env)
+    await _clarify(a, client)
+    await deliver(a, prompted(D_SID, D_ISSUE, "staging", "act-ans"))
+    assert got == [("clar-1", "staging")]
+    assert len(gw.events) == 1  # no new turn
+    assert store.control("clar-1") is None
+    assert client.issue_updates == []
+
+
+async def test_other_session_does_not_answer(env, session_env):
+    """Review Focus 2: a pending row belongs to its own agent session."""
+    a, client, gw, store, order = env
+    n = await _pending_clarify(a, client, gw, session_env)
+    await deliver(a, prompted("sess-B", D_ISSUE, "superpowers", "act-b", mention=True))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    ev = gw.events[-1]
+    assert ev.text.endswith("\n\nsuperpowers") and "Answer to" not in ev.text
+    assert ev.message_id == message_id("sess-B", "act-b")
+    row = store.control("clar-1")
+    assert row is not None and row.state == "pending" and row.agent_session_id == D_SID
+    assert _removed(client) == []
+
+
+async def test_pending_approval_approve(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    monkeypatch.setattr(sessions_open_mod, "_approval_refusal", lambda *a, **k: None)
+    monkeypatch.setattr(sessions_open_mod, "_resolve_approval_card",
+                        lambda *a, **k: pytest.fail("a pending approval has no waiter"))
+    n = await _pending_approval(a, client, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    ev = gw.events[-1]
+    assert ev.text.endswith(f"Answer to approval for `{RM}`: approved (once)")
+    assert _grants(store) == [("agent:main:linear:dm:x", RM, "once", HUMAN, ev.message_id)]
+    assert ev.message_id == message_id(D_SID, "act-ans")
+    assert store.control("req-1") is None
+    assert _removed(client) == [(D_ISSUE, [BLOCKED])]
+
+
+async def test_pending_approval_deny(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    monkeypatch.setattr(sessions_open_mod, "_approval_refusal", lambda *a, **k: None)
+    n = await _pending_approval(a, client, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "deny", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    assert gw.events[-1].text.endswith(f"Answer to approval for `{RM}`: denied")
+    assert _grants(store) == []
+    assert store.control("req-1") is None
+    assert _removed(client) == [(D_ISSUE, [BLOCKED])]
+
+
+async def test_pending_approval_gibberish_reasks(env, session_env):
+    a, client, gw, store, order = env
+    n = await _pending_approval(a, client, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "yes please", "act-ans"))
+    await settle(a)
+    sid, content, eph, signal, meta = client.activities[-1]
+    assert (sid, content, signal) == (
+        D_SID, {"type": "elicitation", "body": sessions_open_mod.REASK_TEXT}, "select")
+    assert [o["value"] for o in meta["options"]] == ["once", "session", "deny"]
+    assert store.control("req-1").state == "pending"
+    assert len(gw.events) == n and _grants(store) == [] and _removed(client) == []
+
+
+async def test_pending_approval_refusal_keeps_row(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    seen = []
+    monkeypatch.setattr(sessions_open_mod, "_approval_refusal",
+                        lambda sk, actor, **k: seen.append((sk, actor, k)) or "Alice")
+    monkeypatch.setattr(sessions_open_mod, "_refusal_text", lambda who: f"only {who}")
+    n = await _pending_approval(a, client, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "once", "act-ans"))
+    await settle(a)
+    assert seen == [("agent:main:linear:dm:x", HUMAN, {"request_id": "req-1"})]
+    assert client.activities[-1][1] == {"type": "thought", "body": "only Alice"}
+    assert store.control("req-1").state == "pending"
+    assert len(gw.events) == n and _grants(store) == [] and _removed(client) == []
+
+
+async def test_stop_while_pending_drops(env, session_env):
+    a, client, gw, store, order = env
+    n = await _pending_clarify(a, client, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "", "act-stop", signal="stop"))
+    await settle(a)
+    assert store.control("clar-1") is None
+    assert _removed(client) == [(D_ISSUE, [BLOCKED])]
+    acts = _session_acts(client)
+    assert acts[-1][:2] == ("response", "Stopped.")  # no stale re-post after it
+    assert len(gw.events) == n
+
+
+async def test_undelegation_drops_pending(env, session_env):
+    a, client, gw, store, order = env
+    await _pending_clarify(a, client, gw, session_env)
+    ev = json.loads(json.dumps(ISSUE_DELEGATED))
+    ev["data"]["id"] = D_ISSUE
+    ev["data"].pop("delegateId", None)
+    ev["data"].pop("delegate", None)
+    ev["updatedFrom"] = {"delegateId": APP}
+    await deliver(a, ev)
+    await settle(a)
+    assert store.ticket(D_ISSUE).mode == "untouched"
+    assert store.control("clar-1") is None
+    assert _removed(client) == [(D_ISSUE, [BLOCKED])]
+
+
+async def test_redelegation_drops_pending_but_not_live(env, session_env):
+    a, client, gw, store, order = env
+    await _pending_clarify(a, client, gw, session_env)
+    store.put_control("live-1", "clarify", D_SID, 1, [], session_key="sk")
+    gen = store.ticket(D_ISSUE).generation
+    await a._execute(SetMode(D_ISSUE, "delegated", gen), {})
+    assert store.control("clar-1") is not None  # same generation: nothing dropped
+    await a._execute(SetMode(D_ISSUE, "delegated", gen + 1), {})
+    await settle(a)
+    assert store.control("clar-1") is None
+    assert store.control("live-1") is not None  # live rows are Hermes's to cancel
+    assert _removed(client) == [(D_ISSUE, [BLOCKED])]

@@ -62,6 +62,9 @@ class ResolveControl:
     kind: str
     actor_id: str
     answer: str
+    state: str = "live"  # the row's state: "live" (a Hermes waiter) or "pending"
+    user_name: str | None = None  # the replying user (the answer turn's header)
+    activity_id: str = ""  # the prompted activity (the answer turn's message id)
 
 
 @dataclass(frozen=True)

@@ -117,7 +117,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             store=lambda: self._store, client=lambda: self._client,
             settings=lambda: self._settings, post_ack=self._post_ack,
             enqueue=self._enqueue_turn, submit=self._submit,
-            wait_override=lambda: self.delegation_wait_s)
+            wait_override=lambda: self.delegation_wait_s, spawn=self._spawn)
         self.outbound = Outbound(self)
 
     last_outcome = property(lambda self: self.turns.last_outcome)
@@ -431,10 +431,17 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         elif isinstance(d, AddContext):
             store.add_context(list(d.items))
         elif isinstance(d, SetMode):
+            before = store.ticket(d.issue_id)
             store.set_mode(d.issue_id, d.mode, d.generation)  # type: ignore[arg-type]
+            after = store.ticket(d.issue_id)
+            if d.mode == "untouched" or (before is not None and after is not None
+                                         and before.generation != after.generation):
+                self.opener.drop_pending(store.controls_for_issue(d.issue_id))
         elif isinstance(d, ResolveControl):
             await self.opener.resolve_control(d)
         elif isinstance(d, Interrupt):
+            # Drop pending questions first: the stop's own response must not re-post them.
+            self.opener.drop_pending(self._session_controls(d.agent_session_id))
             try:
                 self.turns.interrupt(d.agent_session_id)
             finally:
@@ -451,6 +458,14 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             log.debug("linear: ignored (%s)", d.reason)
         else:  # pragma: no cover - exhaustive over models.Decision
             log.warning("linear: unknown decision %s", type(d).__name__)
+
+    def _session_controls(self, agent_session_id: str) -> list:
+        store = self._store
+        session = store.session(agent_session_id) if store is not None else None
+        if session is None:
+            return []
+        return [r for r in store.controls_for_issue(session.issue_id)
+                if r.agent_session_id == agent_session_id]
 
     # ------------------------------------------------------------ turn engine glue
 
