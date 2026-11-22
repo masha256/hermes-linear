@@ -262,3 +262,63 @@ def test_update_noop_label_removal_sends_no_write(pin_ctx, ws):
     out = linear_issue_update({"id": "RET-2", "remove_labels": ["Bug"]})  # not carried
     assert out["ok"] is True and out["issue"]["id"] == TASK
     assert ws.writes() == []
+
+
+# ------------------------------------------------------------- open-task tracking (RET-94 T4)
+
+
+def test_task_state_tracks_open_tasks(pin_ctx, ws, adapter):
+    """in_progress / in_review open the task for the session ticket; done, blocked and
+    unblocked close it; a failed call changes nothing."""
+    from hermes_linear.store import Store
+    adapter._store = store = Store.open(":memory:")
+    assert linear_task_state({"id": "RET-2", "state": "in_progress"})["ok"] is True
+    assert store.open_tasks(SELF) == [TASK]
+    assert linear_task_state({"id": "RET-2", "state": "in_review"})["ok"] is True
+    assert store.open_tasks(SELF) == [TASK]
+    assert linear_task_state({"id": "RET-2", "state": "done"})["ok"] is True
+    assert store.open_tasks(SELF) == []
+    for st, extra in (("blocked", {"question": "q?"}), ("unblocked", {})):
+        store.set_open_task(SELF, TASK, True)
+        assert linear_task_state({"id": "RET-2", "state": st, **extra})["ok"] is True
+        assert store.open_tasks(SELF) == [], st
+    # a refusal (out of scope) changes nothing, either way
+    store.set_open_task(SELF, "uuid-other", True)
+    for st in ("in_progress", "done"):
+        assert linear_task_state({"id": "OTH-9", "state": st})["error"] == "OUT_OF_SCOPE"
+    assert store.open_tasks(SELF) == ["uuid-other"]
+    assert linear_task_state({"id": "RET-2", "state": "finished"})["error"] == "BAD_ARGS"
+    assert store.open_tasks(SELF) == ["uuid-other"]
+
+
+def test_task_state_blocked_label_missing_still_closes(pin_ctx, ws, adapter):
+    """LABEL_MISSING with the question posted: the task is blocked, so no longer open."""
+    from hermes_linear.store import Store
+    adapter._store = store = Store.open(":memory:")
+    store.set_open_task(SELF, TASK, True)
+    ws.workspace_labels = []
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "question": "q?"})
+    assert out["error"] == "LABEL_MISSING" and out["question_posted"] is True
+    assert store.open_tasks(SELF) == []
+
+
+def test_task_state_linear_error_changes_nothing(pin_ctx, ws, adapter, monkeypatch):
+    from hermes_linear.store import Store
+    adapter._store = store = Store.open(":memory:")
+
+    async def boom(*_a, **_k):
+        raise agent_tools.LinearError("boom")
+    monkeypatch.setattr(ws, "issue_update", boom)
+    assert linear_task_state({"id": "RET-2", "state": "in_progress"})["ok"] is False
+    assert store.open_tasks(SELF) == []
+
+
+def test_task_state_without_store_still_works(pin_ctx, ws, adapter, loop):
+    adapter._store = None
+    assert linear_task_state({"id": "RET-2", "state": "in_progress"})["ok"] is True
+    # no adapter at all: tracking is skipped, the transition still succeeds
+    ctx = agent_tools.ToolContext(adapter=None, client=ws, session_issue_id=SELF,
+                                  session_key="sk", is_linear=True)
+    a = agent_tools._parse_task_state({"id": "RET-2", "state": "done"})
+    out = asyncio.run_coroutine_threadsafe(agent_tools._task_state(ctx, a), loop).result(5)
+    assert out["ok"] is True and out["state"] == "Done"
