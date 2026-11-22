@@ -366,13 +366,18 @@ def _on_any_loop() -> bool:
 
 def _tool(parse: Callable[[dict], dict],
           body: Callable[[ToolContext, dict], Coroutine[Any, Any, dict]], *,
-          blocking_parse: bool = False) -> Callable[..., dict]:
+          blocking_parse: bool = False, timeout_s: float = TOOL_TIMEOUT_S,
+          finish: Callable[[dict, dict], dict] | None = None) -> Callable[..., dict]:
     """Wrap ``parse`` (sync arg validation) and ``body`` (loop coroutine) into a handler.
 
     With ``blocking_parse`` (``parse`` reads files / runs git), a call on an event-loop
     thread (the ``PluginContext.dispatch_tool`` path) is refused with ``WRONG_THREAD``
-    before ``parse`` runs, so no blocking I/O ever runs on the gateway loop.
+    before ``parse`` runs, so no blocking I/O ever runs on the gateway loop. ``finish``
+    (``(parsed, result) -> result``) runs in the tool thread after a successful ``body``,
+    e.g. to write a file; it is only allowed together with ``blocking_parse``.
     """
+    assert finish is None or blocking_parse, "finish does I/O: needs the on-loop guard"
+
     def handler(args: Any = None, **kw: Any) -> dict:
         try:
             if blocking_parse and _on_any_loop():
@@ -392,7 +397,10 @@ def _tool(parse: Callable[[dict], dict],
                     return await body(ctx, parsed)
                 except _Refusal as r:
                     return _err(r.code)
-            return run_on_adapter(ctx, run)
+            result = run_on_adapter(ctx, run, timeout_s=timeout_s)
+            if finish is not None and result.get("ok"):
+                result = finish(parsed, result)
+            return result
         except Exception as exc:  # noqa: BLE001 - Q3.4: a tool never raises
             return _internal(exc, "tool")
     return handler
@@ -596,11 +604,177 @@ async def _sync_spec(ctx: ToolContext, a: dict) -> dict:
             "url": out.get("url") or issue.get("url"), "inline": a["inline"]}
 
 
+# -- linear_sync_plan (RET-78)
+
+PLAN_MARKER = "plan"
+#: Loop-side budget for one plan sync. A ~30-task plan costs up to ~30 issue reads, ~30
+#: writes and a few comment calls, one GraphQL round trip each (0.3–1 s live): more than
+#: the generic TOOL_TIMEOUT_S (30 s). Every step is idempotent, so a TIMEOUT is retried
+#: safely (children are adopted by their ``T<n> ·`` title on the rerun).
+PLAN_SYNC_TIMEOUT_S = 120.0
+PLAN_SORT_STEP = 10  # subIssueSortOrder = PLAN_SORT_STEP * position (1-based)
+_CLOSED = {"completed", "canceled"}
+
+
+def _state_type(issue: dict) -> str | None:
+    return (issue.get("state") or {}).get("type")
+
+
+def _parse_sync_plan(args: dict) -> dict:
+    """In the tool thread, off the loop: read and parse the plan, and run git (sync.py)."""
+    p, text = _read_source(args)
+    ticket = sync.read_linear_header(text)
+    if ticket is None:
+        raise _Refusal("NO_LINEAR_HEADER")
+    tasks = sync.parse_plan(text)
+    numbers = [t.number for t in tasks]
+    ids = [t.ticket for t in tasks if t.ticket]
+    if not tasks or len(set(numbers)) != len(numbers) or len(set(ids)) != len(ids) \
+            or ticket in ids:
+        raise _Refusal("BAD_ARGS")  # no tasks, a duplicate number/ID, or the project itself
+    return {"path": p, "text": text, "ticket": ticket, "tasks": tasks,
+            "info": sync.source_info(p)}
+
+
+async def _resolve_tasks(ctx: ToolContext, project: dict, tasks: list) -> tuple[dict, list]:
+    """Reads only: task number -> existing issue (full ``issue_get``), and recreated numbers.
+
+    A heading ID wins; a deleted or canceled ticket is recreated. A task without a usable ID
+    adopts an open child titled ``T<n> ·`` not claimed by another heading (crash between
+    create and write-back). Every target is scope-checked before any write.
+    """
+    pid = project["id"]
+    target: dict[int, dict] = {}
+    recreated: list[int] = []
+    for t in tasks:
+        if not t.ticket:
+            continue
+        try:
+            issue = await ctx.client.issue_get(t.ticket)
+        except LinearError as exc:
+            if exc.code != "NOT_FOUND":
+                raise
+            recreated.append(t.number)
+            continue
+        if issue["id"] == pid:
+            raise _Refusal("BAD_ARGS")
+        if _state_type(issue) == "canceled":
+            recreated.append(t.number)
+            continue
+        if (issue.get("parent") or {}).get("id") != pid:  # a child of a checked issue is fine
+            code = await check_write_scope(ctx, issue["id"])
+            if code is not None:
+                raise _Refusal(code)
+        target[t.number] = issue
+    claimed = {i["id"] for i in target.values()}
+    for t in tasks:
+        if t.number in target:
+            continue
+        prefix = f"T{t.number} ·"
+        for c in project.get("children") or []:
+            if c["id"] in claimed or _state_type(c) in _CLOSED \
+                    or not (c.get("title") or "").startswith(prefix):
+                continue
+            target[t.number] = await ctx.client.issue_get(c["id"])
+            claimed.add(c["id"])
+            break
+    return target, recreated
+
+
+async def _sync_plan(ctx: ToolContext, a: dict) -> dict:
+    client, info, tasks = ctx.client, a["info"], a["tasks"]
+    project = await _writable(ctx, a["ticket"])
+    pid, team = project["id"], _team_of(project)
+    target, recreated = await _resolve_tasks(ctx, project, tasks)
+
+    mapping: dict[int, str] = {}
+    created: list[str] = []
+    keep: set[str] = {i["id"] for i in target.values()}
+    for pos, t in enumerate(tasks, 1):
+        order = PLAN_SORT_STEP * pos
+        title, desc = sync.task_title(t), sync.task_description(t, info)
+        issue = target.get(t.number)
+        if issue is None:
+            inp: dict[str, Any] = {"teamId": team, "title": title, "description": desc,
+                                   "parentId": pid, "subIssueSortOrder": order}
+            if (project.get("project") or {}).get("id"):
+                inp["projectId"] = project["project"]["id"]
+            new = await client.issue_create(inp)
+            # On the loop (this coroutine): the UUID Linear returned, never the identifier.
+            ctx.adapter.tool_created.setdefault(ctx.session_key or "", set()).add(new["id"])
+            keep.add(new["id"])
+            mapping[t.number] = new["identifier"]
+            created.append(new["identifier"])
+            continue
+        mapping[t.number] = issue["identifier"]
+        if _state_type(issue) == "completed":
+            continue  # Done tickets are never touched
+        inp = {}
+        if issue.get("title") != title:
+            inp["title"] = title
+        if (issue.get("description") or "") != desc:
+            inp["description"] = desc
+        if issue.get("subIssueSortOrder") != order:
+            inp["subIssueSortOrder"] = order
+        if inp:
+            await client.issue_update(issue["id"], inp)
+
+    canceled: list[str] = []
+    cancel_state: str | None = None
+    for c in project.get("children") or []:
+        if c["id"] in keep or _state_type(c) in _CLOSED \
+                or not sync.MANAGED_TITLE_RE.match(c.get("title") or ""):
+            continue  # in the plan, closed, or not a plan ticket (a human's child)
+        cancel_state = cancel_state or await _state_id(ctx, team, "canceled")
+        # Reason first: a crash in between repeats the comment rather than losing it.
+        await client.comment_create(
+            c["id"], f"Removed from the plan in {info.commit or sync.UNCOMMITTED}.")
+        await client.issue_update(c["id"], {"stateId": cancel_state})
+        canceled.append(c["identifier"])
+
+    # The comment shows the plan as it will be on disk (IDs written back), so a rerun on
+    # the written file finds it unchanged. Markers in the plan text are dropped so no
+    # other edit_marker lookup can ever match this comment.
+    tag = _marker_tag(PLAN_MARKER)
+    text = ANY_MARKER_RE.sub("", sync.write_ticket_ids(a["text"], mapping))
+    body, inline = sync.plan_comment(text, info, tasks, tag, mapping)
+    mine = next((c for c in await client.app_comments(pid) if tag in (c.get("body") or "")),
+                None)  # the app's own comments only: a human quoting the marker is never edited
+    if mine is None:
+        await client.comment_create(pid, body)
+        comment = "created"
+    elif mine.get("body") != body:
+        await client.comment_update(mine["id"], body)
+        comment = "edited"
+    else:
+        comment = "unchanged"
+    return {"ok": True, "issue": project.get("identifier"), "url": project.get("url"),
+            "tasks": mapping, "created": created, "canceled": canceled,
+            "recreated": recreated, "comment": comment, "comment_inline": inline}
+
+
+def _finish_sync_plan(a: dict, out: dict) -> dict:
+    """In the tool thread: write the IDs back into the headings, unless the file changed."""
+    new = sync.write_ticket_ids(a["text"], out["tasks"])
+    out.update(file_changed=False, file_conflict=False)
+    if new == a["text"]:
+        return out
+    if sync.read_source(a["path"]) != a["text"]:
+        out["file_conflict"] = True  # edited meanwhile: rerun the sync on the new file
+        return out
+    sync.write_source(a["path"], new)
+    out["file_changed"] = True
+    return out
+
+
 linear_issue_get = _tool(_parse_get, _get)
 linear_issue_create = _tool(_parse_create, _create)
 linear_issue_update = _tool(_parse_update, _update)
 linear_comment = _tool(_parse_comment, _comment)
 linear_sync_spec = _tool(_parse_sync_spec, _sync_spec, blocking_parse=True)
+linear_sync_plan = _tool(_parse_sync_plan, lambda ctx, a: _sync_plan(ctx, a),  # late-bound
+                         blocking_parse=True, timeout_s=PLAN_SYNC_TIMEOUT_S,
+                         finish=_finish_sync_plan)
 
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
 
@@ -669,6 +843,20 @@ TOOL_SCHEMAS: dict[str, dict] = {
                      "description": "Absolute path to the spec file."},
         }, "required": ["path"]},
     },
+    "linear_sync_plan": {
+        "name": "linear_sync_plan",
+        "description": ("Mirror a plan file onto Linear as the Linear app: the plan as one "
+                        "comment on the ticket named by its 'Linear: <ID>' header, and one "
+                        "sub-ticket 'T<n> · <name>' per '### Task <n>: <name>' heading, in "
+                        "plan order. Headings with '— <ID>' update that ticket; others adopt "
+                        "a matching child or create one. Tickets of removed tasks are "
+                        "canceled; Done tickets are never touched. Writes the IDs back into "
+                        "the headings (commit the file afterwards). Safe to re-run."),
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string",
+                     "description": "Absolute path to the plan file."},
+        }, "required": ["path"]},
+    },
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
@@ -677,10 +865,11 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_issue_update": linear_issue_update,
     "linear_comment": linear_comment,
     "linear_sync_spec": linear_sync_spec,
+    "linear_sync_plan": linear_sync_plan,
 }
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_comment", "linear_issue_create", "linear_issue_get", "linear_issue_update",
-           "linear_sync_spec",
+           "linear_sync_plan", "linear_sync_spec",
            "resolve_context", "resolve_state", "run_on_adapter"]

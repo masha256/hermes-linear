@@ -157,7 +157,7 @@ class FakeWorkspace:
         st = self._state(i["team"], i["state"])
         return {
             "id": i["id"], "identifier": i["identifier"], "title": i["title"],
-            "description": i["description"],
+            "description": i["description"], "subIssueSortOrder": i["subIssueSortOrder"],
             "url": f"https://linear.app/x/issue/{i['identifier']}",
             "state": dict(st), "team": {"id": i["team"]}, "project": copy.deepcopy(i["project"]),
             "parent": {"id": parent["id"], "identifier": parent["identifier"]} if parent else None,

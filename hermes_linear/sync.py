@@ -11,8 +11,11 @@ the adapter loop. Lengths are measured in UTF-16 code units (``utf16_len``), as 
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -80,6 +83,27 @@ def read_source(path: Path, max_bytes: int = MAX_SOURCE_BYTES) -> str | None:
         return data.decode("utf-8")
     except (OSError, UnicodeDecodeError, ValueError):
         return None
+
+
+def write_source(path: Path, text: str) -> None:
+    """Atomically replace the file ``path`` (symlinks followed) with UTF-8 ``text``.
+
+    Same directory temp file, mode copied, then ``os.replace``: a crash never leaves a
+    half-written plan. Raises ``OSError``. Call only off the loop.
+    """
+    target = Path(path).resolve()
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(text.encode("utf-8"))
+        shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ----------------------------------------------------------------- text
@@ -212,7 +236,129 @@ def spec_description(text: str, info: SourceInfo) -> tuple[str, bool]:
     return (summary + tail).lstrip(), False
 
 
-__all__ = ["MAX_SOURCE_BYTES", "SPEC_INLINE_MAX", "SourceInfo", "footer", "git_short_commit",
-           "github_repo",
-           "read_linear_header", "read_source", "render_spec", "run_git", "source_info",
-           "source_path", "spec_description", "spec_summary", "utf16_len", "utf16_truncate"]
+# ----------------------------------------------------------------- plans (RET-78)
+
+#: Limit for the plan comment (marker included), in UTF-16 units. Linear documents no
+#: comment limit; probe P1 measured 200,000 for descriptions, so the same value is used.
+PLAN_COMMENT_MAX = SPEC_INLINE_MAX
+#: A task heading; group 3 is the first ``— <ID>`` token, even when text follows it.
+TASK_HEADING_RE = re.compile(r"^### Task (\d+): (.+?)(?:\s+—\s+([A-Z]+-\d+)\b.*)?\s*$")
+#: Titles of the ticket the plan sync manages: ``T<n> · …`` (U+00B7).
+MANAGED_TITLE_RE = re.compile(r"^T\d+ ·")
+_PLAN_FENCE_RE = re.compile(r"^ {0,3}(```|~~~)")
+_FILES_RE = re.compile(r"^\*\*Files:\*\*")
+
+
+@dataclass(frozen=True)
+class PlanTask:
+    number: int
+    name: str
+    ticket: str | None
+    summary: str
+    line: int  # 1-based line of the heading
+
+
+def _plan_lines(text: str):
+    """``(index, line_without_eol, line_with_eol, fenced)`` for every line of ``text``."""
+    fenced = False
+    for i, raw in enumerate(text.splitlines(keepends=True)):
+        line = raw.rstrip("\r\n")
+        if _PLAN_FENCE_RE.match(line):
+            fenced = not fenced
+            yield i, line, raw, True
+            continue
+        yield i, line, raw, fenced
+
+
+def _summary(body: list[tuple[str, bool]]) -> str:
+    """The first paragraph of ``body`` (lines, fenced flag) that is not a ``**Files:**`` block."""
+    para: list[str] = []
+    for line, fenced in [*body, ("", False)]:
+        if fenced or not line.strip():
+            if para and not _FILES_RE.match(para[0]):
+                return "\n".join(para).strip()
+            para = []
+            continue
+        para.append(line)
+    return ""
+
+
+def parse_plan(text: str) -> list[PlanTask]:
+    """The ``### Task N: <name>[ — <ID>]`` headings outside code fences, in file order."""
+    heads: list[tuple[int, re.Match]] = []
+    lines: list[tuple[str, bool]] = []
+    for i, line, _raw, fenced in _plan_lines(text or ""):
+        lines.append((line, fenced))
+        if not fenced and (m := TASK_HEADING_RE.match(line)):
+            heads.append((i, m))
+    out: list[PlanTask] = []
+    for i, m in heads:
+        end = len(lines)
+        for j in range(i + 1, len(lines)):
+            if not lines[j][1] and lines[j][0].startswith("#"):
+                end = j
+                break
+        out.append(PlanTask(number=int(m.group(1)), name=m.group(2).strip(), ticket=m.group(3),
+                            summary=_summary(lines[i + 1:end]), line=i + 1))
+    return out
+
+
+def write_ticket_ids(text: str, mapping: dict[int, str]) -> str:
+    """``text`` with each mapped heading's ``— <ID>`` added or replaced; nothing else changes."""
+    out: list[str] = []
+    for _i, line, raw, fenced in _plan_lines(text or ""):
+        m = None if fenced else TASK_HEADING_RE.match(line)
+        ident = mapping.get(int(m.group(1))) if m else None
+        if not m or not ident or m.group(3) == ident:
+            out.append(raw)
+            continue
+        eol = raw[len(line):]
+        if m.group(3):
+            new = line[:m.start(3)] + ident + line[m.end(3):]
+        else:
+            new = line[:m.end(2)] + f" — {ident}" + line[m.end(2):]
+        out.append(new + eol)
+    return "".join(out)
+
+
+def task_title(t: PlanTask) -> str:
+    return f"T{t.number} · {t.name}"
+
+
+def task_description(t: PlanTask, info: SourceInfo) -> str:
+    head = f"[Plan]({info.link}) · Task {t.number}"
+    return f"{head}\n\n{t.summary}" if t.summary else head
+
+
+def render_plan(text: str, path: str, short_commit: str | None) -> str:
+    """The plan file, a rule, then the spec footer."""
+    return render_spec(text, path, short_commit)
+
+
+def plan_comment(text: str, info: SourceInfo, tasks: list[PlanTask], marker_tag: str,
+                 tickets: dict[int, str]) -> tuple[str, bool]:
+    """The plan comment body ending in ``marker_tag`` and whether it is the whole plan.
+
+    The whole plan when it fits ``PLAN_COMMENT_MAX`` UTF-16 units; otherwise a link to the
+    file, the task list (``T<n> · <name> — <ID>``), then the footer.
+    """
+    full = f"{render_plan(text, info.path, info.commit)}\n\n{marker_tag}"
+    if utf16_len(full) <= PLAN_COMMENT_MAX:
+        return full, True
+    head = f"Full plan (too long to show here): {info.link}\n\n"
+    tail = f"\n\n---\n{footer(info.path, info.commit)}\n\n{marker_tag}"
+    items = "\n".join(f"- {task_title(t)}" + (f" — {tickets[t.number]}"
+                                              if tickets.get(t.number) else "")
+                      for t in tasks)
+    room = PLAN_COMMENT_MAX - utf16_len(head) - utf16_len(tail)
+    if utf16_len(items) > room:
+        items = utf16_truncate(items, room - utf16_len(TRUNCATED)).rstrip() + TRUNCATED
+    return head + items + tail, False
+
+
+__all__ = ["MANAGED_TITLE_RE", "MAX_SOURCE_BYTES", "PLAN_COMMENT_MAX", "PlanTask",
+           "SPEC_INLINE_MAX", "SourceInfo", "TASK_HEADING_RE", "footer", "git_short_commit",
+           "github_repo", "parse_plan", "plan_comment", "read_linear_header", "read_source",
+           "render_plan", "render_spec", "run_git", "source_info", "source_path",
+           "spec_description", "spec_summary", "task_description", "task_title", "utf16_len",
+           "utf16_truncate", "write_source", "write_ticket_ids"]

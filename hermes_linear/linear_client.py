@@ -87,7 +87,7 @@ MUTATION_ISSUE_UPDATE = """mutation IssueUpdate($id: String!, $input: IssueUpdat
 
 QUERY_ISSUE_GET = """query IssueGet($id: String!) {
   issue(id: $id) {
-    id identifier title description url
+    id identifier title description url subIssueSortOrder
     state { id name type }
     team { id }
     project { id name externalLinks { nodes { label url } } }
