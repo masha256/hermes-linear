@@ -1,0 +1,95 @@
+{
+  "type": "AgentSessionEvent",
+  "action": "created",
+  "createdAt": "2026-11-21T21:00:32.696Z",
+  "organizationId": "00000000-0000-4000-8000-000000000003",
+  "oauthClientId": "00000000000000000000000000000001",
+  "appUserId": "00000000-0000-4000-8000-000000000001",
+  "agentSession": {
+    "id": "00000000-0000-4000-8000-000000000019",
+    "createdAt": "2026-11-21T21:00:32.222Z",
+    "updatedAt": "2026-11-21T21:00:32.222Z",
+    "archivedAt": null,
+    "creatorId": "00000000-0000-4000-8000-000000000006",
+    "appUserId": "00000000-0000-4000-8000-000000000001",
+    "commentId": "00000000-0000-4000-8000-000000000020",
+    "sourceCommentId": null,
+    "issueId": "00000000-0000-4000-8000-000000000021",
+    "pullRequestId": null,
+    "slugId": "57ce9a55cf3c0",
+    "status": "pending",
+    "startedAt": null,
+    "endedAt": null,
+    "lastAgentReplyAt": null,
+    "dismissedAt": null,
+    "dismissedById": null,
+    "externalLink": null,
+    "summary": null,
+    "sourceMetadata": null,
+    "modelSelection": null,
+    "plan": null,
+    "workspaceDiff": null,
+    "context": [],
+    "url": "https://linear.app/example-workspace/agent-session/00000000-0000-4000-8000-000000000019",
+    "externalUrls": [],
+    "organizationId": "00000000-0000-4000-8000-000000000003",
+    "creator": {
+      "id": "00000000-0000-4000-8000-000000000006",
+      "name": "Test User",
+      "email": "user2@example.com",
+      "avatarUrl": "https://public.linear.app/00000000-0000-4000-8000-000000000006/00000000-0000-4000-8000-000000000009",
+      "url": "https://linear.app/example-workspace/profiles/testuser"
+    },
+    "comment": {
+      "id": "00000000-0000-4000-8000-000000000020",
+      "body": "This thread is for an agent session with hermestest.",
+      "issueId": "00000000-0000-4000-8000-000000000021"
+    },
+    "issue": {
+      "id": "00000000-0000-4000-8000-000000000021",
+      "title": "Second test ticket for neo",
+      "teamId": "00000000-0000-4000-8000-000000000007",
+      "team": {
+        "id": "00000000-0000-4000-8000-000000000007",
+        "key": "RET",
+        "name": "Example Team"
+      },
+      "identifier": "RET-62",
+      "url": "https://linear.app/example-workspace/issue/RET-62/second-test-ticket-for-neo",
+      "description": ""
+    }
+  },
+  "agentActivity": {
+    "id": "00000000-0000-4000-8000-000000000022",
+    "createdAt": "2026-11-21T21:00:32.222Z",
+    "updatedAt": "2026-11-21T21:00:32.222Z",
+    "archivedAt": null,
+    "agentSessionId": "00000000-0000-4000-8000-000000000019",
+    "sourceCommentId": "00000000-0000-4000-8000-000000000020",
+    "userId": "00000000-0000-4000-8000-000000000006",
+    "sourceMetadata": null,
+    "executionSkippedReason": null,
+    "signal": null,
+    "ephemeral": false,
+    "pushSummary": null,
+    "queued": false,
+    "sentAt": null,
+    "signalMetadata": null,
+    "content": {
+      "type": "prompt",
+      "body": "Work on [RET-62](https://linear.app/example-workspace/issue/RET-62/second-test-ticket-for-neo)"
+    },
+    "user": {
+      "id": "00000000-0000-4000-8000-000000000006",
+      "name": "Test User",
+      "email": "user2@example.com",
+      "avatarUrl": "https://public.linear.app/00000000-0000-4000-8000-000000000006/00000000-0000-4000-8000-000000000009",
+      "url": "https://linear.app/example-workspace/profiles/testuser"
+    }
+  },
+  "previousComments": null,
+  "guidance": null,
+  "promptContext": "<issue identifier=\"RET-62\">\n<title>Second test ticket for neo</title>\n<team name=\"Example Team\"/>\n<project name=\"Valkyrie\">Hermes Linear channel plugin: one Hermes session per delegated ticket.</project>\n</issue>\n\n<user-request>\nWork on [RET-62](https://linear.app/example-workspace/issue/RET-62/second-test-ticket-for-neo)\n</user-request>",
+  "webhookTimestamp": 1795294832708,
+  "webhookId": "00000000-0000-4000-8000-000000000008"
+}

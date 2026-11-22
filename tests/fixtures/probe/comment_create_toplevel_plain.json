@@ -1,0 +1,47 @@
+{
+  "action": "create",
+  "actor": {
+    "id": "00000000-0000-4000-8000-000000000006",
+    "name": "Test User",
+    "email": "user2@example.com",
+    "avatarUrl": "https://public.linear.app/00000000-0000-4000-8000-000000000006/00000000-0000-4000-8000-000000000009",
+    "url": "https://linear.app/example-workspace/profiles/testuser",
+    "type": "user"
+  },
+  "createdAt": "2026-11-21T20:57:03.874Z",
+  "url": "https://linear.app/example-workspace/issue/RET-61/test-ticket-for-neo#comment-00000017",
+  "type": "Comment",
+  "organizationId": "00000000-0000-4000-8000-000000000003",
+  "data": {
+    "id": "00000000-0000-4000-8000-000000000017",
+    "createdAt": "2026-11-21T20:57:03.874Z",
+    "updatedAt": "2026-11-21T20:57:03.864Z",
+    "body": "top-level comment with no mention",
+    "issueId": "00000000-0000-4000-8000-000000000011",
+    "userId": "00000000-0000-4000-8000-000000000006",
+    "reactionData": [],
+    "isArtificialAgentSessionRoot": false,
+    "botActor": null,
+    "user": {
+      "id": "00000000-0000-4000-8000-000000000006",
+      "name": "Test User",
+      "email": "user2@example.com",
+      "avatarUrl": "https://public.linear.app/00000000-0000-4000-8000-000000000006/00000000-0000-4000-8000-000000000009",
+      "url": "https://linear.app/example-workspace/profiles/testuser"
+    },
+    "issue": {
+      "id": "00000000-0000-4000-8000-000000000011",
+      "title": "Test ticket for neo",
+      "teamId": "00000000-0000-4000-8000-000000000007",
+      "team": {
+        "id": "00000000-0000-4000-8000-000000000007",
+        "key": "RET",
+        "name": "Example Team"
+      },
+      "identifier": "RET-61",
+      "url": "https://linear.app/example-workspace/issue/RET-61/test-ticket-for-neo"
+    }
+  },
+  "webhookTimestamp": 1795294624015,
+  "webhookId": "00000000-0000-4000-8000-000000000008"
+}

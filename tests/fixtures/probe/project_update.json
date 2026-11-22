@@ -1,0 +1,62 @@
+{
+  "action": "update",
+  "actor": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "name": "Hermes Test",
+    "email": "user1@example.com",
+    "url": "https://linear.app/example-workspace/profiles/hermestest",
+    "type": "user"
+  },
+  "createdAt": "2026-11-21T20:54:00.364Z",
+  "updatedFrom": {
+    "updatedAt": "2026-11-21T20:49:07.150Z",
+    "description": ""
+  },
+  "url": "https://linear.app/example-workspace/project/valkyrie-ccc0934644b5",
+  "type": "Project",
+  "organizationId": "00000000-0000-4000-8000-000000000003",
+  "data": {
+    "id": "00000000-0000-4000-8000-000000000004",
+    "createdAt": "2026-11-21T20:49:07.150Z",
+    "updatedAt": "2026-11-21T20:54:00.362Z",
+    "frequencyResolution": "weekly",
+    "name": "Valkyrie",
+    "description": "Hermes Linear channel plugin: one Hermes session per delegated ticket.",
+    "slugId": "ccc0934644b5",
+    "icon": ":shield:",
+    "color": "#eb5757",
+    "statusId": "00000000-0000-4000-8000-000000000005",
+    "creatorId": "00000000-0000-4000-8000-000000000006",
+    "startDate": null,
+    "startDateResolution": null,
+    "targetDate": null,
+    "targetDateResolution": null,
+    "sortOrder": 2212.37,
+    "prioritySortOrder": -491.39,
+    "priority": 0,
+    "issueCountHistory": [],
+    "completedIssueCountHistory": [],
+    "scopeHistory": [],
+    "completedScopeHistory": [],
+    "inProgressScopeHistory": [],
+    "labelIds": [],
+    "url": "https://linear.app/example-workspace/project/valkyrie-ccc0934644b5",
+    "identifier": "P-RET-3",
+    "previousIdentifiers": [],
+    "teamIds": [
+      "00000000-0000-4000-8000-000000000007"
+    ],
+    "memberIds": [],
+    "milestones": [],
+    "initiatives": [],
+    "status": {
+      "id": "00000000-0000-4000-8000-000000000005",
+      "color": "#F2994A",
+      "name": "Backlog",
+      "type": "backlog"
+    },
+    "content": "Hermes channel plugin for Linear's agent API. Third-party `kind: platform` plugin, no Hermes core changes.\n\n## Decided\n\n* Python plugin, full channel adapter: Linear events become gateway messages; the gateway owns sessions\n* One Linear OAuth app per Hermes profile (`actor=app`); tokens via client credentials (auth-code flow is the fallback)\n* Webhooks only, exposed via Tailscale Funnel; no polling\n* One shared listener: `/linear/<profile>/webhook`\n* Delegated ticket = one Hermes session for the whole ticket: every agent thread, plain human comments (wake the agent), edits (context only)\n* Non-delegated ticket: @mention = thread-scoped one-off session. @mention on a delegated ticket joins the ticket session\n* Re-delegation resumes the ticket session unless Done/Canceled\n* Context-only digest: Issues, Comments, Issue attachments, Projects, Project updates (not label-definition events)\n* Access: `LINEAR_ALLOWED_USERS` (UUID / email / `*`) or `LINEAR_ALLOW_ALL_USERS`; default deny; denied users excluded from context\n* Visibility: every tool call as an `action`, commentary as `thought`, heartbeat on long turns, todo → Linear plan\n* Approvals/clarify as `elicitation` + `select`; approvers follow `approvals.approvers`\n* Build order: probe → core delegated loop → the rest. M1 exit = dogfood (retire the `linear-orion` route)"
+  },
+  "webhookTimestamp": 1795294440522,
+  "webhookId": "00000000-0000-4000-8000-000000000008"
+}
