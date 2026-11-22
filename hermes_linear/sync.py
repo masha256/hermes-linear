@@ -10,6 +10,7 @@ the adapter loop. Lengths are measured in UTF-16 code units (``utf16_len``), as 
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -88,7 +89,7 @@ def read_source(path: Path, max_bytes: int = MAX_SOURCE_BYTES) -> str | None:
 def write_source(path: Path, text: str) -> None:
     """Atomically replace the file ``path`` (symlinks followed) with UTF-8 ``text``.
 
-    Same directory temp file, mode copied, then ``os.replace``: a crash never leaves a
+    Same directory temp file (fsynced), mode copied, then ``os.replace``: a crash never leaves a
     half-written plan. Raises ``OSError``. Call only off the loop.
     """
     target = Path(path).resolve()
@@ -96,6 +97,8 @@ def write_source(path: Path, text: str) -> None:
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(text.encode("utf-8"))
+            fh.flush()
+            os.fsync(fh.fileno())  # the data is on disk before the rename makes it visible
         shutil.copymode(target, tmp)
         os.replace(tmp, target)
     except BaseException:
@@ -245,6 +248,11 @@ PLAN_COMMENT_MAX = SPEC_INLINE_MAX
 TASK_HEADING_RE = re.compile(r"^### Task (\d+): (.+?)(?:\s+—\s+([A-Z]+-\d+)\b.*)?\s*$")
 #: Titles of the ticket the plan sync manages: ``T<n> · …`` (U+00B7).
 MANAGED_TITLE_RE = re.compile(r"^T\d+ ·")
+#: The content-hash marker ending every task ticket description the plan sync writes
+#: (Ruling S16). Probe P8: Linear normalizes descriptions (``- x`` -> ``* x``, blank line
+#: before lists) but keeps this trailing comment, so the hash, not the text, is compared.
+DESC_HASH_RE = re.compile(r"<!--\s*hermes-linear:h=([0-9a-f]{12})\s*-->\s*\Z")
+DESC_HASH_LEN = 12
 _PLAN_FENCE_RE = re.compile(r"^ {0,3}(```|~~~)")
 _FILES_RE = re.compile(r"^\*\*Files:\*\*")
 
@@ -326,8 +334,25 @@ def task_title(t: PlanTask) -> str:
 
 
 def task_description(t: PlanTask, info: SourceInfo) -> str:
+    """The rendered description, without the hash marker (``with_desc_hash`` adds it)."""
     head = f"[Plan]({info.link}) · Task {t.number}"
     return f"{head}\n\n{t.summary}" if t.summary else head
+
+
+def desc_hash(rendered: str) -> str:
+    """``sha256(rendered)[:12]`` (hex) of a description without its marker."""
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()[:DESC_HASH_LEN]
+
+
+def with_desc_hash(rendered: str) -> str:
+    """``rendered`` with ``<!-- hermes-linear:h=<desc_hash> -->`` as its last line."""
+    return f"{rendered}\n\n<!-- hermes-linear:h={desc_hash(rendered)} -->"
+
+
+def read_desc_hash(description: str | None) -> str | None:
+    """The ``h=`` of the hash marker ending ``description`` (as Linear returns it), else None."""
+    m = DESC_HASH_RE.search(description or "")
+    return m.group(1) if m else None
 
 
 def render_plan(text: str, path: str, short_commit: str | None) -> str:
@@ -356,7 +381,8 @@ def plan_comment(text: str, info: SourceInfo, tasks: list[PlanTask], marker_tag:
     return head + items + tail, False
 
 
-__all__ = ["MANAGED_TITLE_RE", "MAX_SOURCE_BYTES", "PLAN_COMMENT_MAX", "PlanTask",
+__all__ = ["DESC_HASH_RE", "MANAGED_TITLE_RE", "desc_hash", "read_desc_hash",
+           "with_desc_hash", "MAX_SOURCE_BYTES", "PLAN_COMMENT_MAX", "PlanTask",
            "SPEC_INLINE_MAX", "SourceInfo", "TASK_HEADING_RE", "footer", "git_short_commit",
            "github_repo", "parse_plan", "plan_comment", "read_linear_header", "read_source",
            "render_plan", "render_spec", "run_git", "source_info", "source_path",

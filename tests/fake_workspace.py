@@ -11,6 +11,11 @@ Model (all ids are opaque strings; issue ids are UUID-like, identifiers are ``TE
   subIssueSortOrder``; ``children`` are derived from ``parent`` and returned in insertion
   order, *not* sorted (real Linear does not sort them either; ``LinearClient.issue_get``
   does, and the fake's callers must not rely on it).
+- issues carry ``creator`` (a user id, ``VIEWER`` for the app; ``add_issue`` defaults to
+  ``HUMAN``, ``issue_create`` sets ``VIEWER``); children expose it as ``creator {id}``.
+- ``normalize=True`` mimics probe P8: stored *descriptions* are markdown-normalized
+  (``- item`` -> ``* item``, a blank line inserted before a list); titles and comment
+  bodies are kept byte-exact, as live Linear does.
 - comments: ``id issue body user`` (``user`` is ``VIEWER`` for the app's own comments,
   any other id for a human); ``app_comments`` is oldest first, as the client returns it.
 - states / labels: per team, ``{"id", "name", "type"}`` / ``{"id", "name"}``, plus
@@ -41,11 +46,13 @@ from __future__ import annotations
 
 import copy
 import itertools
+import re
 from typing import Any
 
 from hermes_linear.linear_client import LinearError
 
 VIEWER = "app-user"
+HUMAN = "human-1"
 TEAM = "team-1"
 PROJECT = {"id": "proj-1", "name": "Hermes",
            "externalLinks": [{"label": "Spec", "url": "https://example.test/spec"}]}
@@ -72,12 +79,28 @@ UPDATE_FIELDS = {"title", "description", "stateId", "addedLabelIds", "removedLab
                  "labelIds", "parentId", "projectId", "subIssueSortOrder"}
 
 
+_BULLET_RE = re.compile(r"^(\s*)- ", re.MULTILINE)
+
+
+def normalize_markdown(text: str) -> str:
+    """Probe P8's description normalization: ``- x`` -> ``* x``, blank line before lists."""
+    out: list[str] = []
+    for line in _BULLET_RE.sub(r"\1* ", text).split("\n"):
+        is_item = line.lstrip().startswith("* ")
+        prev = out[-1] if out else ""
+        if is_item and prev.strip() and not prev.lstrip().startswith("* "):
+            out.append("")
+        out.append(line)
+    return "\n".join(out)
+
+
 def _not_found(what: str) -> LinearError:
     return LinearError(f"Entity not found: {what}", code="NOT_FOUND", status=200)
 
 
 class FakeWorkspace:
-    def __init__(self) -> None:
+    def __init__(self, *, normalize: bool = False) -> None:
+        self.normalize = normalize
         self.issues: dict[str, dict] = {}
         self.comments: dict[str, dict] = {}
         self.states: dict[str, list[dict]] = {TEAM: [dict(s) for s in DEFAULT_STATES]}
@@ -91,7 +114,8 @@ class FakeWorkspace:
     def add_issue(self, identifier: str | None = None, *, title: str = "", description: str = "",
                   team: str = TEAM, project: dict | None = PROJECT, parent: str | None = None,
                   labels: tuple[str, ...] = (), state: str = "st-todo",
-                  sort_order: float = 0.0, uuid: str | None = None) -> str:
+                  sort_order: float = 0.0, uuid: str | None = None,
+                  creator: str | None = HUMAN) -> str:
         """Add an issue; ``labels`` are label ids. Returns its id."""
         iid = uuid or f"uuid-{next(self._ids)}"
         self.issues[iid] = {
@@ -99,7 +123,7 @@ class FakeWorkspace:
             "title": title, "description": description, "team": team,
             "project": copy.deepcopy(project),
             "parent": parent, "labels": list(labels), "state": state,
-            "subIssueSortOrder": sort_order,
+            "subIssueSortOrder": sort_order, "creator": creator,
         }
         return iid
 
@@ -165,9 +189,13 @@ class FakeWorkspace:
             "children": [
                 {"id": c["id"], "identifier": c["identifier"], "title": c["title"],
                  "subIssueSortOrder": c["subIssueSortOrder"],
-                 "state": {"type": self._state(c["team"], c["state"])["type"]}}
+                 "state": {"type": self._state(c["team"], c["state"])["type"]},
+                 "creator": {"id": c["creator"]} if c.get("creator") else None}
                 for c in children],
         }
+
+    def _desc(self, text: str) -> str:
+        return normalize_markdown(text) if self.normalize else text
 
     def _summary(self, i: dict) -> dict:
         return {"id": i["id"], "identifier": i["identifier"], "title": i["title"],
@@ -184,19 +212,21 @@ class FakeWorkspace:
         project = PROJECT if inp.get("projectId") == PROJECT["id"] else None
         state = inp.get("stateId") or self.default_state(team)
         self._state(team, state)
-        iid = self.add_issue(title=inp.get("title") or "", description=inp.get("description") or "",
+        iid = self.add_issue(title=inp.get("title") or "",
+                             description=self._desc(inp.get("description") or ""),
                              team=team, project=project, parent=inp.get("parentId"),
                              labels=tuple(inp.get("labelIds") or ()), state=state,
-                             sort_order=inp.get("subIssueSortOrder") or 0.0)
+                             sort_order=inp.get("subIssueSortOrder") or 0.0, creator=VIEWER)
         return self._summary(self.issues[iid])
 
     async def issue_update(self, issue_id: str, inp: dict) -> dict:
         self.calls.append(("issue_update", (issue_id, dict(inp))))
         assert set(inp) <= UPDATE_FIELDS, set(inp) - UPDATE_FIELDS
         i = self.issue(issue_id)
-        for key in ("title", "description"):
-            if key in inp:
-                i[key] = inp[key]
+        if "title" in inp:
+            i["title"] = inp["title"]
+        if "description" in inp:
+            i["description"] = self._desc(inp["description"])
         if "stateId" in inp:
             self._state(i["team"], inp["stateId"])
             i["state"] = inp["stateId"]

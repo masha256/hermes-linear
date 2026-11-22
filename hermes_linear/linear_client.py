@@ -93,7 +93,20 @@ QUERY_ISSUE_GET = """query IssueGet($id: String!) {
     project { id name externalLinks { nodes { label url } } }
     parent { id identifier }
     labels { nodes { id name } }
-    children { nodes { id identifier title subIssueSortOrder createdAt state { type } } }
+    children(first: 250) {
+      nodes { id identifier title subIssueSortOrder createdAt state { type } creator { id } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
+
+# Further pages of ``Issue.children`` (same node fields as ``QUERY_ISSUE_GET``).
+QUERY_ISSUE_CHILDREN = """query IssueChildren($id: String!, $after: String) {
+  issue(id: $id) {
+    children(first: 250, after: $after) {
+      nodes { id identifier title subIssueSortOrder createdAt state { type } creator { id } }
+      pageInfo { hasNextPage endCursor }
+    }
   }
 }"""
 
@@ -421,11 +434,11 @@ class LinearClient:
         return list((conn or {}).get("nodes") or []) if isinstance(conn, dict) else []
 
     async def _paged(self, query: str, variables: dict,
-                     conn_of: Callable[[dict], Any], *, cap: int = PAGE_CAP) -> list[dict]:
+                     conn_of: Callable[[dict], Any], *, cap: int = PAGE_CAP,
+                     after: str | None = None) -> list[dict]:
         """All nodes of a cursor-paged connection (``pageInfo{hasNextPage endCursor}``),
-        at most ``cap``."""
+        at most ``cap``, starting after cursor ``after`` (``None``: the first page)."""
         out: list[dict] = []
-        after: str | None = None
         while True:
             data = await self.gql(query, {**variables, "after": after})
             conn = conn_of(data)
@@ -447,15 +460,27 @@ class LinearClient:
 
     async def issue_get(self, issue_id: str) -> dict:
         """An issue by UUID or identifier, connections flattened to lists
-        (``labels``, ``children``, ``project.externalLinks``). Null issue: ``NOT_FOUND``."""
+        (``labels``, ``children``, ``project.externalLinks``). Null issue: ``NOT_FOUND``.
+
+        ``children`` is every page (up to ``PAGE_CAP``); each child carries ``creator``
+        (``{id}`` or ``None``) so callers can tell the app's children from humans'."""
         data = await self.gql(QUERY_ISSUE_GET, {"id": issue_id})
         i = data.get("issue")
         if not isinstance(i, dict) or not i.get("id"):
             raise LinearError("issue not found", code="NOT_FOUND")
         out = dict(i)
         out["labels"] = self._nodes(i.get("labels"))
+        kids = self._nodes(i.get("children"))
+        info = (i.get("children") or {}).get("pageInfo") if isinstance(i.get("children"),
+                                                                       dict) else None
+        if (info or {}).get("hasNextPage") and (info or {}).get("endCursor") \
+                and len(kids) < PAGE_CAP:
+            kids += await self._paged(
+                QUERY_ISSUE_CHILDREN, {"id": i["id"]},
+                lambda d: (d.get("issue") or {}).get("children"),
+                cap=PAGE_CAP - len(kids), after=info["endCursor"])
         # Linear returns children in no particular order (live probe): sort them.
-        out["children"] = sorted(self._nodes(i.get("children")), key=self._child_order)
+        out["children"] = sorted(kids, key=self._child_order)
         if isinstance(i.get("project"), dict):
             out["project"] = {**i["project"],
                               "externalLinks": self._nodes(i["project"].get("externalLinks"))}

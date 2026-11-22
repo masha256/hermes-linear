@@ -13,14 +13,14 @@ from pathlib import Path
 
 import pytest
 
-from fake_workspace import FakeWorkspace
+from fake_workspace import HUMAN, VIEWER, FakeWorkspace, normalize_markdown
 from test_agent_tools_runtime import new_adapter
 
 from hermes_linear import agent_tools, sync
 from hermes_linear.agent_tools import TOOL_HANDLERS, TOOL_SCHEMAS, linear_sync_plan
 from hermes_linear.linear_client import LinearClient
-from hermes_linear.sync import (PLAN_COMMENT_MAX, PlanTask, parse_plan, render_plan,
-                                task_title, write_ticket_ids)
+from hermes_linear.sync import (PLAN_COMMENT_MAX, PlanTask, parse_plan, read_desc_hash,
+                                render_plan, task_title, with_desc_hash, write_ticket_ids)
 
 SELF = "uuid-self"
 FIXTURE = Path(__file__).parent / "fixtures" / "plans" / "channel-plan.md"
@@ -52,6 +52,20 @@ continues here.
 ### Task 3: Gamma
 
 Gamma things.
+"""
+
+
+LIST_PLAN = """Linear: RET-1
+
+### Task 1: Listy
+
+Steps:
+- one
+- two
+
+### Task 2: Plain
+
+Just text.
 """
 
 
@@ -215,9 +229,12 @@ def test_sync_creates_children_in_order(pin_ctx, ws, plan, adapter):
     assert out["tasks"] == {1: ids[0], 2: ids[1], 3: ids[2]}
     assert out["created"] == ids and out["canceled"] == []
     assert out["file_changed"] is True
-    assert kids[0]["description"] == f"[Plan]({link(plan)}) · Task 1\n\nDo alpha first."
-    assert kids[1]["description"] == (f"[Plan]({link(plan)}) · Task 2\n\n"
-                                      "Beta summary paragraph\ncontinues here.")
+    assert kids[0]["description"] == with_desc_hash(
+        f"[Plan]({link(plan)}) · Task 1\n\nDo alpha first.")
+    assert kids[1]["description"] == with_desc_hash(
+        f"[Plan]({link(plan)}) · Task 2\n\nBeta summary paragraph\ncontinues here.")
+    assert kids[0]["description"].splitlines()[-1].startswith("<!-- hermes-linear:h=")
+    assert all(k["creator"] == VIEWER for k in kids)
     assert all(k["project"] is not None and k["team"] == "team-1" for k in kids)
     creates = [c[1] for c in ws.writes() if c[0] == "issue_create"]
     assert [c["subIssueSortOrder"] for c in creates] == [10, 20, 30]
@@ -229,6 +246,8 @@ def test_sync_creates_children_in_order(pin_ctx, ws, plan, adapter):
 
 
 def test_sync_plan_idempotent(pin_ctx, ws, plan):
+    ws.normalize = True  # probe P8: Linear rewrites descriptions on save
+    plan.write_text(LIST_PLAN, encoding="utf-8")
     first = linear_sync_plan({"path": str(plan)})
     assert first["ok"] is True
     text = plan.read_text(encoding="utf-8")
@@ -239,6 +258,33 @@ def test_sync_plan_idempotent(pin_ctx, ws, plan):
     assert second["file_changed"] is False and second["tasks"] == first["tasks"]
     assert plan.read_text(encoding="utf-8") == text
     assert [c for c in ws.calls[n:] if c in ws.writes()] == []  # zero writes
+    stored = ws.issue(first["tasks"][1])["description"]
+    assert "* one" in stored and "- one" not in stored  # normalized, yet not rewritten
+
+
+def test_summary_change_rewrites_description_once(pin_ctx, ws, plan):
+    ws.normalize = True
+    plan.write_text(LIST_PLAN, encoding="utf-8")
+    first = linear_sync_plan({"path": str(plan)})["tasks"]
+    text = plan.read_text(encoding="utf-8")
+    plan.write_text(text.replace("- two", "- two\n- three"), encoding="utf-8")
+    n = len(ws.writes())
+    assert linear_sync_plan({"path": str(plan)})["ok"] is True
+    updates = [c[1] for c in ws.writes()[n:] if c[0] == "issue_update"]
+    assert updates == [(ws.issue(first[1])["id"], {"description": updates[0][1]["description"]})]
+    assert "- three" in updates[0][1]["description"]
+    assert read_desc_hash(ws.issue(first[1])["description"]) is not None
+    n = len(ws.writes())
+    linear_sync_plan({"path": str(plan)})
+    assert ws.writes()[n:] == []
+
+
+def test_normalize_markdown_mimics_p8():
+    assert normalize_markdown("Do:\n- a\n- b") == "Do:\n\n* a\n* b"
+    assert normalize_markdown("x\n\n<!-- hermes-linear:h=abc123abc123 -->") == (
+        "x\n\n<!-- hermes-linear:h=abc123abc123 -->")
+    assert read_desc_hash(normalize_markdown(with_desc_hash("Do:\n- a"))) == read_desc_hash(
+        with_desc_hash("Do:\n- a"))
 
 
 def test_sync_plan_crash_before_writeback_no_duplicate(pin_ctx, ws, plan):
@@ -298,12 +344,98 @@ continues here.
     assert out["file_changed"] is False
 
 
-def test_renamed_task_without_id_adopted_by_prefix(pin_ctx, ws, plan):
+def test_adoption_needs_the_exact_title(pin_ctx, ws, plan):
+    """M3: adopt only an open, app-made child titled exactly ``T<n> · <name>``."""
     first = linear_sync_plan({"path": str(plan)})["tasks"]
     plan.write_text(PLAN.replace("### Task 2: Beta", "### Task 2: Beta prime"), encoding="utf-8")
+    out = linear_sync_plan({"path": str(plan)})  # IDs lost and renamed: a new ticket
+    assert out["tasks"][1] == first[1] and out["tasks"][3] == first[3]
+    assert len(out["created"]) == 1 and out["tasks"][2] == out["created"][0]
+    assert out["canceled"] == [first[2]]
+    assert ws.issue(first[2])["title"] == "T2 · Beta"
+
+
+def test_replaced_task_number_cancels_old_creates_new(pin_ctx, ws, tmp_path):
+    f = tmp_path / "plan.md"
+    f.write_text("Linear: RET-1\n\n### Task 4: Keep\n\nK.\n\n### Task 5: Old thing\n\nO.\n",
+                 encoding="utf-8")
+    first = linear_sync_plan({"path": str(f)})["tasks"]
+    text = f.read_text(encoding="utf-8")
+    f.write_text(text[:text.index("### Task 5")] + "### Task 5: New thing\n\nN.\n",
+                 encoding="utf-8")
+    out = linear_sync_plan({"path": str(f)})
+    assert out["ok"] is True and out["canceled"] == [first[5]]
+    assert out["created"] == [out["tasks"][5]] and out["tasks"][5] != first[5]
+    assert out["tasks"][4] == first[4]
+    assert ws.issue(first[5])["state"] == "st-cancel"
+    assert ws.issue(first[5])["title"] == "T5 · Old thing"  # never retitled
+    assert ws.issue(out["tasks"][5])["title"] == "T5 · New thing"
+
+
+def test_human_children_never_canceled_or_adopted(pin_ctx, ws, plan):
+    """I2 / Ruling S17: only children the app created are adopted or canceled."""
+    human_t1 = ws.add_issue(title="T1 · Alpha", parent=SELF, creator=HUMAN)
+    human_t9 = ws.add_issue(title="T9 · Human task", parent=SELF, creator=HUMAN)
+    no_creator = ws.add_issue(title="T8 · Gone user", parent=SELF, creator=None)
     out = linear_sync_plan({"path": str(plan)})
-    assert out["created"] == [] and out["tasks"] == first
-    assert ws.issue(first[2])["title"] == "T2 · Beta prime"
+    assert out["ok"] is True and len(out["created"]) == 3
+    assert out["tasks"][1] != ws.issues[human_t1]["identifier"]  # not adopted
+    assert out["canceled"] == []
+    assert sorted(out["unmanaged"]) == sorted(ws.issues[i]["identifier"]
+                                              for i in (human_t1, human_t9, no_creator))
+    for i in (human_t1, human_t9, no_creator):
+        assert ws.issues[i]["state"] == "st-todo"
+        assert not [c for c in ws.writes() if c[0] in {"issue_update", "comment_create"}
+                    and c[1][0] == i]
+    assert ws.issues[human_t1]["title"] == "T1 · Alpha"
+
+
+def test_app_child_of_removed_task_canceled_but_human_kept(pin_ctx, ws, plan):
+    app_t7 = ws.add_issue(title="T7 · Stale", parent=SELF, creator=VIEWER)
+    human_t7 = ws.add_issue(title="T7 · Stale", parent=SELF, creator=HUMAN)
+    out = linear_sync_plan({"path": str(plan)})
+    assert out["canceled"] == [ws.issues[app_t7]["identifier"]]
+    assert out["unmanaged"] == [ws.issues[human_t7]["identifier"]]
+    assert ws.issues[human_t7]["state"] == "st-todo"
+
+
+def test_heading_naming_session_ticket_refused_for_that_task(pin_ctx, ws, tmp_path):
+    """M7: the session ticket (not the project ticket) is never a task ticket."""
+    ws.add_issue("RET-50", title="Session ticket", uuid="uuid-sess", creator=VIEWER)
+    ws.issues[SELF]["parent"] = "uuid-sess"  # the project ticket is in the session's scope
+    pin_ctx(issue="uuid-sess")
+    f = tmp_path / "plan.md"
+    text = "Linear: RET-1\n\n### Task 1: A — RET-50\n\nA.\n\n### Task 2: B\n\nB.\n"
+    f.write_text(text, encoding="utf-8")
+    out = linear_sync_plan({"path": str(f)})
+    assert out["ok"] is True and out["errors"] == {1: "BAD_ARGS"}
+    assert 1 not in out["tasks"] and len(out["created"]) == 1
+    assert ws.issues["uuid-sess"]["title"] == "Session ticket"
+    assert not [c for c in ws.writes() if c[0] == "issue_update" and c[1][0] == "uuid-sess"]
+    assert parse_plan(f.read_text(encoding="utf-8"))[0].ticket == "RET-50"
+
+
+def test_writeback_oserror_reports_file_error(pin_ctx, ws, plan, monkeypatch):
+    """M9: the Linear writes are done; a failed write-back still answers ok."""
+    def boom(path, text):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(sync, "write_source", boom)
+    out = linear_sync_plan({"path": str(plan)})
+    assert out["ok"] is True and out["file_error"] == "Permission denied"
+    assert len(out["created"]) == 3 and out["canceled"] == []
+    assert out["file_changed"] is False and plan.read_text(encoding="utf-8") == PLAN
+
+
+def test_write_source_fsyncs_before_replace(tmp_path, monkeypatch):
+    order: list[str] = []
+    real_fsync, real_replace = sync.os.fsync, sync.os.replace
+    monkeypatch.setattr(sync.os, "fsync", lambda fd: (order.append("fsync"), real_fsync(fd)))
+    monkeypatch.setattr(sync.os, "replace",
+                        lambda a, b: (order.append("replace"), real_replace(a, b)))
+    f = tmp_path / "p.md"
+    f.write_text("old", encoding="utf-8")
+    sync.write_source(f, "new")
+    assert order == ["fsync", "replace"] and f.read_text(encoding="utf-8") == "new"
 
 
 def test_removed_task_canceled_with_comment(pin_ctx, ws, tmp_path):
@@ -428,8 +560,8 @@ def test_order_uses_sub_issue_sort_order(pin_ctx, ws, plan):
 
 
 def test_unmanaged_and_done_children_never_adopted(pin_ctx, ws, plan):
-    done = ws.add_issue(title="T1 · Alpha", parent=SELF, state="st-done")
-    other = ws.add_issue(title="Tx · not a task", parent=SELF)
+    done = ws.add_issue(title="T1 · Alpha", parent=SELF, state="st-done", creator=VIEWER)
+    other = ws.add_issue(title="Tx · not a task", parent=SELF, creator=VIEWER)
     out = linear_sync_plan({"path": str(plan)})
     assert out["tasks"][1] != ws.issues[done]["identifier"] and len(out["created"]) == 3
     assert ws.issues[other]["state"] == "st-todo"

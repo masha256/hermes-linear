@@ -399,7 +399,8 @@ async def test_client_issue_get_shape(fake, client):
     i = await client.issue_get("RET-1")
     (call,) = fake.gql_calls("IssueGet")
     assert call.variables == {"id": "RET-1"}
-    for field in ("subIssueSortOrder", "externalLinks", "children", "parent", "url"):
+    for field in ("subIssueSortOrder", "externalLinks", "children", "parent", "url",
+                  "creator { id }"):
         assert field in call.json["query"]
     assert i["id"] == "uuid-1" and i["state"]["type"] == "unstarted"
     assert i["labels"] == [{"id": "l1", "name": "Bug"}]
@@ -524,6 +525,24 @@ async def test_issue_get_sorts_children_by_sub_issue_sort_order(fake, client):
 
 def _page(nodes, cursor=None):
     return {"nodes": nodes, "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor}}
+
+
+async def test_issue_get_pages_children(fake, client):
+    def child(ident, sso):
+        return {"id": f"u-{ident}", "identifier": ident, "title": ident, "subIssueSortOrder": sso,
+                "state": {"type": "unstarted"}, "creator": {"id": APP_USER}}
+    fake.on("IssueGet", {"data": {"issue": {**ISSUE_NODE, "children": _page(
+        [child("RET-2", 20)], "c1")}}})
+    fake.on("IssueChildren",
+            {"data": {"issue": {"children": _page([child("RET-3", 10)], "c2")}}},
+            {"data": {"issue": {"children": _page([child("RET-4", 30)])}}})
+    i = await client.issue_get("RET-1")
+    assert [c["identifier"] for c in i["children"]] == ["RET-3", "RET-2", "RET-4"]
+    assert i["children"][0]["creator"] == {"id": APP_USER}
+    calls = fake.gql_calls("IssueChildren")
+    assert [c.variables for c in calls] == [{"id": "uuid-1", "after": "c1"},
+                                            {"id": "uuid-1", "after": "c2"}]
+    assert "pageInfo { hasNextPage endCursor }" in fake.gql_calls("IssueGet")[0].json["query"]
 
 
 async def test_client_app_comments_pages_oldest_first(fake, client):

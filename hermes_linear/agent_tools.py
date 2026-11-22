@@ -233,6 +233,10 @@ async def check_write_scope(ctx: ToolContext, issue_id: str) -> str | None:
     returns are compared. Never raises: a ``LinearError`` from the parent walk returns its
     ``code`` (``LINEAR_ERROR`` if none). Fail-closed: any non-``None`` result is a refusal.
 
+    Descendants: an issue fetched through the ``children`` connection of an issue that
+    passed this check is in scope (it has that issue as its parent), so callers such as
+    ``linear_sync_plan`` write such children without a per-child check.
+
     Contract for write tools:
     - Add the UUID Linear returns for an issue you create (``issueCreate.issue.id``), never
       its identifier (``RET-12``), to ``ctx.adapter.tool_created[ctx.session_key]``, on the
@@ -636,16 +640,34 @@ def _parse_sync_plan(args: dict) -> dict:
             "info": sync.source_info(p)}
 
 
-async def _resolve_tasks(ctx: ToolContext, project: dict, tasks: list) -> tuple[dict, list]:
-    """Reads only: task number -> existing issue (full ``issue_get``), and recreated numbers.
+def _is_session(ctx: ToolContext, node: dict) -> bool:
+    """True if ``node`` (an issue or child) is the session issue (UUID or identifier)."""
+    return bool(ctx.session_issue_id) and ctx.session_issue_id in (node.get("id"),
+                                                                   node.get("identifier"))
 
-    A heading ID wins; a deleted or canceled ticket is recreated. A task without a usable ID
-    adopts an open child titled ``T<n> ·`` not claimed by another heading (crash between
-    create and write-back). Every target is scope-checked before any write.
+
+def _app_made(node: dict, me: str) -> bool:
+    """True if the app user (``me``, the viewer) created ``node`` (Ruling S17)."""
+    return (node.get("creator") or {}).get("id") == me
+
+
+async def _resolve_tasks(ctx: ToolContext, project: dict, tasks: list,
+                         me: str) -> tuple[dict, list, dict]:
+    """Reads only: task number -> existing issue (full ``issue_get``), recreated numbers, and
+    per-task errors (``{n: code}``; those tasks are not written at all).
+
+    A heading ID wins; a deleted or canceled ticket is recreated; a heading naming the
+    session issue (not the project ticket) is refused for that task (``BAD_ARGS``), so the
+    session ticket is never retitled. A task without a usable ID adopts an open child the
+    app created (``creator.id == me``) whose title is exactly ``T<n> · <name>`` and that no
+    other heading claims (crash between create and write-back). Exact title, not prefix: a
+    task number reused for a different task gets a new ticket and the old one is canceled.
+    Every heading target is scope-checked before any write.
     """
     pid = project["id"]
     target: dict[int, dict] = {}
     recreated: list[int] = []
+    errors: dict[int, str] = {}
     for t in tasks:
         if not t.ticket:
             continue
@@ -658,6 +680,9 @@ async def _resolve_tasks(ctx: ToolContext, project: dict, tasks: list) -> tuple[
             continue
         if issue["id"] == pid:
             raise _Refusal("BAD_ARGS")
+        if _is_session(ctx, issue):
+            errors[t.number] = "BAD_ARGS"  # the session ticket is never a task ticket
+            continue
         if _state_type(issue) == "canceled":
             recreated.append(t.number)
             continue
@@ -668,34 +693,38 @@ async def _resolve_tasks(ctx: ToolContext, project: dict, tasks: list) -> tuple[
         target[t.number] = issue
     claimed = {i["id"] for i in target.values()}
     for t in tasks:
-        if t.number in target:
+        if t.number in target or t.number in errors:
             continue
-        prefix = f"T{t.number} ·"
+        title = sync.task_title(t)
         for c in project.get("children") or []:
-            if c["id"] in claimed or _state_type(c) in _CLOSED \
-                    or not (c.get("title") or "").startswith(prefix):
+            if c["id"] in claimed or _state_type(c) in _CLOSED or _is_session(ctx, c) \
+                    or not _app_made(c, me) or c.get("title") != title:
                 continue
             target[t.number] = await ctx.client.issue_get(c["id"])
             claimed.add(c["id"])
             break
-    return target, recreated
+    return target, recreated, errors
 
 
 async def _sync_plan(ctx: ToolContext, a: dict) -> dict:
     client, info, tasks = ctx.client, a["info"], a["tasks"]
     project = await _writable(ctx, a["ticket"])
     pid, team = project["id"], _team_of(project)
-    target, recreated = await _resolve_tasks(ctx, project, tasks)
+    me = await client.viewer_id()  # cached since connect
+    target, recreated, errors = await _resolve_tasks(ctx, project, tasks, me)
 
     mapping: dict[int, str] = {}
     created: list[str] = []
     keep: set[str] = {i["id"] for i in target.values()}
     for pos, t in enumerate(tasks, 1):
+        if t.number in errors:
+            continue
         order = PLAN_SORT_STEP * pos
-        title, desc = sync.task_title(t), sync.task_description(t, info)
+        title, rendered = sync.task_title(t), sync.task_description(t, info)
         issue = target.get(t.number)
         if issue is None:
-            inp: dict[str, Any] = {"teamId": team, "title": title, "description": desc,
+            inp: dict[str, Any] = {"teamId": team, "title": title,
+                                   "description": sync.with_desc_hash(rendered),
                                    "parentId": pid, "subIssueSortOrder": order}
             if (project.get("project") or {}).get("id"):
                 inp["projectId"] = project["project"]["id"]
@@ -710,21 +739,26 @@ async def _sync_plan(ctx: ToolContext, a: dict) -> dict:
         if _state_type(issue) == "completed":
             continue  # Done tickets are never touched
         inp = {}
-        if issue.get("title") != title:
+        if issue.get("title") != title:  # titles round-trip exactly (probe P8)
             inp["title"] = title
-        if (issue.get("description") or "") != desc:
-            inp["description"] = desc
+        # Descriptions are normalized by Linear (P8): compare the hash marker, never text.
+        if sync.read_desc_hash(issue.get("description")) != sync.desc_hash(rendered):
+            inp["description"] = sync.with_desc_hash(rendered)
         if issue.get("subIssueSortOrder") != order:
             inp["subIssueSortOrder"] = order
         if inp:
             await client.issue_update(issue["id"], inp)
 
     canceled: list[str] = []
+    unmanaged: list[str] = []
     cancel_state: str | None = None
     for c in project.get("children") or []:
-        if c["id"] in keep or _state_type(c) in _CLOSED \
+        if c["id"] in keep or _state_type(c) in _CLOSED or _is_session(ctx, c) \
                 or not sync.MANAGED_TITLE_RE.match(c.get("title") or ""):
-            continue  # in the plan, closed, or not a plan ticket (a human's child)
+            continue  # in the plan, closed, the session ticket, or not a plan ticket
+        if not _app_made(c, me):
+            unmanaged.append(c["identifier"])  # a human's T<n> ticket: reported, never touched
+            continue
         cancel_state = cancel_state or await _state_id(ctx, team, "canceled")
         # Reason first: a crash in between repeats the comment rather than losing it.
         await client.comment_create(
@@ -750,11 +784,16 @@ async def _sync_plan(ctx: ToolContext, a: dict) -> dict:
         comment = "unchanged"
     return {"ok": True, "issue": project.get("identifier"), "url": project.get("url"),
             "tasks": mapping, "created": created, "canceled": canceled,
-            "recreated": recreated, "comment": comment, "comment_inline": inline}
+            "recreated": recreated, "unmanaged": unmanaged, "errors": errors,
+            "comment": comment, "comment_inline": inline}
 
 
 def _finish_sync_plan(a: dict, out: dict) -> dict:
-    """In the tool thread: write the IDs back into the headings, unless the file changed."""
+    """In the tool thread: write the IDs back into the headings, unless the file changed.
+
+    The Linear writes are done by now: an ``OSError`` here still answers ``ok`` (with
+    ``file_error``) so the caller sees what was created and canceled; a rerun adopts.
+    """
     new = sync.write_ticket_ids(a["text"], out["tasks"])
     out.update(file_changed=False, file_conflict=False)
     if new == a["text"]:
@@ -762,7 +801,12 @@ def _finish_sync_plan(a: dict, out: dict) -> dict:
     if sync.read_source(a["path"]) != a["text"]:
         out["file_conflict"] = True  # edited meanwhile: rerun the sync on the new file
         return out
-    sync.write_source(a["path"], new)
+    try:
+        sync.write_source(a["path"], new)
+    except OSError as exc:
+        log.warning("linear: plan write-back failed: %s", type(exc).__name__)
+        out["file_error"] = exc.strerror or type(exc).__name__
+        return out
     out["file_changed"] = True
     return out
 
@@ -849,8 +893,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "comment on the ticket named by its 'Linear: <ID>' header, and one "
                         "sub-ticket 'T<n> · <name>' per '### Task <n>: <name>' heading, in "
                         "plan order. Headings with '— <ID>' update that ticket; others adopt "
-                        "a matching child or create one. Tickets of removed tasks are "
-                        "canceled; Done tickets are never touched. Writes the IDs back into "
+                        "the app's open child with that exact title or create one. App-made "
+                        "tickets of removed tasks are canceled; humans' tickets and Done "
+                        "tickets are never touched. Writes the IDs back into "
                         "the headings (commit the file afterwards). Safe to re-run."),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string",
