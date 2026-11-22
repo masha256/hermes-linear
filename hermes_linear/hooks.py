@@ -159,14 +159,24 @@ _APPROVAL_TIMEOUT_MARK = "timed out without user response"  # tools/approval.py 
 _NOT_ANSWERED = frozenset({"timed_out", "cancelled", "undelivered"})
 
 
-def _controls(session_key: str) -> list:
-    """Every connected adapter's control rows for ``session_key`` (read-only, any state)."""
-    rows: list = []
+def _turn_controls(session_key: str, kind: str) -> list:
+    """``(store, row)`` for every ``kind`` control row asked during THIS turn: same session
+    key and ``row.turn_mid == HERMES_SESSION_MESSAGE_ID`` (outbound stores the asking turn's
+    mid; the turn's MessageEvent binds the same id). Several Linear agent sessions can share
+    one Hermes key, so the key alone would touch another session's question. Unbound
+    message id -> no rows (act on nothing)."""
+    mid = get_session_env("HERMES_SESSION_MESSAGE_ID") or None
+    if not mid:
+        return []
+    found: list = []
     for ad in list(adapter_mod.ADAPTERS.values()):
         store = getattr(ad, "_store", None)
-        if store is not None:
-            rows.extend(store.controls_for_session_key(session_key))
-    return rows
+        if store is None:
+            continue
+        for row in store.controls_for_session_key(session_key):
+            if row.kind == kind and row.turn_mid == mid:
+                found.append((store, row))
+    return found
 
 
 def _strings(value: Any):
@@ -181,14 +191,18 @@ def _strings(value: Any):
             yield from _strings(v)
 
 
-def _drop_clarify(session_key: str) -> None:
-    for ad in list(adapter_mod.ADAPTERS.values()):
-        store = getattr(ad, "_store", None)
-        if store is None:
-            continue
-        for row in store.controls_for_session_key(session_key):
-            if row.kind == "clarify":
-                store.drop_control(row.request_id)
+def _this_question(rows: list, data: dict) -> tuple | None:
+    """The ``(store, row)`` this clarify result answers: the row whose question is one of
+    the result's ``responses[*].question``; else the newest of this turn's rows."""
+    if not rows:
+        return None
+    responses = data.get("responses")
+    asked = {r.get("question") for r in responses if isinstance(r, dict)} \
+        if isinstance(responses, list) else set()
+    for pair in rows:
+        if pair[1].question is not None and pair[1].question in asked:
+            return pair
+    return max(rows, key=lambda pair: pair[1].created_at)
 
 
 def _clarify_result(session_key: str, result: Any) -> str | None:
@@ -201,13 +215,16 @@ def _clarify_result(session_key: str, result: Any) -> str | None:
     if not isinstance(data, dict) or "outcome" not in data:
         return None
     outcome = data.get("outcome")
-    if outcome != "timed_out":
-        if outcome not in _NOT_ANSWERED:
-            # Answered outside the plugin's own path (e.g. the gateway text intercept from
-            # another Linear session on this key): a kept row would stay pending forever.
-            _drop_clarify(session_key)
+    if outcome in _NOT_ANSWERED and outcome != "timed_out":
         return None
-    if not any(r.kind == "clarify" for r in _controls(session_key)):
+    pair = _this_question(_turn_controls(session_key, "clarify"), data)
+    if pair is None:
+        return None
+    if outcome != "timed_out":
+        # Answered outside the plugin's own path (e.g. the gateway text intercept): the
+        # kept row would stay pending forever. Drop only this question's row.
+        store, row = pair
+        store.drop_control(row.request_id)
         return None
     data["outcome"] = "pending"
     data["notice"] = PENDING_NOTICE
@@ -218,8 +235,8 @@ def _approval_result(session_key: str, args: Any, result: Any) -> str | None:
     if not isinstance(result, str) or _APPROVAL_TIMEOUT_MARK not in result:
         return None
     values = list(_strings(args))
-    for row in _controls(session_key):
-        if row.kind == "approval" and row.command and any(row.command in v for v in values):
+    for _store, row in _turn_controls(session_key, "approval"):
+        if row.command and any(row.command in v for v in values):
             return APPROVAL_PENDING_TEXT
     return None
 
@@ -227,7 +244,8 @@ def _approval_result(session_key: str, args: Any, result: Any) -> str | None:
 def on_transform_tool_result(tool_name: str, args: Any = None, result: Any = None,
                              **kw: Any) -> str | None:
     """In a Linear session, a timed-out clarify / approval whose question is still stored reads
-    as pending, not as a timeout; a clarify answered elsewhere drops its stale rows. Runs on
+    as pending, not as a timeout; a clarify answered elsewhere drops its stale row. Only
+    rows asked during this turn (``turn_mid``) are considered. Runs on
     the agent thread: store access only, no network I/O or loop hop; any failure leaves the
     result untouched (None)."""
     try:

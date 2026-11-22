@@ -161,11 +161,15 @@ def test_plugin_registers_transform_hook(ctx, monkeypatch):
 
     assert ("transform_tool_result", hooks.on_transform_tool_result) in ctx.hooks
     store = Store.open(None)
-    store.put_control("req-1", "approval", "sess-1", 1, [], session_key="sk", command="ls -la")
+    store.put_control("req-1", "approval", "sess-1", 1, [], session_key="sk", command="ls -la",
+                      turn_mid="mid-1")
     monkeypatch.setattr(adapter_mod, "ADAPTERS", {"neo": SimpleNamespace(_store=store)})
-    env = {"HERMES_SESSION_PLATFORM": "linear", "HERMES_SESSION_KEY": "sk"}
+    env = {"HERMES_SESSION_PLATFORM": "linear", "HERMES_SESSION_KEY": "sk",
+           "HERMES_SESSION_MESSAGE_ID": "mid-1"}
     monkeypatch.setattr(hooks, "get_session_env", lambda name, default="": env.get(name, default))
     pm = PluginManager()
+    # Known coupling: writes Hermes's private PluginManager._hooks (no public way to load
+    # a plugin's callbacks without discovery); update here if Hermes renames it.
     for name, cb in ctx.hooks:
         pm._hooks.setdefault(name, []).append(cb)
     out = pm.invoke_hook("transform_tool_result", tool_name="terminal", args={"command": "ls -la"},
