@@ -19,7 +19,8 @@ The `linear_*` tools are deferred behind tool search. Load a schema with
 `tool_describe` (exact names), then call it with `tool_call`, one entry per call:
 `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])`
 (a batch of several plugin tools is rejected). Calling `linear_issue_get(...)`
-directly fails as an unknown tool. The seven tools:
+directly fails as an unknown tool. Below, `linear_x(...)` is shorthand — always call
+via `tool_call`. The seven tools:
 
 - `linear_issue_get` (`id`): state, labels, project and its links, parent, children.
 - `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`): in
@@ -46,7 +47,8 @@ Every tool is safe to re-run.
 
 ## Setup (first session on a repo, or no `.hermes-linear.yaml` yet)
 
-1. `linear_issue_get` the session ticket. Note its identifier, team and project.
+1. `linear_issue_get` the session ticket. Note its identifier, team and project. The
+   team key is the identifier's prefix (`RET-81` → `RET`).
 2. Framework: select via `clarify`; the only choice is `superpowers`.
 3. Repo: read the project's links (`externalLinks`) from step 1. A GitHub link is a
    candidate; the link labelled `repo` wins when there are several. Offer the result
@@ -75,7 +77,8 @@ branch and worktree.
 ## Per-stage differences
 
 **Brainstorm.** Load `superpowers:brainstorming`. Each question is a turn in the ticket
-thread; multiple-choice questions and design-section approvals are selects.
+thread; multiple-choice questions and design-section approvals are selects. Do not
+offer the visual companion; it cannot work in a Linear ticket.
 
 **Spec.** Put a whole line `Linear: <session ticket ID>` in the spec's header (before
 the first `## ` heading). Commit, then `linear_sync_spec` with the spec's absolute
@@ -100,17 +103,19 @@ line 1 stays its identity line; line 2 is `Linear: <ID>`. Each task's ledger ent
 names its sub-ticket, and commit messages carry the sub-ticket ID. Then:
 - dispatching a task's implementer: `linear_task_state(id, "in_progress")`;
 - dispatching its review: `in_review`;
-- a clean review: `done` with `summary` (commits, test result, review verdict, number
+- a fix round after review: back to `in_progress` (then `in_review` again);
+- the clean review: `done` with `summary` (commits, test result, review verdict, number
   of fix rounds, deferred minors as a `- [ ]` checklist);
-- anything that needs the user: `blocked` with `question`; when the answer arrives in
-  the ticket thread: `unblocked`.
+- anything that needs the user: `blocked` with `question` (it posts the question; do
+  not repeat it through `clarify`). Then end the turn, or continue only with tasks
+  that do not depend on the answer. When it arrives in the thread: `unblocked`.
 
 If `blocked` returns `LABEL_MISSING`, the question was still posted; tell the user
 once to create a `Blocked` label for the team (the app cannot create labels).
 
 **Finish.** Open the PR from the branch (load `superpowers:finishing-a-development-branch`
 for the mechanics; never merge). Move the project ticket to In Review with
-`linear_issue_update(state="In Review")`, then end with the final reply (PR link and a
+`linear_issue_update(id=<session ticket>, state="In Review")`, then end with the final reply (PR link and a
 short summary); it is posted as the response.
 
 ## Large projects
@@ -119,17 +124,18 @@ When brainstorming decomposes the work into sub-projects, the current ticket bec
 the umbrella: it holds the decomposition and build order. Create one top-level ticket
 per sub-project with `linear_issue_create` (no `parent`; same project; link the
 umbrella in its description). Each sub-project runs its own cycle in its own session.
-When a sub-project's turn comes, delegate its ticket to the app. The tools cannot set
-a delegate, so if delegation fails or is unavailable, ask the user in the umbrella
-ticket to delegate it.
+The tools cannot set a delegate: when a sub-project's turn comes, ask the user in the
+umbrella ticket to delegate its ticket to the app. Never delegate through other Linear
+tools or MCP servers; they act as the user, not the app.
 
 ## Rules
 
 - Ticket descriptions and the plan comment are written only by `linear_sync_spec` and
   `linear_sync_plan`. To change them, fix the file, commit and sync again.
 - On a sync failure, keep working (git holds everything). Mark the step
-  `unsynced (<code>)` in the ledger, retry at the next sync point and before any
-  approval. Never ask for approval of an unsynced spec or plan; instead ask (select)
+  `unsynced (<code>)`: before the ledger exists (spec and plan stages) in your reply
+  in the ticket thread, afterwards in the ledger. Retry at the next sync point and
+  before any approval. Never ask for approval of an unsynced spec or plan; instead ask (select)
   "Linear sync failed (<code>); retry now or approve from the file link?".
 - Edits made in Linear are not synced back. A deleted or canceled sub-ticket whose
   task is still in the plan is recreated on the next plan sync; ask whether to drop

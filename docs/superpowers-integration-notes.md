@@ -72,7 +72,10 @@ the Linear MCP server, and the collision hides every MCP Linear tool. Use a diff
     `platform_toolsets.<platform>`.
 - **Task 6: the skill must tell the agent to reach the tools through the bridge.** It says to call
   `tool_describe` with the exact tool name to load the schema, then
-  `tool_call(name="linear_issue_get", arguments={...})`, and so on for each tool. It also says plainly
+  `tool_call(calls=[{"name": "linear_issue_get", "arguments": {...}}])`, one plugin tool per call: the
+  bridge schema takes a `calls` array (`tools/tool_search.py:309-326`) and rejects a batch of more than
+  one entry when any is not a connector tool (`tools/tool_search.py:604-605`,
+  `tools/tool_search_validation.py:196`). It also says plainly
   that calling `linear_issue_get(...)` directly fails as an unknown tool. The skill lists all seven exact
   names (Q5).
 - Fallback, if a toolset named after the platform is ever needed: document
