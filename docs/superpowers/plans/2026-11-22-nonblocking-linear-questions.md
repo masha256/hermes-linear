@@ -54,7 +54,7 @@ the re-run's `approval_prompt`.
 
 ---
 
-### Task 1: Approval-grant feasibility gate
+### Task 1: Approval-grant feasibility gate — RET-96
 
 **Files:**
 - Test: `tests/test_approval_grant_feasibility.py`
@@ -77,7 +77,7 @@ the re-run's `approval_prompt`.
     (`linear_task_state blocked`) whether to switch Task 8 to "ask again" (spec Q1 option 2).
 - [ ] **Step 4: Commit** `test: approval resolved from inside the prompt callback (RET-94 T1)`.
 
-### Task 2: Store — pending state, open tasks, approval grants
+### Task 2: Store — pending state, open tasks, approval grants — RET-97
 
 **Files:**
 - Modify: `hermes_linear/store.py` (schema, `Store.__init__` migration, `ControlRow`, control methods)
@@ -116,7 +116,7 @@ the re-run's `approval_prompt`.
 - [ ] **Step 4:** run `tests/test_store.py`, then the full suite: PASS.
 - [ ] **Step 5: Commit** `feat: store pending questions, open tasks and approval grants (RET-94 T2)`.
 
-### Task 3: Switch to pending and the Blocked label
+### Task 3: Switch to pending and the Blocked label — RET-98
 
 **Files:**
 - Create: `hermes_linear/questions.py` (pending-question helpers: target, label, copy)
@@ -175,7 +175,7 @@ the re-run's `approval_prompt`.
 - [ ] **Step 4:** the new tests, `test_elicitation_visibility.py` and the full suite: PASS.
 - [ ] **Step 5: Commit** `feat: timed-out Linear questions become pending with Blocked (RET-94 T3)`.
 
-### Task 4: Track open task sub-tickets
+### Task 4: Track open task sub-tickets — RET-99
 
 **Files:**
 - Modify: `hermes_linear/agent_tools.py` (`_task_state`)
@@ -195,7 +195,7 @@ the re-run's `approval_prompt`.
 - [ ] **Step 4:** `tests/test_task_state.py` and the full suite: PASS.
 - [ ] **Step 5: Commit** `feat: linear_task_state records open tasks (RET-94 T4)`.
 
-### Task 5: Tell the agent the question is pending (`transform_tool_result`)
+### Task 5: Tell the agent the question is pending (`transform_tool_result`) — RET-100
 
 **Files:**
 - Modify: `hermes_linear/hooks.py` (new `on_transform_tool_result`), `hermes_linear/plugin.py`
@@ -235,7 +235,7 @@ the re-run's `approval_prompt`.
 - [ ] **Step 4:** the new tests and the full suite: PASS; `hermes plugins validate .` OK.
 - [ ] **Step 5: Commit** `feat: agent sees Linear questions as pending, not timed out (RET-94 T5)`.
 
-### Task 6: Re-post the pending question after the final response
+### Task 6: Re-post the pending question after the final response — RET-101
 
 **Files:**
 - Modify: `hermes_linear/outbound.py` (`send`, new `_repost_pending`)
@@ -264,7 +264,7 @@ the re-run's `approval_prompt`.
 - [ ] **Step 4:** the new tests, `test_adapter_outbound.py` and the full suite: PASS.
 - [ ] **Step 5: Commit** `feat: re-post a pending Linear question after the final response (RET-94 T6)`.
 
-### Task 7: Answering a pending question starts the next turn
+### Task 7: Answering a pending question starts the next turn — RET-102
 
 **Files:**
 - Modify: `hermes_linear/models.py` (`ResolveControl` gains `state: str = "live"`),
@@ -312,7 +312,7 @@ the re-run's `approval_prompt`.
   suite: PASS.
 - [ ] **Step 5: Commit** `feat: answers to pending Linear questions start the next turn (RET-94 T7)`.
 
-### Task 8: One-shot approval grant on the re-run
+### Task 8: One-shot approval grant on the re-run — RET-103
 
 (Only if Task 1 passed. Otherwise: the grant is not stored, the approve turn text ends with
 ` — re-run the command; it will ask again`, and this task only tests that.)
@@ -345,7 +345,7 @@ the re-run's `approval_prompt`.
 - [ ] **Step 4:** the new tests, Task 1's test and the full suite: PASS.
 - [ ] **Step 5: Commit** `feat: approved pending command runs once without a second prompt (RET-94 T8)`.
 
-### Task 9: Restart sweep
+### Task 9: Restart sweep — RET-104
 
 **Files:**
 - Modify: `hermes_linear/adapter.py` (`connect`, after the store opens and before the worker starts)
@@ -367,7 +367,7 @@ the re-run's `approval_prompt`.
 - [ ] **Step 4:** the new tests and the full suite: PASS.
 - [ ] **Step 5: Commit** `feat: pending Linear questions survive a gateway restart (RET-94 T9)`.
 
-### Task 10: Skill text
+### Task 10: Skill text — RET-105
 
 **Files:**
 - Modify: `hermes_linear/skills/manage-superpowers/SKILL.md` ("Questions and approvals")
@@ -388,7 +388,7 @@ the re-run's `approval_prompt`.
 - [ ] **Step 2:** `.venv/bin/pytest -q` and `hermes plugins validate .`: PASS.
 - [ ] **Step 3: Commit** `docs: skills describe pending Linear questions (RET-94 T10)`.
 
-### Task 11: Deploy live and verify
+### Task 11: Deploy live and verify — RET-106
 
 **Files:** none (deployment and live checks; findings go in the ledger).
 
