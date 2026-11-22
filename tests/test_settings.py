@@ -14,7 +14,6 @@ from hermes_linear.models import (
     Fatal,
     Ignore,
     Interrupt,
-    OpenSessionOnComment,
     Refuse,
     Reply,
     ResolveControl,
@@ -180,9 +179,6 @@ def test_decision_models_frozen_with_fields():
         Reply(agent_session_id="s1", issue_id="i1", text="task"),
         SetMode(issue_id="i1", mode="delegated", generation=2),
         AwaitDelegation(issue_id="i1", deadline_s=5),
-        OpenSessionOnComment(
-            issue_id="i1", comment_id="cm1", user_id="u1", user_name="Val", body="b",
-        ),
         Fatal(reason="boom"),
         Ignore(reason="dup"),
     ]

@@ -14,7 +14,6 @@ from hermes_linear.models import (
     ContextItem,
     Fatal,
     Ignore,
-    OpenSessionOnComment,
     SetMode,
 )
 from hermes_linear.router import RouterContext, route
@@ -200,16 +199,13 @@ async def test_bot_issue_edit_is_context_without_allowlist(store):
 # ---------------------------------------------------------------- Comment
 
 
-async def test_toplevel_human_comment_on_delegated_opens_session(ctx, store):
+async def test_toplevel_human_comment_on_delegated_is_context(ctx, store):
+    """RET-108: only the agent's own threads drive it; a plain top-level comment is context."""
     _delegate(store, C_ISSUE)
-    out = await route(copy.deepcopy(TOPLEVEL), ctx)
-    d = TOPLEVEL["data"]
-    assert out == [
-        OpenSessionOnComment(
-            issue_id=C_ISSUE, comment_id=d["id"], user_id=HUMAN, user_name="Test User",
-            body="top-level comment with no mention",
-        )
-    ]
+    (item,) = _items(await route(copy.deepcopy(TOPLEVEL), ctx))
+    assert (item.issue_id, item.kind, item.field, item.new) == (
+        C_ISSUE, "comment", "comment", "top-level comment with no mention")
+    assert item.actor == "Test User" and item.at == TOPLEVEL["createdAt"]
 
 
 async def test_toplevel_comment_on_untouched_ignored(ctx, store):
@@ -228,7 +224,7 @@ async def test_mention_comment_ignored(ctx, store):
     # word-bounded: a longer handle is not a mention
     ev = copy.deepcopy(TOPLEVEL)
     ev["data"]["body"] = "ask @hermestester instead"
-    assert isinstance((await route(ev, ctx))[0], OpenSessionOnComment)
+    assert isinstance((await route(ev, ctx))[0], AddContext)
 
 
 async def test_router_context_handle_optional(store):
@@ -264,9 +260,7 @@ async def test_bot_comment_context_only(ctx, store):
     _delegate(store, C_ISSUE)
     ev = copy.deepcopy(TOPLEVEL)
     ev["data"]["botActor"] = {"id": "bot-1", "name": "GitHub", "type": "github"}
-    out = await route(ev, ctx)
-    assert not any(isinstance(d, OpenSessionOnComment) for d in out)
-    (item,) = _items(out)
+    (item,) = _items(await route(ev, ctx))
     assert (item.kind, item.new) == ("comment", "top-level comment with no mention")
 
 
@@ -349,9 +343,8 @@ async def test_null_actor_comment_is_human_and_checked(store):
         return True
 
     ctx = RouterContext(store=store, app_user_id=APP, allowed=allow, app_user_handle=HANDLE)
-    out = await route(_no_actor_toplevel(), ctx)
-    assert len(out) == 1 and isinstance(out[0], OpenSessionOnComment)
-    assert out[0].user_id == HUMAN and seen == [HUMAN]
+    (item,) = _items(await route(_no_actor_toplevel(), ctx))
+    assert item.kind == "comment" and seen == [HUMAN]
     ctx = RouterContext(store=store, app_user_id=APP, allowed=_no, app_user_handle=HANDLE)
     assert await route(_no_actor_toplevel(), ctx) == [Ignore("denied actor")]
     assert store.pending_context(C_ISSUE) == []
@@ -381,12 +374,10 @@ async def test_explicit_bot_context_exempt(store):
         ev["actor"] = {"id": "bot-1", "name": "GitHub", "type": actor_type}
         (item,) = _items(await route(ev, ctx))
         assert item.field == "labels"
-        # a top-level comment by an explicit bot is context, never a session
+        # a top-level comment by an explicit bot is context
         ev = copy.deepcopy(TOPLEVEL)
         ev["actor"] = {"id": "bot-1", "name": "GitHub", "type": actor_type}
-        out = await route(ev, ctx)
-        assert not any(isinstance(d, OpenSessionOnComment) for d in out)
-        (item,) = _items(out)
+        (item,) = _items(await route(ev, ctx))
         assert item.kind == "comment"
     # botActor alone (actor absent) is an explicit bot signal too
     ev = copy.deepcopy(LABELS)

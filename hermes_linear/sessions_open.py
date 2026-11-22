@@ -3,7 +3,6 @@
 * Delegation timers: an ``Issue update`` delegating to the app waits
   ``AwaitDelegation.deadline_s`` for Linear's own ``created``; on expiry the
   plugin reuses or opens an app session and starts the first turn.
-* Top-level comments on delegated tickets get a session opened on the comment.
 * ``ResolveControl``: approval / clarify answers to pending prompts (Q8).
 * First-turn snapshot fetch and auto-start (§8.3) for the turn engine.
 
@@ -21,7 +20,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from . import questions, renderer
 from .constants import ACK_TIMEOUT_S
-from .models import AwaitDelegation, OpenSessionOnComment, ResolveControl, StartTurn
+from .models import AwaitDelegation, ResolveControl, StartTurn
 from .router import ACK_TEXT, DEFAULT_AUTHOR, _session_key, message_id, ticket_chat_id, turn_header
 from .settings import Settings
 from .store import ControlRow, Store
@@ -200,37 +199,6 @@ class SessionOpener:
             text=f"{turn_header(ident, None, author)}\n\nYou have been delegated {ident}.",
             first_turn=True, ack=ACK_TEXT,
         ), human=True)
-
-    # ------------------------------------------------------------ comment sessions
-
-    async def open_session_on_comment(self, d: OpenSessionOnComment) -> None:
-        store, client = self._store(), self._client()
-        assert store is not None and client is not None
-        if store.session_by_root_comment(d.comment_id) is not None:
-            return  # R18: a session already hangs off this comment
-        ticket = store.ticket(d.issue_id)
-        if ticket is None or ticket.mode != "delegated":
-            return
-        # Placeholder first, so a `created` for it is ignored whatever the arrival order.
-        placeholder = f"pending:{d.comment_id}"
-        store.record_session(placeholder, d.issue_id, d.comment_id, "comment",
-                             plugin_created=True)
-        try:  # bounded: this runs on the event worker
-            sid = await asyncio.wait_for(client.create_session_on_comment(d.comment_id),
-                                         ACK_TIMEOUT_S)
-        except Exception as exc:  # noqa: BLE001 - includes TimeoutError
-            log.error("linear: session on comment %s failed: %s", d.comment_id, type(exc).__name__)
-            store.delete_session(placeholder)  # let a later comment try again
-            return
-        store.record_session(sid, d.issue_id, d.comment_id, "comment", plugin_created=True)
-        ident = ticket.identifier or d.issue_id
-        await self._enqueue(StartTurn(
-            agent_session_id=sid, activity_id=d.comment_id, issue_id=d.issue_id,
-            chat_id=ticket_chat_id(d.issue_id, max(ticket.generation, 1)), thread_id=None,
-            user_id=d.user_id, user_name=d.user_name,
-            text=f"{turn_header(ident, d.comment_id, d.user_name)}\n\n{d.body}",
-            first_turn=False, ack=ACK_TEXT,
-        ))
 
     # ------------------------------------------------------------ controls (§8.4)
 

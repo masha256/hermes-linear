@@ -72,11 +72,9 @@ class FakeClient:
         self.state_type = "unstarted"
         self.app_sessions: list[dict] = []
         self.user_emails: dict[str, str] = {}
-        self.on_comment_hook = None
         self.closed = False
         self.activity_delay: dict[str, float] = {}  # agent session id -> seconds
         self.snapshot_delay = 0.0
-        self.comment_fails = False
         self.issues: dict[str, dict] = {}  # issue_get by id (task sub-ticket guard)
 
     async def issue_get(self, issue_id):
@@ -108,14 +106,6 @@ class FakeClient:
         self.activities.append((sid, content, ephemeral, signal, signal_metadata))
         self.order.append(("activity", content["type"], content.get("body")))
         return f"act-{len(self.activities)}"
-
-    async def create_session_on_comment(self, comment_id):
-        self.calls.append(("create_session_on_comment", comment_id))
-        if self.on_comment_hook is not None:
-            await self.on_comment_hook()
-        if self.comment_fails:
-            raise RuntimeError("linear down")
-        return "sess-comment"
 
     async def create_session_on_issue(self, issue_id):
         self.calls.append(("create_session_on_issue", issue_id))
@@ -502,52 +492,42 @@ async def test_delegation_wait_cancelled_by_created(env):
     assert len(gw.events) == 1
 
 
-# ------------------------------------------------------ comment sessions
+# ------------------------------------------------- plain comments (RET-108)
 
 
-def plain_comment():
-    return copy.deepcopy(COMMENT_PLAIN)
-
-
-async def test_open_session_on_comment_race(env):
+async def test_toplevel_comment_on_delegated_is_context_not_a_session(env):
+    """RET-108: a plain top-level comment opens no session and runs no turn; the next
+    turn in the delegation thread sees it in the digest."""
     a, client, gw, store, order = env
-    issue = COMMENT_PLAIN["data"]["issueId"]
-    comment_id = COMMENT_PLAIN["data"]["id"]
-    store.set_mode(issue, "delegated", 1)
-    created = copy.deepcopy(MENTION)
-    created["agentSession"]["id"] = "sess-comment"
-    created["agentSession"]["commentId"] = comment_id
-    created["agentSession"]["comment"]["id"] = comment_id
-    created["agentActivity"]["agentSessionId"] = "sess-comment"
-
-    async def hook():
-        # Linear's `created` for our own session arrives before the mutation returns.
-        await a.on_event(copy.deepcopy(created))
-
-    client.on_comment_hook = hook
-    await deliver(a, plain_comment())
-    assert client.calls.count(("create_session_on_comment", comment_id)) == 1
+    await deliver(a, DELEGATION)
+    await complete(a, gw.events[0])
+    comment = copy.deepcopy(COMMENT_PLAIN)
+    comment["data"]["issueId"] = D_ISSUE
+    comment["data"]["issue"]["id"] = D_ISSUE
+    await deliver(a, comment)
     assert len(gw.events) == 1
-    ev = gw.events[0]
-    assert ev.source.chat_id == f"{issue}:1" and ev.source.thread_id is None
-    assert "top-level comment with no mention" in ev.text
-    assert store.session("sess-comment").plugin_created
-    # A late duplicate `created` is ignored too.
-    await deliver(a, created)
-    assert len(gw.events) == 1
+    assert not [c for c in client.calls if "session" in c[0]]
+    assert [s.agent_session_id for s in store.sessions_for_issue(D_ISSUE)] == [D_SID]
+    assert not [x for x in client.activities if x[0] != D_SID]
+    await deliver(a, prompted(D_SID, D_ISSUE, "next", "act-2"))
+    assert len(gw.events) == 2
+    text = gw.events[1].text
+    assert text.startswith("Since your last turn:")
+    assert 'Comment: "top-level comment with no mention" (Test User)' in text
+    assert store.pending_context(D_ISSUE) == []
 
 
-async def test_open_session_on_comment_skipped_when_root_exists(env):
+async def test_existing_comment_session_keeps_working(env):
+    """RET-108: a comment session opened before the change still takes prompts."""
     a, client, gw, store, order = env
-    issue = COMMENT_PLAIN["data"]["issueId"]
-    comment_id = COMMENT_PLAIN["data"]["id"]
-    store.set_mode(issue, "delegated", 1)
-    from hermes_linear.models import OpenSessionOnComment
-    store.record_session("sess-existing", issue, comment_id, "comment", plugin_created=True)
-    await a._execute(OpenSessionOnComment(issue, comment_id, HUMAN, "Test User", "hi"), {})
-    await a.wait_idle()
-    assert not [c for c in client.calls if c[0] == "create_session_on_comment"]
-    assert gw.events == []
+    await deliver(a, DELEGATION)
+    await complete(a, gw.events[0])
+    store.record_session("sess-comment", D_ISSUE, "cmt-old", "comment", plugin_created=True)
+    await deliver(a, prompted("sess-comment", D_ISSUE, "follow-up", "act-c1"))
+    assert len(gw.events) == 2
+    ev = gw.events[1]
+    assert ev.source.chat_id == f"{D_ISSUE}:1" and ev.source.thread_id is None
+    assert "follow-up" in ev.text
 
 
 # ------------------------------------------------------------ auto-start
@@ -949,18 +929,6 @@ async def test_dispatch_exception_before_handoff_frees_fifo(env, monkeypatch):
     assert errors == [D_SID]
     await deliver(a, prompted(D_SID, D_ISSUE, "again", "act-2"))
     assert len(gw.events) == 1
-
-
-async def test_comment_session_failure_deletes_placeholder(env):
-    a, client, gw, store, order = env
-    issue = COMMENT_PLAIN["data"]["issueId"]
-    comment_id = COMMENT_PLAIN["data"]["id"]
-    store.set_mode(issue, "delegated", 1)
-    client.comment_fails = True
-    await deliver(a, plain_comment())
-    assert store.session(f"pending:{comment_id}") is None
-    assert store.session_by_root_comment(comment_id) is None
-    assert gw.events == []
 
 
 async def test_connect_twice_does_not_reregister(env, caplog):

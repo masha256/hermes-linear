@@ -113,17 +113,6 @@ class AwaitDelegation:
 
 
 @dataclass(frozen=True)
-class OpenSessionOnComment:
-    """Open a Linear agent session in response to a plain comment."""
-
-    issue_id: str
-    comment_id: str
-    user_id: str
-    user_name: str
-    body: str
-
-
-@dataclass(frozen=True)
 class Fatal:
     """Unrecoverable condition; the adapter should report and stop."""
 
@@ -146,7 +135,6 @@ Decision = Union[
     Reply,
     SetMode,
     AwaitDelegation,
-    OpenSessionOnComment,
     Fatal,
     Ignore,
 ]
@@ -159,7 +147,6 @@ __all__ = [
     "Fatal",
     "Ignore",
     "Interrupt",
-    "OpenSessionOnComment",
     "Refuse",
     "Reply",
     "ResolveControl",

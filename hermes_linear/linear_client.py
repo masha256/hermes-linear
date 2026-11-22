@@ -41,10 +41,6 @@ MUTATION_ACTIVITY = """mutation AgentActivityCreate($input: AgentActivityCreateI
   agentActivityCreate(input: $input) { success agentActivity { id } }
 }"""
 
-MUTATION_SESSION_ON_COMMENT = """mutation AgentSessionCreateOnComment($input: AgentSessionCreateOnComment!) {
-  agentSessionCreateOnComment(input: $input) { success agentSession { id } }
-}"""
-
 MUTATION_SESSION_ON_ISSUE = """mutation AgentSessionCreateOnIssue($input: AgentSessionCreateOnIssue!) {
   agentSessionCreateOnIssue(input: $input) { success agentSession { id } }
 }"""
@@ -365,10 +361,6 @@ class LinearClient:
         data = await self.gql(MUTATION_ACTIVITY, {"input": inp})
         result = self._require_success(data, "agentActivityCreate")
         return result["agentActivity"]["id"]
-
-    async def create_session_on_comment(self, comment_id: str) -> str:
-        data = await self.gql(MUTATION_SESSION_ON_COMMENT, {"input": {"commentId": comment_id}})
-        return self._require_success(data, "agentSessionCreateOnComment")["agentSession"]["id"]
 
     async def create_session_on_issue(self, issue_id: str) -> str:
         data = await self.gql(MUTATION_SESSION_ON_ISSUE, {"input": {"issueId": issue_id}})
