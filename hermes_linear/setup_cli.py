@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import threading
 import time
+from pathlib import Path
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -59,9 +60,30 @@ class CliEnv:
     open_store: Callable[[], Any]
     adapters: dict = field(default_factory=dict)
     now: Callable[[], float] = time.time
+    revision: Callable[[], "str | None"] = lambda: None  # plugin checkout on disk
 
 
 # ------------------------------------------------------------------ helpers
+
+
+def plugin_revision(path: "str | None" = None) -> "str | None":
+    """``<sha> <subject> (<branch>|detached)`` of the git checkout holding the plugin
+    code, or None when it isn't a git checkout (pip install). Shows what is on disk;
+    the gateway runs it only after a restart."""
+    import subprocess
+
+    where = path or str(Path(__file__).resolve().parent)
+
+    def git(*a: str) -> str:
+        return subprocess.run(["git", "-C", where, *a], capture_output=True, text=True,
+                              timeout=5, check=True, stdin=subprocess.DEVNULL).stdout.strip()
+
+    try:
+        head = git("log", "-1", "--format=%h %s")
+        branch = git("branch", "--show-current") or "detached"
+    except Exception:  # noqa: BLE001 - not a checkout, no git, timeout
+        return None
+    return f"{head} ({branch})" if head else None
 
 
 def webhook_url(host: str, profile: str) -> str:
@@ -328,6 +350,9 @@ def run_status(env: CliEnv) -> int:
     out(f"linear ({env.profile})")
     out(f"webhook URL:   {webhook_url(host, env.profile)}")
     out(f"listener:      {settings.listener_host}:{settings.listener_port}")
+    rev = env.revision()
+    if rev:
+        out(f"code on disk:  {rev}")
     client = env.make_client(settings.client_id, settings.client_secret)
     try:
         viewer = _run(_check_app(client))
@@ -485,6 +510,7 @@ def default_env(ctx: Any) -> CliEnv:
         ask_secret=lambda q: prompt(q, password=True),
         out=print,
         make_client=make_client,
+        revision=plugin_revision,
         detect_host=tailscale_dns_name,
         post=aiohttp_post,
         open_store=open_store,

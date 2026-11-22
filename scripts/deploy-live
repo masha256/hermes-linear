@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Point the live worktree (what the gateway loads) at one ref, or a throwaway
+# merge of several. See docs/development.md. Restart the gateway afterwards.
+set -euo pipefail
+[ $# -ge 1 ] || { echo "usage: $0 <ref> [<ref> ...]" >&2; exit 2; }
+repo=$(git -C "$(dirname "$0")/.." rev-parse --path-format=absolute --git-common-dir)
+repo=${repo%/.git}
+live=${HERMES_LINEAR_LIVE:-$repo/.worktrees/live}
+git -C "$repo" fetch -q origin
+resolve() {  # prefer the up-to-date remote branch, else any local ref/sha
+  git -C "$repo" rev-parse -q --verify "origin/$1^{commit}" 2>/dev/null ||
+    git -C "$repo" rev-parse --verify "$1^{commit}"
+}
+[ -d "$live" ] || git -C "$repo" worktree add -q --detach "$live" "$(resolve "$1")"
+if [ -n "$(git -C "$live" status --porcelain --untracked-files=no)" ]; then
+  echo "live worktree has local changes; refusing" >&2; exit 1
+fi
+git -C "$live" switch -q --detach "$(resolve "$1")"
+shift
+for ref in "$@"; do
+  git -C "$live" -c user.name="deploy-live" -c user.email="deploy-live@localhost" \
+    merge -q --no-edit -m "live: merge $ref" "$(resolve "$ref")"
+done
+git -C "$live" log --oneline -1
+echo "deployed to $live; restart the gateway to load it"
