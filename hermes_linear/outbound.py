@@ -30,9 +30,10 @@ Q8, Q10).
   session's latest activity. While a control this adapter elicited is pending (row present,
   its turn in flight), ``_post`` drops every ``thought`` / ``action`` for that session
   (typing, heartbeat, interim sends, tool actions). Elicitations, errors and responses still
-  post; the expiry thought posts after the row is dropped. The turn's first response (sent or
-  promoted at turn end) would land after a *pending* question and hide its select, so the
-  question is queued again right after it (same row, ``_repost_pending``).
+  post; the expiry thought posts after the row is dropped. Every response of the turn (the
+  first, sent or promoted at turn end, and each ``more`` one: attachments, a late final) would
+  land after a *pending* question and hide its select, so the question is queued again right
+  after each (same row, ``_repost_pending``).
 * Tool events from ``hooks.py`` (already on the loop): start/finish actions with the fast-tool
   skip, todo -> plan, and the session link.
 
@@ -350,8 +351,9 @@ class Outbound:
             if first:
                 self.responded.add(target.mid)
             fut = self._shielded_response(target, renderer.response(body), first)
-            if first:
-                self._repost_pending(target.sid)  # queued now: lands right after the response
+            # Every response of the turn (attachments, a late final): queued now, so the
+            # pending question lands right after it and stays the last activity.
+            self._repost_pending(target.sid)
             ok = await fut
             kind = "response"
         else:
@@ -514,7 +516,7 @@ class Outbound:
         return self._post(sid, renderer.elicitation(question), timeout_s=ACK_TIMEOUT_S, **kw)
 
     def _repost_pending(self, sid: str) -> None:
-        """Spec §5: right after the turn's first response is queued, queue the session's
+        """Spec §5: right after each response of the turn is queued, queue the session's
         pending question again (same row and request id) so it is the last activity and
         Linear keeps showing its select. A live row is never re-posted."""
         store = self.a._store

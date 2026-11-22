@@ -397,18 +397,34 @@ async def test_final_response_then_repost(env, session_env):
                     {"label": "prod", "value": "prod"}]}
     row = store.control("clar-1")
     assert row is not None and row.state == "pending"  # same row, state kept
-    # A further response of the answered turn does not post the question again.
-    await a.send(D_CHAT, "more", metadata={**META, "notify": True})
+
+
+async def test_repost_after_attachment_more_response(env, session_env):
+    a, client, gw, store, order = env
+    _, original = await _deferred_clarify(a, client, gw, session_env)
+    await a.send(D_CHAT, "final", metadata={**META, "notify": True})
+    # Rulings 33/35: an attachment of the final (notify, no reply_to) is a ``more`` response.
+    r = await a.send(D_CHAT, "attachment", metadata={**META, "notify": True})
     await settle(a)
-    assert sum(1 for t, *_ in _session_acts(client) if t == "elicitation") == 2
+    assert r.success
+    acts = _session_acts(client)
+    assert [x[:2] for x in acts[-4:-1]] == [
+        ("response", "final"), original[:2], ("response", "attachment")]
+    assert acts[-3] == original and acts[-1] == original  # the question is the last activity
+    assert sum(1 for t, *_ in acts if t == "elicitation") == 3  # original + one per response
+    assert len(store.controls_for_issue(D_ISSUE)) == 1  # no new row
+    assert store.control("clar-1").state == "pending"
 
 
 async def test_no_repost_without_pending(env, session_env):
     a, client, gw, store, order = env
     await _delegated(a, gw, session_env)
     await a.send(D_CHAT, "done", metadata=META)
+    await a.send(D_CHAT, "attachment", metadata={**META, "notify": True})  # a ``more``
     await settle(a)
-    assert _session_acts(client)[-1][:2] == ("response", "done")
+    acts = _session_acts(client)
+    assert [x[:2] for x in acts[-2:]] == [("response", "done"), ("response", "attachment")]
+    assert not any(t == "elicitation" for t, *_ in acts)
 
 
 async def test_no_repost_for_live_row(env, session_env):
