@@ -279,6 +279,21 @@ async def test_turn_error_notice_posted_as_error(env):
     assert bodies(client, "error") == [(D_SID, "Sorry, I hit an error.")]
 
 
+async def test_turn_error_notice_consumed_once(env):
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+
+    async def base_task():
+        await a.on_processing_complete(gw.events[0], ProcessingOutcome.FAILURE)
+        await a.send(D_CHAT, "turn failed")
+
+    await asyncio.create_task(base_task())
+    await a.wait_idle()
+    await a.send(D_CHAT, "an unrelated unmarked send")  # no new turn recorded in between
+    assert bodies(client, "error") == [(D_SID, "turn failed")]
+    assert bodies(client, "thought")[-1] == (D_SID, "an unrelated unmarked send")
+
+
 async def test_anchorless_send_after_success_is_thought(env, caplog):
     a, client, gw, store, order = env
     await deliver(a, DELEGATION)
@@ -466,6 +481,11 @@ async def test_approval_timeout_edit_posts_expiry_and_drops_control(env):
     assert store.control_for_session(M_SID) is None
     other = await a.edit_message(M_ISSUE, "act-9", "x")
     assert other.success is False
+    # An approval id never retires a clarify row.
+    await a.send_clarify(M_ISSUE, "Which?", None, "clar-1", "sk", metadata={"thread_id": M_SID})
+    n = len(client.activities)
+    await a.edit_message(M_ISSUE, "approval:clar-1", "x")
+    assert len(client.activities) == n and store.control("clar-1") is not None
 
 
 # --------------------------------------------------------------- clarify
