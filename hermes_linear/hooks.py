@@ -22,6 +22,10 @@ The ``clarify`` tool posts no action at all (neither phase): its elicitation is 
 and anything posted after the elicitation would hide Linear's select input. The Tool Search
 bridge normally unwraps ``tool_call`` to the real name before hooks run; a call it leaves
 wrapped (scope / probe block) is recognised by its ``calls`` entries.
+
+``transform_tool_result`` (RET-94 spec §3) is the exception to "no store access here": it must
+answer synchronously, so it reads (and, for a clarify answered elsewhere, drops) control rows
+on the calling thread. ``Store`` is thread-safe; there is still no network I/O or loop hop.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from typing import Any
 from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
+from .questions import APPROVAL_PENDING_TEXT, PENDING_NOTICE
 
 log = logging.getLogger(__name__)
 
@@ -148,4 +153,95 @@ def on_post_tool_call(tool_name: str, args: Any = None, result: Any = None, task
     return None
 
 
-__all__ = ["on_post_tool_call", "on_pre_tool_call"]
+# --------------------------------------------------- transform_tool_result (RET-94 spec §3)
+
+_APPROVAL_TIMEOUT_MARK = "timed out without user response"  # tools/approval.py cli_timeout
+_NOT_ANSWERED = frozenset({"timed_out", "cancelled", "undelivered"})
+
+
+def _controls(session_key: str) -> list:
+    """Every connected adapter's control rows for ``session_key`` (read-only, any state)."""
+    rows: list = []
+    for ad in list(adapter_mod.ADAPTERS.values()):
+        store = getattr(ad, "_store", None)
+        if store is not None:
+            rows.extend(store.controls_for_session_key(session_key))
+    return rows
+
+
+def _strings(value: Any):
+    """Every string inside ``value`` (dict values and list items, recursively)."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _strings(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _strings(v)
+
+
+def _drop_clarify(session_key: str) -> None:
+    for ad in list(adapter_mod.ADAPTERS.values()):
+        store = getattr(ad, "_store", None)
+        if store is None:
+            continue
+        for row in store.controls_for_session_key(session_key):
+            if row.kind == "clarify":
+                store.drop_control(row.request_id)
+
+
+def _clarify_result(session_key: str, result: Any) -> str | None:
+    if not isinstance(result, str):
+        return None
+    try:
+        data = json.loads(result)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or "outcome" not in data:
+        return None
+    outcome = data.get("outcome")
+    if outcome != "timed_out":
+        if outcome not in _NOT_ANSWERED:
+            # Answered outside the plugin's own path (e.g. the gateway text intercept from
+            # another Linear session on this key): a kept row would stay pending forever.
+            _drop_clarify(session_key)
+        return None
+    if not any(r.kind == "clarify" for r in _controls(session_key)):
+        return None
+    data["outcome"] = "pending"
+    data["notice"] = PENDING_NOTICE
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _approval_result(session_key: str, args: Any, result: Any) -> str | None:
+    if not isinstance(result, str) or _APPROVAL_TIMEOUT_MARK not in result:
+        return None
+    values = list(_strings(args))
+    for row in _controls(session_key):
+        if row.kind == "approval" and row.command and any(row.command in v for v in values):
+            return APPROVAL_PENDING_TEXT
+    return None
+
+
+def on_transform_tool_result(tool_name: str, args: Any = None, result: Any = None,
+                             **kw: Any) -> str | None:
+    """In a Linear session, a timed-out clarify / approval whose question is still stored reads
+    as pending, not as a timeout; a clarify answered elsewhere drops its stale rows. Runs on
+    the agent thread: store access only, no network I/O or loop hop; any failure leaves the
+    result untouched (None)."""
+    try:
+        if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
+            return None
+        session_key = get_session_env("HERMES_SESSION_KEY") or None
+        if not session_key:
+            return None
+        if _silent(tool_name, args):
+            return _clarify_result(session_key, result)
+        return _approval_result(session_key, args, result)
+    except Exception as exc:  # noqa: BLE001 - fail open: never alter a result on error
+        log.debug("linear: transform_tool_result hook failed: %s", type(exc).__name__)
+        return None
+
+
+__all__ = ["on_post_tool_call", "on_pre_tool_call", "on_transform_tool_result"]

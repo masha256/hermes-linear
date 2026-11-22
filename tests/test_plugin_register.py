@@ -150,6 +150,31 @@ def test_hooks_registered(ctx):
     assert ("post_tool_call", hooks.on_post_tool_call) in ctx.hooks
 
 
+def test_plugin_registers_transform_hook(ctx, monkeypatch):
+    """Registered, and Hermes's real dispatch returns the hook's rewritten result."""
+    from types import SimpleNamespace
+
+    from hermes_cli.plugins import PluginManager
+
+    from hermes_linear import adapter as adapter_mod
+    from hermes_linear import questions
+
+    assert ("transform_tool_result", hooks.on_transform_tool_result) in ctx.hooks
+    store = Store.open(None)
+    store.put_control("req-1", "approval", "sess-1", 1, [], session_key="sk", command="ls -la")
+    monkeypatch.setattr(adapter_mod, "ADAPTERS", {"neo": SimpleNamespace(_store=store)})
+    env = {"HERMES_SESSION_PLATFORM": "linear", "HERMES_SESSION_KEY": "sk"}
+    monkeypatch.setattr(hooks, "get_session_env", lambda name, default="": env.get(name, default))
+    pm = PluginManager()
+    for name, cb in ctx.hooks:
+        pm._hooks.setdefault(name, []).append(cb)
+    out = pm.invoke_hook("transform_tool_result", tool_name="terminal", args={"command": "ls -la"},
+                         result="BLOCKED: Command timed out without user response.",
+                         task_id="t", tool_call_id="c", session_id="s", duration_ms=3,
+                         status="error", error_type=None, error_message=None)
+    assert out == [questions.APPROVAL_PENDING_TEXT]
+
+
 @pytest.mark.parametrize("present", [
     {}, {"LINEAR_CLIENT_SECRET": "x"}, {"LINEAR_WEBHOOK_SECRET": "y"},
     {"LINEAR_CLIENT_SECRET": "", "LINEAR_WEBHOOK_SECRET": "y"},
@@ -247,7 +272,8 @@ def test_manifest_declares_every_tool():
 
     manifest = yaml.safe_load((REPO_ROOT / "plugin.yaml").read_text())
     assert manifest["provides_tools"] == TOOL_NAMES
-    assert manifest["provides_hooks"] == ["pre_tool_call", "post_tool_call"]
+    assert manifest["provides_hooks"] == ["pre_tool_call", "post_tool_call",
+                                         "transform_tool_result"]
 
 
 def test_skill_registered(ctx):

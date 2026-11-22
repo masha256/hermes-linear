@@ -18,6 +18,7 @@ provides_tools:
 provides_hooks:
   - pre_tool_call
   - post_tool_call
+  - transform_tool_result
 requires_env:
   - name: LINEAR_CLIENT_SECRET
     description: "Linear OAuth app client secret (used for client-credentials tokens)"

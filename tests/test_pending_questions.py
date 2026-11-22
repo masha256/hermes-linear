@@ -9,6 +9,7 @@ generation keeps the old expiry (row dropped, expiry thought posted).
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 
 import pytest
@@ -18,6 +19,7 @@ from test_adapter_outbound import (  # noqa: F401  (fixtures)
     D_CHAT, approval_prompt, env, session_env, settle,
 )
 
+from hermes_linear import hooks
 from hermes_linear import outbound as outbound_mod
 from hermes_linear import questions
 
@@ -228,3 +230,94 @@ def test_copy_verbatim():
     assert questions.APPROVAL_PENDING_TEXT == (
         "Command not run: approval is pending in Linear. End this turn. If it is approved, the "
         "next message says so, and re-running this exact command is pre-approved once.")
+
+
+# ------------------------------------------------------------ transform_tool_result (T5)
+
+SK = "agent:main:linear:dm:x"
+TIMED_OUT = json.dumps({"responses": [{"question": "Which env?", "status": "timed_out",
+                                       "user_response": None}], "outcome": "timed_out"})
+APPROVAL_TIMEOUT = "BLOCKED: Command timed out without user response. Silence is not consent."
+
+
+def _row(store, rid="clar-1", kind="clarify", command=None):
+    store.put_control(rid, kind, D_SID, 1, [], session_key=SK, question="Which env?",
+                      command=command)
+
+
+async def test_transform_rewrites_timed_out_clarify(env, session_env):
+    a, client, gw, store, order = env
+    _row(store)
+    session_env(platform="linear", key=SK)
+    assert hooks.on_transform_tool_result("clarify", {}, TIMED_OUT) is not None  # live row
+    assert store.mark_control_pending("clar-1", D_ISSUE)
+    out = hooks.on_transform_tool_result("clarify", {"question": "Which env?"}, TIMED_OUT,
+                                         status="ok")
+    got = json.loads(out)
+    assert got["outcome"] == "pending" and got["notice"] == questions.PENDING_NOTICE
+    assert got["responses"] == json.loads(TIMED_OUT)["responses"]
+    # Bridged (still wrapped) clarify is recognised the same way.
+    bridged = {"calls": [{"name": "clarify", "arguments": {"question": "Which env?"}}]}
+    assert json.loads(hooks.on_transform_tool_result("tool_call", bridged, TIMED_OUT))[
+        "outcome"] == "pending"
+
+
+async def test_transform_ignores_answered_and_non_linear(env, session_env):
+    a, client, gw, store, order = env
+    session_env(platform="linear", key=SK)
+    assert hooks.on_transform_tool_result("clarify", {}, TIMED_OUT) is None  # no row
+    _row(store)
+    session_env(platform="slack", key=SK)
+    assert hooks.on_transform_tool_result("clarify", {}, TIMED_OUT) is None
+    session_env(platform="linear")  # no session key bound
+    assert hooks.on_transform_tool_result("clarify", {}, TIMED_OUT) is None
+    session_env(platform="linear", key=SK)
+    for bad in ("not json", json.dumps(["x"]), None, 42):
+        assert hooks.on_transform_tool_result("clarify", {}, bad) is None
+    assert hooks.on_transform_tool_result("terminal", {"command": "ls"}, TIMED_OUT) is None
+    answered = json.dumps({"responses": [], "outcome": "answered"})
+    assert hooks.on_transform_tool_result("clarify", {}, answered) is None
+
+
+async def test_transform_drops_rows_when_answered(env, session_env):
+    a, client, gw, store, order = env
+    _row(store, "clar-1")
+    _row(store, "req-1", kind="approval", command="ls")
+    session_env(platform="linear", key=SK)
+    for outcome in ("cancelled", "undelivered"):
+        res = json.dumps({"responses": [], "outcome": outcome})
+        assert hooks.on_transform_tool_result("clarify", {}, res) is None
+        assert store.control("clar-1") is not None
+    answered = json.dumps({"responses": [{"status": "answered", "user_response": "prod"}],
+                           "outcome": "answered"})
+    assert hooks.on_transform_tool_result("clarify", {}, answered) is None
+    assert store.control("clar-1") is None
+    assert store.control("req-1") is not None  # approval rows are not clarify answers
+
+
+async def test_transform_rewrites_approval_timeout(env, session_env):
+    a, client, gw, store, order = env
+    _row(store, "req-1", kind="approval", command="rm -rf build")
+    session_env(platform="linear", key=SK)
+    assert hooks.on_transform_tool_result(
+        "terminal", {"command": "rm -rf build"}, APPROVAL_TIMEOUT) == questions.APPROVAL_PENDING_TEXT
+    # Contained in a longer string value, nested args.
+    assert hooks.on_transform_tool_result(
+        "execute_code", {"opts": {"cmds": ["cd x && rm -rf build"]}},
+        APPROVAL_TIMEOUT) == questions.APPROVAL_PENDING_TEXT
+    assert hooks.on_transform_tool_result(
+        "terminal", {"command": "rm -rf dist"}, APPROVAL_TIMEOUT) is None
+    assert hooks.on_transform_tool_result(
+        "terminal", {"command": "rm -rf build"}, "BLOCKED: user denied") is None
+    session_env(platform="slack", key=SK)
+    assert hooks.on_transform_tool_result(
+        "terminal", {"command": "rm -rf build"}, APPROVAL_TIMEOUT) is None
+
+
+async def test_transform_approval_command_with_quotes(env, session_env):
+    a, client, gw, store, order = env
+    cmd = 'echo "hi there" > out.txt'
+    _row(store, "req-1", kind="approval", command=cmd)
+    session_env(platform="linear", key=SK)
+    assert hooks.on_transform_tool_result(
+        "terminal", {"command": cmd}, APPROVAL_TIMEOUT) == questions.APPROVAL_PENDING_TEXT

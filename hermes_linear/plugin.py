@@ -167,6 +167,7 @@ def register(ctx) -> None:
     ctx.register_skill(SKILL_NAME, SKILL_PATH, description=SKILL_DESCRIPTION)
     ctx.register_hook("pre_tool_call", hooks.on_pre_tool_call)
     ctx.register_hook("post_tool_call", hooks.on_post_tool_call)
+    ctx.register_hook("transform_tool_result", hooks.on_transform_tool_result)
     ctx.register_cli_command(
         "linear",
         "Linear channel: setup, status, test",
