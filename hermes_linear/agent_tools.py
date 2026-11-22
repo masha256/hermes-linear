@@ -109,8 +109,12 @@ async def _lookup(ad: Any, env: dict) -> list[str | None]:
 
 
 def _fallback(registry: dict, profile: str | None) -> Any:
-    """The adapter for reads without an owning turn: the session's profile's, else the first."""
-    if profile and registry.get(profile) is not None:
+    """The adapter for reads without an owning turn: the session's profile's, else the first.
+
+    The default bot binds ``HERMES_SESSION_PROFILE`` as ``''`` but registers as ``default``.
+    """
+    profile = (profile or "").strip() or "default"  # as adapter._profile is derived
+    if registry.get(profile) is not None:
         return registry[profile]
     return next(iter(registry.values()), None)
 

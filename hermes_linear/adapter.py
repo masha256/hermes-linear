@@ -111,7 +111,8 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             session_key_of=self._base_session_key, base_owns=self._base_owns,
             base_busy=lambda sk: sk in getattr(self, "_active_sessions", {}),
             on_stop_unsettled=lambda t: self.outbound.stop_unsettled(t),
-            on_safety_expired=lambda t: self.outbound.safety_expired(t))
+            on_safety_expired=lambda t: self.outbound.safety_expired(t),
+            on_drained=lambda: self._forget_tool_created())
         self.opener = SessionOpener(
             store=lambda: self._store, client=lambda: self._client,
             settings=lambda: self._settings, post_ack=self._post_ack,

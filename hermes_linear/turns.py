@@ -113,6 +113,7 @@ class TurnEngine:
         base_busy: Callable[[str], bool],
         on_stop_unsettled: Callable[[Turn], None] = lambda turn: None,
         on_safety_expired: Callable[[Turn], None] = lambda turn: None,
+        on_drained: Callable[[], None] = lambda: None,
     ) -> None:
         self._handle_message = handle_message
         self._build_source = build_source
@@ -127,6 +128,9 @@ class TurnEngine:
         self._base_busy = base_busy
         self._on_stop_unsettled = on_stop_unsettled  # posts Stopped. (outbound)
         self._on_safety_expired = on_safety_expired  # posts the timeout error (outbound)
+        # A drain ended: a turn freed by the stop-settle / safety nets never completes (its
+        # late on_processing_complete finds no turn), so per-session sweeps run here too.
+        self._on_drained = on_drained
         self.queues: dict[Key, deque[Turn]] = {}
         self.inflight: dict[Key, Turn] = {}
         # Completed turns whose base task has not finished yet; release waits for it (Q5).
@@ -179,16 +183,17 @@ class TurnEngine:
         Linear key, belongs to gateway session ``session_key``.
 
         Draining turns freed by the stop-settle / safety nets count (the gateway may still be
-        running them); draining turns whose ``on_processing_complete`` ran do not.
+        running them); draining turns whose ``on_processing_complete`` ran do not. In-flight
+        turns still in ``_hand_off`` (ack wait, snapshot) have no ``session_key`` yet; like
+        queued turns they count under the key they will get (``_queued_session_key``).
         """
         if not session_key:
             return False
-        live = [*self.inflight.values(),
-                *(t for t, _h in self._drain_deadlines.values() if not t.finished)]
-        if any(t is not exclude and t.session_key == session_key for t in live):
-            return True
+        turns = [*self.inflight.values(),
+                 *(t for t, _h in self._drain_deadlines.values() if not t.finished),
+                 *(t for q in self.queues.values() for t in q)]
         return any(t is not exclude and self._queued_session_key(t) == session_key
-                   for q in self.queues.values() for t in q)
+                   for t in turns)
 
     def busy(self, key: Key) -> bool:
         return key in self.inflight or key in self.draining or bool(self.queues.get(key))
@@ -411,6 +416,10 @@ class TurnEngine:
         handle = self._drain_timers.pop(key, None)
         if handle is not None:
             handle.cancel()
+        try:
+            self._on_drained()
+        except Exception as exc:  # noqa: BLE001 - a sweep must never wedge the FIFO
+            log.error("linear: post-drain sweep failed: %s", type(exc).__name__)
 
     def _drain_deadline_hit(self, key: Key, turn: Turn) -> None:
         entry = self._drain_deadlines.get(key)

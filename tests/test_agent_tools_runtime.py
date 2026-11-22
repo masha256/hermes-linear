@@ -439,3 +439,53 @@ async def test_tool_created_cleared_after_stop_drops_queue(env):
     assert not a.turns.queues
     assert sk not in a.tool_created
     await a.wait_idle()
+
+
+# ----------------------------------------------------------------- fix round 2
+
+
+async def test_tool_created_survives_turn_not_yet_handed_off(env):
+    """A turn in ``_hand_off`` (ack wait, snapshot) has no ``session_key`` yet and is no
+    longer queued; it still counts as its gateway session's."""
+    a, client, gw, store, order = env
+    await deliver(a, DELEGATION)
+    key = (f"{D_ISSUE}:1", None)
+    first = a.turns.inflight[key]
+    sk = first.session_key
+    a.tool_created[sk] = {"x"}
+    pending = Turn(decision=first.decision, mid=f"{D_SID}:act-9")  # session_key still None
+    a.turns.inflight[(f"{D_ISSUE}:1", "thread-b")] = pending
+    await asyncio.create_task(a.on_processing_complete(gw.events[0], ProcessingOutcome.SUCCESS))
+    assert a.tool_created[sk] == {"x"}  # the pre-hand-off turn belongs to the same session
+    del a.turns.inflight[(f"{D_ISSUE}:1", "thread-b")]
+    a._forget_tool_created()
+    assert sk not in a.tool_created
+
+
+async def test_tool_created_cleared_after_safety_release(env, monkeypatch):
+    """A safety-freed turn never completes (its late on_processing_complete finds no turn);
+    the set is swept once its drain ends."""
+    from hermes_linear import constants
+    a, client, gw, store, order = env
+    monkeypatch.setattr(constants, "TURN_SAFETY_TIMEOUT_S", 0.05)
+    await deliver(a, DELEGATION)
+    sk = a.turns.inflight[(f"{D_ISSUE}:1", None)].session_key
+    a.tool_created[sk] = {"x"}
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if not a.turns.inflight and not a.turns.draining:
+            break
+    assert not a.turns.inflight and not a.turns.draining
+    assert sk not in a.tool_created
+
+
+def test_fallback_default_profile_empty_env(bg_loop, registry, session, monkeypatch):
+    """The default bot binds HERMES_SESSION_PROFILE='' but registers as 'default'."""
+    first, default = new_adapter(bg_loop), new_adapter(bg_loop)
+    registry["a"], registry["default"] = first, default
+    names = {"HERMES_SESSION_PLATFORM": "slack", "HERMES_SESSION_PROFILE": ""}
+    monkeypatch.setattr(agent_tools, "get_session_env", lambda n, d="": names.get(n, d))
+    assert agent_tools.resolve_context().adapter is default
+    del names["HERMES_SESSION_PROFILE"]
+    assert agent_tools.resolve_context().adapter is default
+    assert agent_tools._fallback(registry, None) is default
