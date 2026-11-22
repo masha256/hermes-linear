@@ -6,7 +6,7 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) channel plugin that turns Linear into a place you work *with* your Hermes agent:
 
-- **Delegate a ticket to your agent → one Hermes session for the whole ticket.** Every agent thread on the ticket, plain comments from your team, and edits to the ticket and its project all feed the same conversation, so the agent remembers everything about the ticket.
+- **Delegate a ticket to your agent → one Hermes session for the whole ticket.** The agent works in the thread Linear opens on delegation (and in any thread where you @mention it). Plain comments from your team and edits to the ticket and its project reach the same conversation as context, so the agent remembers everything about the ticket.
 - **@mention your agent on any other ticket → a quick, thread-scoped Q&A.** Follow-ups in that thread keep context; nothing is shared ticket-wide.
 - **Native Linear agent UI:** progress (thoughts and tool calls), approvals and questions as pick-lists, the Stop button, and a live plan checklist.
 
@@ -38,7 +38,8 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 |---|---|
 | Delegate a ticket to the agent | A Hermes session opens for the ticket. The agent acknowledges within seconds, moves the ticket to your team's first *started* status (configurable), and starts working. |
 | Reply in the agent's thread | The reply is a new turn in the ticket's session. |
-| Start a new thread on a delegated ticket (with or without @mention) | The agent picks it up in the **same** ticket session and answers in that thread. |
+| Comment on a delegated ticket without @mentioning the agent (a new thread, or a reply in a thread that isn't the agent's) | Recorded as context, like an edit: the agent sees it in the "Since your last turn" summary of its next turn. Plain comments never wake the agent; threads outside the agent's own are for people. |
+| @mention the agent in another thread on a delegated ticket | The agent joins that thread in the **same** ticket session and answers there. |
 | Edit the ticket (status, labels, description, links) or its project, or post a project update | Recorded as context. The agent sees a "Since your last turn" summary at the start of its next turn. Edits never wake the agent on their own. |
 | @mention the agent on a ticket that is *not* delegated | A one-off session for that thread only. |
 | Press **Stop** | The running turn is interrupted; the agent reports what it finished and what it didn't. |

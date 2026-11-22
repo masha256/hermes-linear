@@ -37,7 +37,6 @@ from .models import (
     Fatal,
     Ignore,
     Interrupt,
-    OpenSessionOnComment,
     Refuse,
     Reply,
     ResolveControl,
@@ -577,12 +576,9 @@ async def _comment(event: dict, ctx: RouterContext) -> list[Decision]:
     actor_id = _human_actor_id(event)
     if not bot and not (actor_id and await ctx.allowed(actor_id)):
         return [Ignore("denied actor")]
-    if not parent_id and not bot:  # §6.2 (5): top-level human comment
-        return [OpenSessionOnComment(
-            issue_id=issue_id, comment_id=comment_id, user_id=actor_id,
-            user_name=user.get("name") or _d(event.get("actor")).get("name") or DEFAULT_AUTHOR,
-            body=body,
-        )]
+    # RET-108 (§7.4): only the agent's own threads drive it. A plain comment, top-level
+    # or a reply outside a session thread, is context for the next turn; an explicit
+    # @mention reaches the agent through Linear's own mention session (§6.2 (3)).
     bot_name = _d(data.get("botActor")).get("name") if isinstance(data.get("botActor"), dict) else None
     return [AddContext((ContextItem(
         issue_id=issue_id, kind="comment", field="reply" if parent_id else "comment",

@@ -58,7 +58,7 @@ Linear constraints the design must respect: return HTTP 200 within **5 s**; firs
 2. One Linear OAuth app per Hermes profile, `actor=app`, client-credentials tokens.
 3. Webhooks only; one process-wide listener; per-profile path `/linear/<profile>/webhook`.
 4. Delegated ticket → one Hermes session (`chat_id = <issueId>:<generation>`, shared). Non-delegated @mention → thread session (`chat_id = <issueId>`, `thread_id = <agentSessionId>`). @mention on a delegated ticket joins the ticket session.
-5. Plain human top-level comments on delegated tickets wake the agent (plugin opens the Linear session). Edits are context only.
+5. Plain comments and edits on delegated tickets are context only; only the agent's own threads (the delegation session, @mention threads) wake it. (Superseded the original "top-level comments wake the agent" decision in RET-108.)
 6. Context-only events: Issues, Comments (non-session threads), Issue attachments, Projects, Project updates. Label-definition events are not used.
 7. Access: allowlist of Linear UUIDs / emails / `*`, or allow-all; default deny; denied users never become context. Bots and integrations are context-only and never wake the agent.
 8. Visibility: every tool call is an `action`; commentary is `thought`; heartbeat on long turns; todo → Linear plan.
@@ -128,7 +128,7 @@ Inbound `message_id = <agentSessionId>:<activityId>`; the renderer resolves `rep
    1. `signal: stop` → interrupt (§8.5).
    2. A `pending_controls` row for this agent session → resolve it (§8.4); no new turn.
    3. Otherwise → a turn in the session mapped to this agent session.
-5. **Plain top-level human comment on a delegated ticket** → `agentSessionCreateOnComment` on that comment; record the session (`plugin_created`, `root_comment_id`) **before** processing any `created` for it, and match the resulting `created` webhook by session id **or** root comment id so it is ignored regardless of arrival order; start a turn in the ticket session.
+5. **Plain comments are not turn triggers** (RET-108). Only the agent's own threads drive it: the delegation session and any thread where someone @mentions the app (3). A plain human comment on a delegated ticket, top-level or a reply outside a session thread, is context (§7.4) that the next turn sees in its digest. Comment sessions the plugin opened before this change (`kind = comment`, `plugin_created`) keep taking prompts like any other agent session.
 
 ### 6.3 Concurrency and ordering
 
@@ -159,7 +159,7 @@ Accepted risk: an event can be lost if the process dies between the 200 and the 
 ### 7.2 Dispatch by type
 
 - `AgentSessionEvent` → router (§6).
-- `Issue`, `Comment`, `Attachment`, `Project`, `ProjectUpdate` → context collector (§7.4), except triggers in §6.2 (2) and (5).
+- `Issue`, `Comment`, `Attachment`, `Project`, `ProjectUpdate` → context collector (§7.4), except the trigger in §6.2 (2).
 - `OAuthApp revoked` → mark the profile's channel fatal; surfaced in `hermes status` / `hermes linear status`.
 - `AppUserNotification`, `PermissionChange` → log and ignore.
 - **Echo filter:** drop any event whose actor / comment author is the app user.
@@ -178,7 +178,7 @@ Kept only for tickets in mode `delegated`:
 
 - `Issue` / `Attachment` events for that ticket.
 - `Project` / `ProjectUpdate` events, fanned out to every delegated ticket with that `project_id`.
-- `Comment`: top-level by a human → turn trigger (§6.2 (5)); reply in a non-session thread → context; reply in an agent-session thread (`parentId` ∈ `sessions.root_comment_id`) → drop (already arrived as `prompted`).
+- `Comment`: top-level, or a reply in a non-session thread → context (§6.2 (5)); reply in an agent-session thread (`parentId` ∈ `sessions.root_comment_id`) → drop (already arrived as `prompted`).
 
 Item shape: `(issue, kind, field, old → new, actor, at)`. Labels and states use names from the payload; description changes keep the new text truncated to 800 chars.
 
@@ -273,7 +273,7 @@ The platform is registered with `allowed_users_env="LINEAR_ALLOWED_USERS"` and `
 
 - **Unit:** router, renderer, access, digest fold — pure functions over the RET-43 fixtures (IDs scrubbed).
 - **Listener:** signature, replay, dedup, unknown profile, `oauthClientId` mismatch, body cap.
-- **Contract:** fake Linear GraphQL server — token renew on 401, 429 backoff, activity writes, `agentSessionCreateOnComment` / `OnIssue`.
+- **Contract:** fake Linear GraphQL server — token renew on 401, 429 backoff, activity writes, `agentSessionCreateOnIssue`.
 - **Multi-profile:** two profiles, one listener, same workspace — each sees only its own delegated tickets.
 - **Live smoke script** against the Hermes Test app: delegate, two threads, plain comment, edit, approval, stop.
 - `hermes plugins validate` clean.
@@ -285,7 +285,7 @@ Each item has a defined fallback, so none blocks the plan.
 1. `ctx.get_config()` inside a multiplexed secondary profile's adapter returns that profile's settings. **Fallback:** read via `apply_yaml_config_fn` → `PlatformConfig.extra` (per-profile by construction).
 2. How the gateway distinguishes interim from final sends in `send()` metadata. **Fallback:** buffer sends per turn; the last one before turn completion is the `response`, earlier ones become `thought`.
 3. `agentSessionCreateOnIssue` when the app already has a session on the ticket. **Fallback:** reuse the most recent non-dismissed app session on that ticket.
-4. Whether `agentSessionCreateOnComment` emits a `created` webhook. **Handled either way** by the §6.2 (5) match rule.
+4. Whether `agentSessionCreateOnComment` emits a `created` webhook. **Moot since RET-108:** the plugin no longer opens sessions on comments (§6.2 (5)).
 5. Link-attachment and project status-post payload shapes (not yet observed). **Fallback:** generic item rendering from the entity's title/body fields.
 6. Client credentials on an app that has **never** been installed in the workspace (the probe app had been installed earlier via the browser flow). **Fallback:** the setup wizard prints a one-time install URL (`/oauth/authorize?actor=app&scope=…`) for an admin to approve; the plugin still uses client-credentials tokens afterwards.
 7. Whether Linear requires a callback URL on an app that only uses client credentials. **Handled:** README tells users to enter any HTTPS URL if asked.

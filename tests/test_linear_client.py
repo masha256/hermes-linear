@@ -241,14 +241,6 @@ async def test_create_activity_unsuccessful_raises(fake, client):
         await client.create_activity("sess-1", {"type": "thought", "body": "x"})
 
 
-async def test_create_session_on_comment_returns_id(fake, client):
-    fake.on("AgentSessionCreateOnComment", {"data": {"agentSessionCreateOnComment": {
-        "success": True, "agentSession": {"id": "sess-c"}}}})
-    assert await client.create_session_on_comment("cmt-1") == "sess-c"
-    (call,) = fake.gql_calls("AgentSessionCreateOnComment")
-    assert call.variables == {"input": {"commentId": "cmt-1"}}
-
-
 async def test_create_session_on_issue_returns_id(fake, client):
     fake.on("AgentSessionCreateOnIssue", {"data": {"agentSessionCreateOnIssue": {
         "success": True, "agentSession": {"id": "sess-i"}}}})

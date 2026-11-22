@@ -35,8 +35,8 @@ from .constants import ACK_TIMEOUT_S
 from .linear_client import LinearClient
 from .listener import ProfileEndpoint, get_listener
 from .outbound import Outbound, media_text
-from .models import (AddContext, AwaitDelegation, Fatal, Ignore, Interrupt, OpenSessionOnComment,
-                     Refuse, Reply, ResolveControl, SetMode, StartTurn)
+from .models import (AddContext, AwaitDelegation, Fatal, Ignore, Interrupt, Refuse,
+                     Reply, ResolveControl, SetMode, StartTurn)
 from .router import RouterContext, route
 from .sessions_open import SessionOpener
 from .settings import (
@@ -511,8 +511,6 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             await self._post_ack(d.agent_session_id, renderer.response(d.text))
         elif isinstance(d, AwaitDelegation):
             self.opener.await_delegation(d, event)
-        elif isinstance(d, OpenSessionOnComment):
-            await self.opener.open_session_on_comment(d)
         elif isinstance(d, Fatal):
             await self._fatal(d.reason)
         elif isinstance(d, Ignore):
