@@ -432,13 +432,13 @@ covers:
 
 This is a stop point with Mike: a gateway restart, then a live run.
 
-- [ ] **Step 1: Deploy.** Merge the branch into the plugin path used by neo (the
+- [x] **Step 1: Deploy.** Merge the branch into the plugin path used by neo (the
   symlink target). Mike restarts the gateway.
-- [ ] **Step 2: Kickoff.** Mike creates a ticket for a small real change in the
+- [x] **Step 2: Kickoff.** Mike creates a ticket for a small real change in the
   Linear project "hermes linear test project", saying "manage with hermes-linear",
   and delegates it to the app.
-- [ ] **Step 3: Exit checklist.** Run spec §8 "Milestone 1 exit", steps 1–7.
+- [x] **Step 3: Exit checklist.** Run spec §8 "Milestone 1 exit", steps 1–7.
   Record each result on RET-84.
-- [ ] **Step 4: Carry-forwards.** Copy the deferred minors from this plan's SDD
+- [x] **Step 4: Carry-forwards.** Copy the deferred minors from this plan's SDD
   ledger into spec §9 "Carry-forwards". Commit
   `docs: milestone 1 carry-forwards`.

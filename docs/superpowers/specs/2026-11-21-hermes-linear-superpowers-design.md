@@ -300,6 +300,78 @@ Items deferred during the milestone 1 build are logged in its SDD ledger. When
 milestone 1 closes, they are copied here and become the starting list for the M2
 brainstorm.
 
+Milestone 1 closed with the RET-94 run (RET-84). The deferred minors from the
+ledger follow, as logged against `superpowers-integration`. They were not
+re-checked against RET-94 or RET-107, which touched the same code, so confirm
+each one before working it.
+
+**Tool runtime (T1)**
+
+- A loop that stops mid-wait costs the full tool timeout and logs asyncio
+  warnings.
+
+**Client and generic tools (T2)**
+
+- `app_comments` reads only the first 250 comments.
+- The `team_states` cache lives as long as the client does.
+- Label groups are not handled.
+- The marker check-then-act on comments can race under concurrent calls.
+- An update with only unknown `remove_labels` sends an empty `issueUpdate`.
+- The `_paged` cap can overshoot by up to one page.
+- Plain comments don't strip `hermes-linear` markers.
+- Ruling S12: `linear_issue_create` without a parent makes a standalone ticket
+  in the session's team and project. Stray top-level tickets are possible.
+
+**`linear_sync_spec` (T3)**
+
+- The header scan doesn't skip `~~~` fences.
+- `is_file` then `open` races with a FIFO swapped in between (off-loop).
+- A BOM before the header reads as `NO_LINEAR_HEADER`.
+
+**`linear_sync_plan` (T4)**
+
+- Done tickets keep their old sort order after the tasks are renumbered.
+- An unterminated marker strips up to the next `-->`.
+- A refused session-ticket heading still shows its ID in the plan comment.
+  RET-107 changed the comment shape, so check whether this still applies.
+- Ruling S17: only app-created children are canceled or adopted. A duplicate
+  made by a person stays until a person closes it.
+
+**`linear_task_state` (T5)**
+
+- When the blocked comment fails to post, the result doesn't report that the
+  label was applied.
+- Dead `or ""` in the handler.
+- The labels connection is not paged.
+
+**Skill and registration (T6)**
+
+- The repo-from-project-link and large-projects sections of the skill go past
+  D11. They are M2 scope and harmless.
+- `hermes plugins validate` is not part of the test suite (CI runs it).
+- Ruling S19: there is no tool for self-delegation. The skill asks the user to
+  delegate the next sub-project ticket. `delegate: self` on
+  `linear_issue_update` is the follow-up.
+
+**Setup and status (T7)**
+
+- Status output alignment.
+- No "last Linear event" line when the store is unavailable.
+- Labels are refetched per team.
+- Partial results are dropped when one call fails.
+
+**Probe notes (T0)**
+
+- Notes L52: the unknown-tool citation should be
+  `agent/turn_tool_validation.py:84,102-114,146-149` and
+  `conversation_loop.py:1126-1138`. The claim itself is correct.
+- Notes L147 is an overlong line.
+
+**Found at close (filed as tickets)**
+
+- RET-110: `linear_issue_update` can't change a ticket's parent, and the
+  app-created write scope lasts only one turn.
+
 ## 10. Out of scope
 
 - Two-way sync (editing in Linear and syncing back to git).
