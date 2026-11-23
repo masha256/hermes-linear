@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import re
 import threading
@@ -30,7 +31,7 @@ from typing import Any, Callable, Coroutine
 from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
-from . import sync
+from . import graphql_guard, sync
 from .constants import TOOL_TIMEOUT_S
 from .linear_client import LinearError
 
@@ -987,6 +988,52 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
     return out
 
 
+# -- linear_query (RET-119 spec §3)
+
+QUERY_MAX_RESULT_CHARS = 50_000
+QUERY_ERROR_MESSAGE_CHARS = 1_000
+#: ``LinearError`` codes ``linear_query`` answers as-is (plus ``message``).
+_QUERY_KEPT_CODES = {"RATELIMITED", "NOT_FOUND", "UNAUTHENTICATED", "AUTHENTICATION_ERROR",
+                     "FORBIDDEN"}
+_TOO_COMPLEX_PREFIX = "Query too complex"  # live probe: INPUT_ERROR with a presentable detail
+
+
+def _parse_query(args: dict) -> dict:
+    """The read-only guard: runs on the tool thread, before any Linear call."""
+    query = args.get("query")
+    code = graphql_guard.check(query)
+    if code is not None:
+        raise _Refusal(code)
+    variables = args.get("variables")
+    if variables is not None and not isinstance(variables, dict):
+        raise _Refusal("BAD_ARGS")
+    return {"query": query, "variables": variables}
+
+
+def _query_error(exc: LinearError) -> dict:
+    message = str(exc)
+    if message.startswith(_TOO_COMPLEX_PREFIX):
+        return {"ok": False, "error": "QUERY_TOO_COMPLEX",
+                "message": f"{exc.detail or message} Lower first: or the nesting depth."}
+    if exc.code in _QUERY_KEPT_CODES:
+        return {"ok": False, "error": exc.code, "message": message}
+    return {"ok": False, "error": "GRAPHQL_ERROR",
+            "message": message[:QUERY_ERROR_MESSAGE_CHARS]}
+
+
+async def _query(ctx: ToolContext, a: dict) -> dict:
+    try:
+        data = await ctx.client.gql(a["query"], a["variables"])
+    except LinearError as exc:
+        return _query_error(exc)
+    size = len(json.dumps(data, ensure_ascii=False, default=str))
+    if size > QUERY_MAX_RESULT_CHARS:
+        return {"ok": False, "error": "RESPONSE_TOO_LARGE", "size": size,
+                "limit": QUERY_MAX_RESULT_CHARS,
+                "message": "Paginate (first:/after:) or select fewer fields."}
+    return {"ok": True, "data": data}
+
+
 linear_issue_get = _tool(_parse_get, _get)
 linear_issue_create = _tool(_parse_create, _create)
 linear_issue_update = _tool(_parse_update, _update)
@@ -996,6 +1043,7 @@ linear_sync_plan = _tool(_parse_sync_plan, lambda ctx, a: _sync_plan(ctx, a),  #
                          blocking_parse=True, timeout_s=PLAN_SYNC_TIMEOUT_S,
                          finish=_finish_sync_plan)
 linear_task_state = _tool(_parse_task_state, _task_state)
+linear_query = _tool(_parse_query, _query)
 
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
 
@@ -1105,6 +1153,18 @@ TOOL_SCHEMAS: dict[str, dict] = {
                          "description": "Required with blocked: what you need answered."},
         }, "required": ["id", "state"]},
     },
+    "linear_query": {
+        "name": "linear_query",
+        "description": ("Run a read-only GraphQL query against Linear's API as the Linear app "
+                        "(no mutations or subscriptions). Results over 50,000 chars are "
+                        "refused: paginate with first:/after: or select fewer fields."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string",
+                      "description": "A GraphQL query document (query/fragment only)."},
+            "variables": {"type": "object",
+                          "description": "Values for the query's variables."},
+        }, "required": ["query"]},
+    },
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
@@ -1115,10 +1175,11 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_sync_spec": linear_sync_spec,
     "linear_sync_plan": linear_sync_plan,
     "linear_task_state": linear_task_state,
+    "linear_query": linear_query,
 }
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_comment", "linear_issue_create", "linear_issue_get", "linear_issue_update",
-           "linear_sync_plan", "linear_sync_spec", "linear_task_state",
+           "linear_query", "linear_sync_plan", "linear_sync_spec", "linear_task_state",
            "resolve_context", "resolve_state", "run_on_adapter"]

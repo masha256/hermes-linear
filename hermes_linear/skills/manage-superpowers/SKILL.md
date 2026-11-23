@@ -15,12 +15,11 @@ truth; Linear holds rendered copies that link back to the committed files.
 
 ## Calling the tools
 
-The `linear_*` tools are deferred behind tool search. Load a schema with
-`tool_describe` (exact names), then call it with `tool_call`, one entry per call:
-`tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])`
-(a batch of several plugin tools is rejected). Calling `linear_issue_get(...)`
-directly fails as an unknown tool. Below, `linear_x(...)` is shorthand — always call
-via `tool_call`. The seven tools:
+The `linear_*` tools are deferred behind tool search. Load a schema with `tool_describe`
+(exact names), then call it with `tool_call`, one entry per call:
+`tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])` (a batch of
+several plugin tools is rejected). Calling `linear_issue_get(...)` directly fails as an unknown
+tool. Below, `linear_x(...)` is shorthand — always call via `tool_call`. The eight tools:
 
 - `linear_issue_get` (`id`): state, labels, project and its links, parent, children.
 - `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`): in
@@ -31,6 +30,7 @@ via `tool_call`. The seven tools:
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
 - `linear_task_state` (`id`, `state` = `in_progress | in_review | done | blocked |
   unblocked`, `summary?`, `question?`).
+- `linear_query` (`query`, `variables?`): read-only GraphQL, no mutations; over 50,000 chars refused.
 
 They act as the Linear app, write only to the session ticket, its descendants and
 tickets they created from it (in any turn), never raise, and fail as `{"ok": false, "error": …}`.
