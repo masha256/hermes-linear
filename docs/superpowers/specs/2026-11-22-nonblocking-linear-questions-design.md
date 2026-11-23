@@ -18,7 +18,7 @@ Slack and Telegram are unchanged.
 | — | Hybrid vs fully non-blocking | Hybrid. Ask as today (blocking select, Hermes's clarify / approval timeout). Only on timeout does the question become **pending**. |
 | — | What drives the switch | Hermes's own timeout. No plugin timer. |
 | Q1 | Exec approvals | Deny-and-defer with a one-shot pre-approval of the exact re-run. |
-| Q2 | Final reply after a pending select | Post the reply, then re-post the pending question as the last activity. |
+| Q2 | Final reply after a pending select | Post the reply, then re-post the pending question's select as the last activity, under a one-line pointer body (RET-116; it re-sent the full question text before). |
 | Q3 | Which ticket gets `Blocked` | The session's single open task sub-ticket (tracked from `linear_task_state`), else the session ticket. |
 | Q4 | Lifetime | No timer. A question lives until it is answered, replaced by a newer question in the same session, or the ticket is undelegated / re-delegated. |
 
@@ -143,11 +143,20 @@ does no I/O.
 
 ### 5. Final reply: re-post (`outbound.send`)
 
-When `send` posts a turn's **first response** (kind `response`) for an agent session that has
-a pending row, it queues a re-post of that row's elicitation (same body and options, same
+When `send` posts a response of a turn (the first and each `more` one) for an agent session
+that has a pending row, it queues a re-post of that row's elicitation (same options, same
 `request_id`) right after the response, on the session's `_SessionWrites` queue. The re-post
-is therefore the session's last activity. The re-post uses the stored `question` and
-`choices`. Approvals use `renderer.approval_options()` narrowed to the stored choices.
+is therefore the session's last activity. The re-post uses the stored `choices`; approvals use
+`renderer.approval_options()` narrowed to the stored choices.
+
+The re-post body is a fixed pointer, not the stored `question` (RET-116, superseding "same
+body"): every elicitation is a persistent comment in the thread, and Linear only stops
+rendering the select of one that is no longer the latest activity. Re-sending the question
+text showed the whole question twice. Bodies: `outbound.REPOST_CLARIFY_TEXT` ("Still waiting
+for your answer to the question above.") for a clarify, with or without choices, and
+`outbound.REPOST_APPROVAL_TEXT` ("Still waiting for your approval of the command above.")
+for an approval. The stored `question` stays on the row: the answer turn's
+`Answer to "<question>"` framing and the transform hook still use it.
 
 ### 6. Answer path (`router.py`, `sessions_open.py`)
 
@@ -230,7 +239,8 @@ Unit (pytest, through the real registry and hook dispatch where a contract is in
 - `retire_clarify` → pending (no post) and stop → drop + expiry; the same for approvals;
 - the transform hook rewrites the clarify and approval results only in Linear sessions with a
   row, and is a no-op elsewhere;
-- re-post ordering: response then elicitation, last on the queue;
+- re-post ordering: response then elicitation, last on the queue; the re-post carries the
+  original's select under the pointer body, and the full question text is posted once;
 - pending answer → `StartTurn` text and `Blocked` removal; live answer unchanged; stop while
   pending; undelegation;
 - `Blocked` target: zero, one or several open tasks;

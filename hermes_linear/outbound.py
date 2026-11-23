@@ -32,8 +32,9 @@ Q8, Q10).
   (typing, heartbeat, interim sends, tool actions). Elicitations, errors and responses still
   post; the expiry thought posts after the row is dropped. Every response of the turn (the
   first, sent or promoted at turn end, and each ``more`` one: attachments, a late final) would
-  land after a *pending* question and hide its select, so the question is queued again right
-  after each (same row, ``_repost_pending``).
+  land after a *pending* question and hide its select, so the question's select is queued
+  again right after each (same row, ``_repost_pending``) under a one-line pointer body: the
+  original elicitation stays in the thread, so re-sending its text would duplicate it.
 * Tool events from ``hooks.py`` (already on the loop): start/finish actions with the fast-tool
   skip, todo -> plan, and the session link.
 
@@ -76,6 +77,10 @@ HEARTBEAT_TEXT = "Still working…"
 EXPIRED_TEXT = "This request expired."
 APPROVAL_EXPIRED_TEXT = "This request expired. The command was not run."
 TIMED_OUT_TEXT = "This turn timed out."
+# RET-116: the body of a re-posted pending question. Linear keeps the original elicitation
+# in the thread as a comment; only its select stops rendering once another activity follows.
+REPOST_CLARIFY_TEXT = "Still waiting for your answer to the question above."
+REPOST_APPROVAL_TEXT = "Still waiting for your approval of the command above."
 SESSION_LINK_LABEL = "Hermes session"
 _NOTICE_KEYS = frozenset({"thread_id", "hermes_profile"})  # turn-error notice metadata (Q1)
 _APPROVAL_CHOICES = ("once", "session", "deny")  # spec §8.4 omits "always" (Q8)
@@ -521,8 +526,10 @@ class Outbound:
     def _repost_pending(self, sid: str) -> None:
         """Spec §5: right after each response of the turn is queued, queue the session's
         pending question again (same row and request id) so it is the last activity and
-        Linear keeps showing its select. A live row is never re-posted. Never raises: the
-        response is already queued, and a raised ``send`` would invite a second final."""
+        Linear keeps showing its select. The re-post carries the same select but a one-line
+        pointer body: the original elicitation stays in the thread (RET-116). A live row is
+        never re-posted. Never raises: the response is already queued, and a raised ``send``
+        would invite a second final."""
         try:
             store = self.a._store
             row = store.control_for_session(sid) if store is not None else None
@@ -530,7 +537,8 @@ class Outbound:
                 return
             log.info("linear: re-posting pending %s %s after the response", row.kind,
                      row.request_id)
-            self._elicit(sid, row.kind, row.question or "", row.choices)
+            body = REPOST_APPROVAL_TEXT if row.kind == "approval" else REPOST_CLARIFY_TEXT
+            self._elicit(sid, row.kind, body, row.choices)
         except Exception as exc:  # noqa: BLE001 - store error; the response stands
             log.warning("linear: re-posting the pending question of %s failed: %s", sid,
                         type(exc).__name__)

@@ -426,6 +426,17 @@ def _session_acts(client, sid=D_SID):
             for s, c, _eph, signal, sm in client.activities if s == sid]
 
 
+def _repost(original, text=outbound_mod.REPOST_CLARIFY_TEXT):
+    """RET-116: the re-post keeps the original's select (signal and options) but carries a
+    one-line pointer: Linear keeps the original question in the thread as a comment."""
+    return (original[0], text, original[2], original[3])
+
+
+def _asked_once(client, original):
+    """The full question body is in the thread once (the original), never re-sent."""
+    return sum(1 for a in _session_acts(client) if a[1] == original[1]) == 1
+
+
 async def _deferred_clarify(a, client, gw, session_env):
     mid = await _delegated(a, gw, session_env)
     await _clarify(a, client)
@@ -444,7 +455,8 @@ async def test_final_response_then_repost(env, session_env):
     assert r.success
     acts = _session_acts(client)
     assert acts[-2][:2] == ("response", "Waiting for your answer.")
-    assert acts[-1] == original
+    assert acts[-1] == _repost(original)
+    assert _asked_once(client, original)
     assert original[2] == "select" and original[3] == {
         "options": [{"label": "staging", "value": "staging"},
                     {"label": "prod", "value": "prod"}]}
@@ -462,8 +474,10 @@ async def test_repost_after_attachment_more_response(env, session_env):
     assert r.success
     acts = _session_acts(client)
     assert [x[:2] for x in acts[-4:-1]] == [
-        ("response", "final"), original[:2], ("response", "attachment")]
-    assert acts[-3] == original and acts[-1] == original  # the question is the last activity
+        ("response", "final"), _repost(original)[:2], ("response", "attachment")]
+    # the question's select is the last activity; its full text stays posted once
+    assert acts[-3] == _repost(original) and acts[-1] == _repost(original)
+    assert _asked_once(client, original)
     assert sum(1 for t, *_ in acts if t == "elicitation") == 3  # original + one per response
     assert len(store.controls_for_issue(D_ISSUE)) == 1  # no new row
     assert store.control("clar-1").state == "pending"
@@ -502,7 +516,7 @@ async def test_repost_after_promoted_thought(env, session_env):
     await settle(a)
     acts = _session_acts(client)
     assert acts[-2][:2] == ("response", "the answer")
-    assert acts[-1] == original
+    assert acts[-1] == _repost(original)
 
 
 async def test_repost_survives_memory_loss(env, session_env):
@@ -512,7 +526,7 @@ async def test_repost_survives_memory_loss(env, session_env):
     await a.send(D_CHAT, "done", metadata=META)
     await settle(a)
     acts = _session_acts(client)
-    assert acts[-2][:2] == ("response", "done") and acts[-1] == original
+    assert acts[-2][:2] == ("response", "done") and acts[-1] == _repost(original)
 
 
 async def test_repost_pending_approval(env, session_env):
@@ -525,7 +539,9 @@ async def test_repost_pending_approval(env, session_env):
     await a.send(D_CHAT, "done", metadata=META)
     await settle(a)
     acts = _session_acts(client)
-    assert acts[-2][:2] == ("response", "done") and acts[-1] == original
+    assert acts[-2][:2] == ("response", "done")
+    assert acts[-1] == _repost(original, outbound_mod.REPOST_APPROVAL_TEXT)
+    assert _asked_once(client, original)
     assert original[2] == "select" and original[3]["options"]
 
 
@@ -540,7 +556,7 @@ async def test_repost_clarify_without_choices(env, session_env):
     await a.send(D_CHAT, "done", metadata=META)
     await settle(a)
     acts = _session_acts(client)
-    assert acts[-2][:2] == ("response", "done") and acts[-1] == original
+    assert acts[-2][:2] == ("response", "done") and acts[-1] == _repost(original)
 
 
 async def test_repost_store_error_still_returns_send_result(env, session_env, monkeypatch,
