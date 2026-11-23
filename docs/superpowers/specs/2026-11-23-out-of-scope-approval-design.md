@@ -2,7 +2,8 @@
 
 Linear: RET-119
 
-Status: approved in the RET-119 thread (Q1–Q4 and design sections 1–2), 2026-11-23.
+Status: approved in the RET-119 thread (Q1–Q4 and design sections 1–2), 2026-11-23;
+§2 revised for Q1b (public API only), same day.
 Sub-project A of the RET-118 umbrella; B, C and D build on the approval path defined here.
 
 ## Goal
@@ -20,7 +21,8 @@ write is attributed to the app.
 
 | # | Question | Decision |
 |---|----------|----------|
-| Q1 | Where the scope decision runs | In the tool handler. It walks the scope once on the adapter loop and, for an out-of-scope target, calls Hermes's `tools.approval.request_tool_approval` itself from the tool thread (the function the `pre_tool_call` `approve` directive calls). No hook I/O, no hook→handler token, no check/write gap. |
+| Q1 | Where the scope decision runs | ~~In the handler, via `tools.approval.request_tool_approval`~~ (superseded: not in the published plugin API). |
+| Q1b | Same, public API only | The handler walks the scope and records an out-of-scope verdict as an approval request (`APPROVAL_REQUIRED`); the agent's identical re-call makes `pre_tool_call` (store read only) return the `approve` directive; the handler writes only with an armed request. |
 | Q2 | What one approval covers | **Approve once / Deny** only. `rule_key = <tool>:<digest>`; no session grain. A deferred answer grants one re-run bound to the argument digest. |
 | Q3 | Default of `out_of_scope_writes` | `approve`. |
 | Q4 | `linear_query` response cap | Refuse when the serialized `data` exceeds 50,000 chars (`RESPONSE_TOO_LARGE`). |
@@ -55,95 +57,168 @@ call time.
 
 ## 2. The approval path
 
-### 2.1 Two passes
+Revised after spec approval (Q1b, RET-119 thread): `tools.approval.request_tool_approval`
+is not in Hermes's published plugin API (`hermes_cli/data/plugin_api.json`). The gate is
+therefore raised through the public `pre_tool_call` `approve` directive. The handler
+records the scope verdict, and the hook turns it into the directive with no I/O.
 
-`_tool(..., gated=True)` wraps the gated bodies. Each call gets a fresh `Gate` object on
-its `ToolContext`.
+### 2.1 Flow
 
-1. **Pass 1 (adapter loop).** The body runs as today. In a Linear session `_writable(ref)`
-   resolves the issue and runs `check_write_scope`. If the target is out of scope it no
-   longer raises: it records `{uuid, identifier, title}` on the gate and returns the
-   issue. Each gated body calls `gate.check()` immediately before its first Linear write.
-   If the gate recorded anything, `check()` raises `_NeedsApproval(targets)`; nothing has
-   been written. Every gated body already does all scope checks before any write; the
-   update body is the one whose order is checked by a test (`id` and `parent` both
-   checked before `check()`).
-   - A scope *error* (a `LinearError` code from the walk, `NOT_LINEAR_SESSION`) still
-     refuses at once; only the plain `OUT_OF_SCOPE` verdict is gateable.
+The gated tools are `linear_comment`, `linear_issue_update` and `linear_issue_create`.
+`_tool(..., gated=True)` wraps them.
+
+1. **First call: the handler, on the adapter loop.** The body runs as today. In a
+   Linear session, `_writable(ref)` resolves the issue and runs `check_write_scope`.
+   - An out-of-scope target no longer raises. `_writable` records
+     `{uuid, identifier, title}` on the call's `Gate` (a field on `ToolContext`) and
+     returns the issue.
+   - Each gated body calls `gate.check()` immediately before its first Linear write. If
+     the gate recorded anything, `check()` raises `_NeedsApproval(targets)`, and nothing
+     has been written. Every gated body already finishes its scope checks before any
+     write. A test pins this for update: `id` and `parent` are both checked before
+     `check()`.
+   - A scope *error* (a `LinearError` code from the walk, or `NOT_LINEAR_SESSION`) still
+     refuses at once. Only the plain `OUT_OF_SCOPE` verdict can be gated.
    - Non-gated tools (sync, task_state) keep raising `OUT_OF_SCOPE`.
-2. **Mode (tool thread).** On `_NeedsApproval`:
+2. **Mode (tool thread), on `_NeedsApproval`.**
    - `deny`: return `OUT_OF_SCOPE`.
-   - `allow`: go to pass 2.
-   - `approve`: call `request_tool_approval(tool, message, rule_key=f"{tool}:{digest}")`
-     (§2.2) on the tool thread. It blocks until the human answers or Hermes's approval
-     timeout ends the wait. Approved → pass 2. Otherwise → §2.4.
-3. **Pass 2 (adapter loop).** The body re-runs from the start with
-   `approved = {target uuids}`. `_writable` accepts an out-of-scope issue whose UUID is in
-   `approved`. A target that is out of scope and not approved (the issue moved between
-   the passes, or a reference resolved to another issue) is refused `OUT_OF_SCOPE`:
-   no second prompt, no loop.
+   - `allow`: run the body again with `approved = {target uuids}` (step 5) and return its
+     result.
+   - `approve`: store an **approval request** (§2.3) holding the digest (§2.2), the
+     targets and the prepared approval `message`. Then return:
 
-Pass 1 only reads, so running it twice costs one extra round of reads, and only for
-out-of-scope calls. In-scope calls are a single pass, exactly as today.
+     ```json
+     {"ok": false, "error": "APPROVAL_REQUIRED",
+      "message": "Not run: <RET-50> is outside this session's write scope. Call <tool> again with identical arguments to ask a human for approval in Linear."}
+     ```
+
+     Nothing has been written.
+3. **Identical re-call: `pre_tool_call`.**
+   - For a gated tool in a Linear session, the hook computes the digest from the call's
+     args. This is a pure function, the same one the handler uses.
+   - It looks up an approval request for `(session key, digest)` in the owning adapter's
+     store. That is a store read only, as `transform_tool_result` does today; there is no
+     network call and no hop onto the loop.
+   - If it finds one, it **arms** the request (stores `armed = 1`) and returns
+     `{"action": "approve", "message": <stored message>, "rule_key": "<tool>:<digest>"}`.
+   - Anything else returns `None`, as today. That covers no request, a non-gated tool, a
+     non-Linear session, and any error.
+   - The hook never blocks the tool by itself.
+4. **Hermes's gate.**
+   - Hermes asks a human, renders it as the Linear select (§2.4), and waits as far as
+     `approvals.timeout`.
+   - `yolo` and `approvals.mode: off` approve at once. Smart approval is not used for
+     plugin rules. A context with no human (subagent, cron) is blocked.
+   - Denial or timeout: the handler never runs. `transform_tool_result` rewrites the
+     result (§2.5).
+5. **Approved: the handler again.**
+   - It takes the request for `(session key, digest)` only if it is **armed**, and
+     deletes it in the same store operation.
+   - It runs the body with `approved = {stored target uuids}`. `_writable` accepts an
+     out-of-scope issue whose UUID is in `approved`.
+   - A target that is out of scope and not approved is refused `OUT_OF_SCOPE`, with no
+     new request. That happens when the issue moved since step 1, or a reference
+     resolves to another issue.
+   - Without an armed request, the handler treats the call as a first call (step 1). This
+     covers a hook that did not run, for example `ctx.dispatch_tool`, which skips hooks.
+     Such a call can never write out of scope unapproved.
+6. **Disarm.** `post_tool_call` for a gated tool clears `armed` on the request with that
+   digest, so a later call that skips hooks can't use an approval that was denied or
+   blocked. The request itself stays, so the deferred re-run (§2.4) still finds it.
+
+In-scope calls are one handler pass with no store traffic, exactly as today. An
+out-of-scope write costs one extra tool call (the identical re-call) and one extra round
+of reads.
 
 ### 2.2 Digest, message and rule key
 
-- `digest` = first 16 hex chars of `sha256` over the canonical JSON
+- `digest` is the first 16 hex chars of `sha256` over the canonical JSON
   (`sort_keys=True, separators=(",", ":"), ensure_ascii=False`) of
-  `{"tool": <name>, "args": <parsed args>, "targets": <sorted target UUIDs>}`.
-  Identical arguments give the identical digest; any other argument (body, title,
-  target) gives a new one.
-- `message` (Hermes's `description`, shown in the Linear select):
-  - the tool name and what it will do, e.g. ``linear_comment on RET-50 "Title"``;
-  - each target as identifier and title;
-  - a preview of the parsed args, with long strings (bodies, descriptions) cut at 1,500
-    chars and marked as cut;
+  `{"tool": <name>, "args": <raw args dict>}`.
+  - It uses the raw args because the hook only sees those.
+  - The target UUIDs are not part of the digest: they are stored on the request, and
+    step 5 re-checks them.
+  - Identical arguments give the identical digest. Any other argument (body, title,
+    target reference) gives a new one.
+- `message` becomes Hermes's `description`, which is shown in the Linear select. It holds:
+  - the tool and what it will do, e.g. ``linear_comment on RET-50 "Title"``;
+  - each target, as identifier and title;
+  - a preview of the args, with long strings (bodies, descriptions) cut at 1,500 chars
+    and marked as cut;
   - a last line `digest: <hex>`.
 - `rule_key = f"{tool}:{digest}"`. Even if a `session` answer slipped through, it would
   only cover the identical call.
 
-### 2.3 Outbound: tool approvals
+### 2.3 Approval requests (store)
 
-Hermes names the prompt's `command` `<tool> (plugin approval rule)`. A prompt whose
-command matches `^<linear_[a-z_]+> \(plugin approval rule\)$` and whose description ends
-in a `digest: <hex>` line is a **tool approval**:
+The new table is `approval_requests`:
 
-- Its choices are narrowed to `once` and `deny` (no `session`).
-- Its grant key is `f"{command}#{digest}"`, used both when the answer stores the grant
+| Column | Type | Notes |
+|--------|------|-------|
+| `session_key` | TEXT | Part of the primary key. |
+| `digest` | TEXT | Part of the primary key. |
+| `tool` | TEXT | |
+| `targets` | TEXT | JSON list of UUIDs. |
+| `message` | TEXT | |
+| `armed` | INTEGER | 0 or 1. |
+| `created_at` | REAL | |
+
+Store methods:
+
+- `put_request` replaces any existing row for the key and disarms it.
+- `arm_request` returns the row, or None.
+- `take_armed_request` is an atomic select-and-delete of an armed row.
+- `disarm_request`.
+- `drop_all_requests` is the restart sweep, alongside `drop_all_grants`.
+
+Rows older than 24 h are pruned on `put_request`. A stale row can only cause a prompt;
+it never lets a write through unapproved.
+
+### 2.4 Outbound: tool approvals and the deferred answer
+
+Hermes names the prompt's `command` `<tool> (plugin approval rule)`. A prompt is a **tool
+approval** when its command matches `^<linear_[a-z_]+> \(plugin approval rule\)$` and its
+description ends in a `digest: <hex>` line. For a tool approval:
+
+- The choices are narrowed to `once` and `deny`. There is no `session` choice.
+- The grant key is `f"{command}#{digest}"`. It is used when the answer stores the grant
   (`put_grant`) and when the re-run's prompt looks it up (`_use_grant`). The control row
-  keeps the plain command; the key is derived from command + description, so no store
-  migration is needed.
+  keeps the plain command; the key is derived from the command plus the description, so
+  no grants migration is needed.
 - The answer turn reads
   ``Answer to approval for `<tool>` call <digest>: approved (once). Re-run the same call with identical arguments.``
   (or `: denied`). Shell approvals keep ``Answer to approval for `<cmd>`: …``.
-- Everything else about grants stays: one use, bound to the session key, the answering
-  actor (checked against the asking-time authority), and the answer turn's mid; dropped
-  when that turn is freed without reaching Hermes, and on restart.
+- The re-run in the answer turn follows §2.1 from step 3: the request row is still there,
+  so the hook issues the directive, and `_use_grant` approves it without a new select.
+- Everything else about grants is unchanged. A grant is used once and is bound to the
+  session key, to the answering actor (checked against the asking-time authority) and to
+  the answer turn's mid. It is dropped when that turn is freed without reaching Hermes,
+  and on restart.
 
-A tool-approval prompt without a parseable digest is treated as a normal approval (no
-grant on answer; the re-run asks again). Fail-closed.
+A tool approval without a parseable digest is treated as a normal approval: no grant on
+the answer, and the re-run asks again. This fails closed.
 
-### 2.4 Results
+### 2.5 Results
 
 | Outcome | Tool result |
 |---------|-------------|
-| Approved (or `allow`) | The tool's normal result. |
-| Denied by the human, or Hermes refused (e.g. a subagent: no human present) | `{"ok": false, "error": "APPROVAL_DENIED", "message": <Hermes's message>}` |
-| Hermes timed out and the plugin kept the question pending (an `approval` control row in state `pending` for this turn's mid whose description carries this digest) | `{"ok": false, "error": "APPROVAL_PENDING", "message": "Not run: approval is pending in Linear. End this turn. If it is approved, the next message says so and re-running this same call with identical arguments is pre-approved once."}` |
-| Timed out and no pending row (the question expired) | `APPROVAL_DENIED` with Hermes's timeout message. |
-| The gate raised | `APPROVAL_FAILED` (logged by type). |
+| Out of scope, mode `approve`, first call | `APPROVAL_REQUIRED` (§2.1 step 2) |
+| Approved, or mode `allow` | The tool's normal result |
+| Hermes timed out, and the plugin kept the question pending | `{"ok": false, "error": "APPROVAL_PENDING", "message": "Not run: approval is pending in Linear. End this turn. If it is approved, the next message says so and re-running this same call with identical arguments is pre-approved once."}` |
+| Denied by the human, the question expired, or Hermes blocked it (no human present) | `{"ok": false, "error": "APPROVAL_DENIED", "message": <Hermes's text>}` |
 
-The pending check reads the store from the tool thread (thread-safe, no network), using
-`HERMES_SESSION_MESSAGE_ID` and the session key as `hooks._turn_controls` does. Because
-the handler writes this result itself, `transform_tool_result` needs no change for tool
-approvals.
+"Pending" means an `approval` control row in state `pending` for this turn's mid whose
+`question` carries the `digest:` line.
 
-### 2.5 Bypasses and non-human contexts
+`transform_tool_result` produces both of the last two rows:
 
-These come from Hermes, and the plugin doesn't add any of its own:
-- `yolo` and `approvals.mode: off` approve at once.
-- Smart approval is not consulted for plugin rules.
-- A context with no human (a subagent, cron) fails closed, which shows up as `APPROVAL_DENIED`.
+- The rewrite applies only to a gated tool in a Linear session that has an approval
+  request for the call's digest, and only when the result is not the tool's own JSON
+  (`{"ok": …}`).
+- With Hermes's timeout mark and a pending row, the result becomes `APPROVAL_PENDING`.
+- Any other blocked result becomes `APPROVAL_DENIED`, carrying Hermes's text.
+- The hook reads the store only. On any error it leaves the result as it is.
+- The shell-approval rewrite already in `_approval_result` is unchanged.
 
 ## 3. `linear_query`
 
@@ -194,7 +269,8 @@ the code only. `linear_query` maps errors itself and adds `message`:
 - `hermes_linear/skills/manage-superpowers/SKILL.md` (it must stay at 150 lines or fewer, enforced by a test):
   - list `linear_query`;
   - say that out-of-scope writes from comment, update and create ask for approval;
-  - explain that `APPROVAL_PENDING` means end the turn, and that on
+  - explain that `APPROVAL_REQUIRED` means call again with identical arguments (that asks the
+    human), that `APPROVAL_PENDING` means end the turn, and that on
     ``Answer to approval for `<tool>` call <digest>: approved`` the agent re-runs the
     same call with identical arguments in that turn.
 - The neo `linear-agent-sessions` skill is updated after deploy and restart, never before.
@@ -215,15 +291,23 @@ TDD, through the real tool registry (`plugin.tool_handler`) where a handler is i
   - fragments, and several query operations;
   - a mix of query and mutation (refused);
   - SDL, unbalanced brackets, unterminated strings, an empty document, the size limit.
-- **Gate:**
+- **Gate (handler):**
   - each mode, with a fake client;
-  - pass 1 makes no writes;
+  - the first call makes no writes and stores a request;
   - update checks both ends before `check()`;
-  - pass 2 accepts approved UUIDs only, and a target that changes between the passes is refused;
-  - `request_tool_approval` driven against the real `tools.approval` on a worker thread for approve, deny and timeout→pending;
+  - an armed request is consumed exactly once;
+  - an unarmed request (hooks skipped) never writes out of scope;
+  - a target that changes between the calls is refused;
   - `NOT_LINEAR_SESSION` is never gated;
   - a scope error code is never gated.
-- **Digest:** stable for identical args; it changes with the body, the title or the target.
+- **Hook:**
+  - a request returns the `approve` directive with the stored message and `<tool>:<digest>`, and arms it;
+  - no request, or a non-gated tool, or a non-Linear session returns None;
+  - `post_tool_call` disarms;
+  - end to end through Hermes's real `_dispatch_pre_tool_call_hooks` / `request_tool_approval` on a worker thread: approve writes, deny does not, timeout→`APPROVAL_PENDING`.
+- **transform:** pending vs denied rewrites; the tool's own JSON is never rewritten; shell approvals are unchanged.
+- **Store:** request put / arm / take-armed / disarm / 24 h prune / restart sweep.
+- **Digest:** stable for identical args (key order irrelevant); it changes with the body, the title or the target.
 - **Outbound:**
   - tool approvals are narrowed to once and deny;
   - the grant key includes the digest;
@@ -236,8 +320,9 @@ TDD, through the real tool registry (`plugin.tool_handler`) where a handler is i
 
 Live (project "hermes linear test project", after `deploy-live` and a gateway restart):
 
-1. From ticket X, run `linear_comment` on an unrelated ticket Y. A select appears with
-   Approve once / Deny. Approve posts as the app; Deny posts nothing.
+1. From ticket X, run `linear_comment` on an unrelated ticket Y. The first call returns
+   `APPROVAL_REQUIRED` and the agent re-calls. A select appears with Approve once / Deny.
+   Approve posts as the app; Deny posts nothing.
 2. Let the select time out (pending), then answer later. The answer turn re-runs and posts
    without a second prompt. The same call with a different body prompts again.
 3. A comment on X or on its child gets no prompt.
@@ -253,12 +338,15 @@ Live (project "hermes linear test project", after `deploy-live` and a gateway re
   `question` (the prompt text), not by `command`: confirm that `prompt.text` carries the
   description and therefore the `digest:` line. If it does not, store the digest on the
   row from `prompt.description`.
-- Whether Hermes's generic tool deadline (`timeouts.tools.concurrent_batch`) can cut a
-  handler that is waiting on an approval, compared with a pre-hook approval. If it can,
-  declare a deadline floor or document the interaction.
-- `request_tool_approval` called from a plugin handler sees the gateway context
-  (`_presence`: `HERMES_SESSION_*` and the approval session contextvars are bound on the
-  tool thread). Pin this with a test against the real module.
+- Whether Hermes's generic tool deadline (`timeouts.tools.concurrent_batch`) covers the
+  pre-hook approval wait; if it can cut it, document the interaction.
+- The args the hook sees equal the args the handler receives (no `modify` hook in
+  between), and the Tool Search bridge unwraps `tool_call` before hooks run, so the
+  hook sees the real tool name. If the bridge can leave it wrapped, unwrap as
+  `hooks._silent` does.
+- `post_tool_call` fires for a call blocked by the approval gate (needed for disarm).
+- `execute_code`'s tool RPC runs `pre_tool_call` (if not, a sandboxed call simply gets
+  `APPROVAL_REQUIRED` every time: safe, but document it).
 - Hermes's `ExecApprovalPrompt.choices` for a plugin rule. Narrowing keeps only
   offered choices, so a Deny-only card stays Deny-only.
 
