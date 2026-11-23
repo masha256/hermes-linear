@@ -8,6 +8,7 @@ resolution is Task 1's (tested there), so it is pinned here with ``pin_ctx``.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import threading
 
 import pytest
@@ -64,6 +65,15 @@ def pin_ctx(monkeypatch, adapter):
         return ctx
     pin()
     return pin
+
+
+def deny_mode(adapter) -> None:
+    """Out-of-scope writes refused outright (no approval request; RET-119)."""
+    adapter._settings = dataclasses.replace(adapter._settings, out_of_scope_writes="deny")
+
+
+def needs_approval(out: dict) -> bool:
+    return out.get("ok") is False and out.get("error") == "APPROVAL_REQUIRED"
 
 
 # ----------------------------------------------------------------- schemas / handlers
@@ -189,6 +199,9 @@ def test_create_without_parent_then_update_created(pin_ctx, ws, adapter):
 
 
 def test_create_parent_out_of_scope_refused(pin_ctx, ws, adapter):
+    assert needs_approval(linear_issue_create({"title": "Sneaky", "parent": "OTH-9"}))
+    assert ws.writes() == [] and adapter._store.created_by(SELF) == set()
+    deny_mode(adapter)
     out = linear_issue_create({"title": "Sneaky", "parent": "OTH-9"})
     assert out == {"ok": False, "error": "OUT_OF_SCOPE"}
     assert ws.writes() == [] and adapter._store.created_by(SELF) == set()
@@ -265,7 +278,9 @@ def test_unknown_label_is_label_missing(pin_ctx, ws):
     assert ws.writes() == []
 
 
-def test_update_out_of_scope_refused(pin_ctx, ws):
+def test_update_out_of_scope_refused(pin_ctx, ws, adapter):
+    assert needs_approval(linear_issue_update({"id": "OTH-9", "title": "x"}))
+    deny_mode(adapter)
     assert linear_issue_update({"id": "OTH-9", "title": "x"}) == {"ok": False,
                                                                   "error": "OUT_OF_SCOPE"}
     assert ws.writes() == []
@@ -297,7 +312,11 @@ def test_reparent_with_other_fields(pin_ctx, ws):
     assert ws.writes()[-1][1] == ("uuid-sib", {"title": "Moved", "parentId": "uuid-child"})
 
 
-def test_reparent_out_of_scope_source(pin_ctx, ws):
+def test_reparent_out_of_scope_source(pin_ctx, ws, adapter):
+    assert needs_approval(linear_issue_update({"id": "OTH-9", "parent": "RET-1"}))
+    assert needs_approval(linear_issue_update({"id": "OTH-9", "parent": None}))
+    assert ws.writes() == []
+    deny_mode(adapter)
     assert linear_issue_update({"id": "OTH-9", "parent": "RET-1"}) == {
         "ok": False, "error": "OUT_OF_SCOPE"}
     assert linear_issue_update({"id": "OTH-9", "parent": None}) == {
@@ -305,7 +324,10 @@ def test_reparent_out_of_scope_source(pin_ctx, ws):
     assert ws.writes() == []
 
 
-def test_reparent_out_of_scope_target(pin_ctx, ws):
+def test_reparent_out_of_scope_target(pin_ctx, ws, adapter):
+    assert needs_approval(linear_issue_update({"id": "RET-2", "parent": "OTH-9"}))
+    assert ws.writes() == []
+    deny_mode(adapter)
     assert linear_issue_update({"id": "RET-2", "parent": "OTH-9"}) == {
         "ok": False, "error": "OUT_OF_SCOPE"}
     assert ws.issues["uuid-child"]["parent"] == SELF
@@ -380,6 +402,7 @@ def test_created_issue_survives_adapter_restart(pin_ctx, ws, adapter, loop):
 def test_created_issue_scoped_to_its_session_ticket(pin_ctx, ws, adapter):
     top = linear_issue_create({"title": "Umbrella"})["issue"]
     pin_ctx(issue="uuid-other", key="sk-other")  # a session on another ticket
+    deny_mode(adapter)  # the scope verdict itself, not the approval path (test_agent_tools_gate)
     assert linear_issue_update({"id": top["id"], "title": "x"}) == {
         "ok": False, "error": "OUT_OF_SCOPE"}
     assert linear_issue_create({"title": "x", "parent": top["id"]}) == {
@@ -403,7 +426,10 @@ def test_comment_plain_creates(pin_ctx, ws):
     assert (c["issue"], c["body"], c["user"]) == ("uuid-child", "hello", VIEWER)
 
 
-def test_comment_out_of_scope_refused(pin_ctx, ws):
+def test_comment_out_of_scope_refused(pin_ctx, ws, adapter):
+    assert needs_approval(linear_comment({"id": "OTH-9", "body": "x"}))
+    assert ws.writes() == []
+    deny_mode(adapter)
     assert linear_comment({"id": "OTH-9", "body": "x"}) == {"ok": False, "error": "OUT_OF_SCOPE"}
     assert ws.writes() == []
 
