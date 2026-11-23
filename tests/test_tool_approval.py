@@ -145,3 +145,42 @@ def test_grant_command_round_trip():
     assert split_grant_command(None) is None
     assert split_grant_command(f"<terminal> (plugin approval rule)#{d}") == ("terminal", d)
     assert split_grant_command(f"{CMD}#xyz") is None
+
+
+@pytest.mark.parametrize("tool,raw,coerced", [
+    ("linear_issue_create", {"title": "t", "labels": '["a","b"]'}, {"title": "t", "labels": ["a", "b"]}),
+    ("linear_issue_create", {"title": "t", "labels": "a"}, {"title": "t", "labels": ["a"]}),
+    ("linear_issue_create", {"title": "t", "labels": ("a",)}, {"title": "t", "labels": ["a"]}),
+    ("linear_issue_update", {"id": "X-1", "add_labels": "bug"}, {"id": "X-1", "add_labels": ["bug"]}),
+    ("linear_issue_update", {"id": "X-1", "remove_labels": '"bug"'},
+     {"id": "X-1", "remove_labels": ['"bug"']}),
+    ("linear_issue_update", {"id": "X-1", "add_labels": 7}, {"id": "X-1", "add_labels": [7]}),
+    ("linear_issue_update", {"id": "X-1", "add_labels": "[not json"},
+     {"id": "X-1", "add_labels": ["[not json"]}),
+])
+def test_digest_normalizes_array_fields_like_hermes_coercion(tool, raw, coerced):
+    assert digest(tool, raw) == digest(tool, coerced)
+
+
+def test_digest_normalization_idempotent_and_keeps_none_and_other_fields():
+    from hermes_linear.tool_approval import normalize_args
+
+    args = {"id": "X-1", "add_labels": ["a"], "remove_labels": None, "title": "[1]"}
+    assert normalize_args("linear_issue_update", args) == args
+    assert normalize_args("linear_issue_update", normalize_args(
+        "linear_issue_update", {"id": "X-1", "add_labels": "a"})) == {"id": "X-1", "add_labels": ["a"]}
+    # only array fields of that tool: a string field that looks like a list stays a string
+    assert digest("linear_comment", {"id": "X-1", "body": '["a"]'}) != \
+        digest("linear_comment", {"id": "X-1", "body": ["a"]})
+    assert digest("linear_issue_create", {"title": "t", "labels": None}) != \
+        digest("linear_issue_create", {"title": "t", "labels": [None]})
+
+
+def test_array_fields_match_tool_schemas():
+    from hermes_linear.agent_tools import TOOL_SCHEMAS
+    from hermes_linear.tool_approval import ARRAY_FIELDS
+
+    assert set(ARRAY_FIELDS) == set(GATED_TOOLS)
+    for tool in GATED_TOOLS:
+        props = TOOL_SCHEMAS[tool]["parameters"]["properties"]
+        assert ARRAY_FIELDS[tool] == {k for k, v in props.items() if v.get("type") == "array"}

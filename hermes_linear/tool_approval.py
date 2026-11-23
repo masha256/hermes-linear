@@ -2,7 +2,7 @@
 
 Used by the gated write handlers, the ``pre_tool_call`` hook, and outbound
 approval rendering. A gated call is identified by a digest of its tool name
-and raw arguments; the digest rides in the approval description's last line
+and normalized arguments (see :func:`normalize_args`); the digest rides in the approval description's last line
 so the hook can recover it from Hermes's approval request.
 """
 
@@ -29,11 +29,47 @@ _DIGEST_LINE_RE = re.compile(r"^digest: ([0-9a-f]{16})$")
 _GRANT_RE = re.compile(r"^<([A-Za-z0-9_]+)> \(plugin approval rule\)#([0-9a-f]{16})$")
 
 
+# Array-typed fields of the gated tools' schemas (agent_tools.TOOL_SCHEMAS; a test keeps
+# them in sync — importing agent_tools here would be a cycle).
+ARRAY_FIELDS: dict[str, frozenset[str]] = {
+    "linear_comment": frozenset(),
+    "linear_issue_create": frozenset({"labels"}),
+    "linear_issue_update": frozenset({"add_labels", "remove_labels"}),
+}
+
+
+def _as_array(value: Any) -> Any:
+    """Coerce one array-schema value as Hermes's ``coerce_tool_args`` does."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            return parsed
+    return [value]
+
+
+def normalize_args(tool: str, args: Any) -> dict:
+    """``args`` with the tool's array fields coerced; idempotent on coerced args.
+
+    The ``pre_tool_call`` hook sees the model's raw args and the handler may see them
+    after Hermes's ``coerce_tool_args``; normalizing here makes both digests agree.
+    """
+    if not isinstance(args, dict):
+        return {}
+    fields = ARRAY_FIELDS.get(tool, frozenset())
+    return {k: (_as_array(v) if k in fields else v) for k, v in args.items()}
+
+
 def digest(tool: str, args: Any) -> str:
-    """First 16 hex chars of sha256 over the canonical JSON of tool + args."""
-    raw_args = args if isinstance(args, dict) else {}
+    """First 16 hex chars of sha256 over the canonical JSON of tool + normalized args."""
     payload = json.dumps(
-        {"tool": tool, "args": raw_args},
+        {"tool": tool, "args": normalize_args(tool, args)},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,

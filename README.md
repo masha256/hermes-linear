@@ -45,7 +45,7 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 | @mention the agent on a ticket that is *not* delegated | A one-off session for that thread only. |
 | Press **Stop** | The running turn is interrupted; the agent reports what it finished and what it didn't. |
 | Answer an approval / question pick-list | The agent continues. Free text never counts as approval of a risky action. |
-| The agent wants to write to a ticket outside its own (not the session ticket, its sub-tickets or tickets it created from it) | It asks first: an **Approve once / Deny** pick-list in the thread names the tool, the target ticket and the arguments. *Approve once* runs exactly that call; any other call asks again. Unanswered within Hermes's `approvals.timeout`, the question stays pending: answer it later and the agent re-runs the call without a second prompt. Set with `out_of_scope_writes`. |
+| The agent wants to write to a ticket outside its own (not the session ticket, its sub-tickets or tickets it created from it) | It asks first: an **Allow once / Deny** pick-list in the thread names the tool, the target ticket and the arguments. *Allow once* runs exactly that call; any other call asks again. Unanswered within Hermes's `approvals.timeout`, the question stays pending: answer it later and the agent re-runs the call without a second prompt. Set with `out_of_scope_writes`. |
 | Remove the delegation | Any running turn stops. The session's memory is kept; re-delegating resumes it — unless the ticket is Done or Canceled, which starts a fresh session. |
 
 Everything the agent does appears in Linear's agent session panel: every tool call as an *action* with its result preview, commentary as *thoughts*, the final answer as a comment in the thread. Two prompts arriving at once (e.g. from two threads) are queued, never interleaved.
@@ -322,7 +322,7 @@ Use `hermes -p <profile> linear …` for other profiles.
 - Every webhook is HMAC-verified, rejected if older than 60 s, and de-duplicated.
 - Secrets are stored only in the profile's `.env`; tokens are held in memory.
 - Ticket text is untrusted input. Keep the allowlist tight and keep Hermes approvals on for risky tools; consider a narrower toolset for the Linear platform (`hermes tools … --platform linear`).
-- An out-of-scope write (`out_of_scope_writes: approve`) goes to a human through Hermes's own approval gate; one approval covers one call with identical arguments. Hermes's bypasses apply to it as to every approval: `/yolo` (or `--yolo`) and `approvals.mode: off` approve it without asking. Where Hermes has no human to ask, its gate blocks the write (cron follows `approvals.cron_mode`). `out_of_scope_writes: allow` skips the question entirely; use it only in trusted single-user setups.
+- An out-of-scope write (`out_of_scope_writes: approve`) goes to a human through Hermes's own approval gate; one approval covers one call with identical arguments. Hermes's bypasses apply to it as to every approval: `/yolo` (or `--yolo`) and `approvals.mode: off` approve it without asking. Hermes's presence rules decide who is asked: where no human is present (cron, a non-gateway run) its gate blocks the write (cron follows `approvals.cron_mode`); a subagent that inherits the gateway session asks in Linear like its parent. `out_of_scope_writes: allow` skips the question entirely; use it only in trusted single-user setups.
 
 ## Limitations
 

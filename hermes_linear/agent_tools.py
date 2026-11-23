@@ -484,8 +484,8 @@ def _gated(tool: str, args: dict, ctx: ToolContext,
            execute: Callable[[ToolContext], dict]) -> dict:
     """In the tool thread: run a gated tool's body (RET-119 spec §2.1 steps 1, 2 and 5).
 
-    An armed request for this call (``(session key, digest of the raw args)``) is taken
-    first: its stored target UUIDs are the only out-of-scope issues the pass may write.
+    An armed request for this call (``(session key, digest of the normalized args)``) is
+    taken first: its stored target UUIDs are the only out-of-scope issues the pass may write.
     Without one, a first pass records out-of-scope targets; then the mode decides: ``deny``
     refuses, ``allow`` runs again with those targets approved, ``approve`` stores a request
     and answers ``APPROVAL_REQUIRED``. Fail-closed: no digest or no store refuses

@@ -23,7 +23,7 @@ write is attributed to the app.
 |---|----------|----------|
 | Q1 | Where the scope decision runs | ~~In the handler, via `tools.approval.request_tool_approval`~~ (superseded: not in the published plugin API). |
 | Q1b | Same, public API only | The handler walks the scope and records an out-of-scope verdict as an approval request (`APPROVAL_REQUIRED`); the agent's identical re-call makes `pre_tool_call` (store read only) return the `approve` directive; the handler writes only with an armed request. |
-| Q2 | What one approval covers | **Approve once / Deny** only. `rule_key = <tool>:<digest>`; no session grain. A deferred answer grants one re-run bound to the argument digest. |
+| Q2 | What one approval covers | **Allow once / Deny** only. `rule_key = <tool>:<digest>`; no session grain. A deferred answer grants one re-run bound to the argument digest. |
 | Q3 | Default of `out_of_scope_writes` | `approve`. |
 | Q4 | `linear_query` response cap | Refuse when the serialized `data` exceeds 50,000 chars (`RESPONSE_TOO_LARGE`). |
 
@@ -108,7 +108,9 @@ The gated tools are `linear_comment`, `linear_issue_update` and `linear_issue_cr
    - Hermes asks a human, renders it as the Linear select (§2.4), and waits as far as
      `approvals.timeout`.
    - `yolo` and `approvals.mode: off` approve at once. Smart approval is not used for
-     plugin rules. A context with no human (subagent, cron) is blocked.
+     plugin rules. Hermes's presence rules decide: a context with no human present (cron,
+     a non-gateway run) is blocked; a subagent that inherits the gateway session asks in
+     Linear like its parent (`tools/delegate_tool_child_run.py:1021`; not verified live).
    - Denial or timeout: the handler never runs; the agent sees Hermes's own BLOCKED text
      (§2.5).
 5. **Approved: the handler again.**
@@ -135,8 +137,13 @@ identical re-call) and one extra round of reads.
 
 - `digest` is the first 16 hex chars of `sha256` over the canonical JSON
   (`sort_keys=True, separators=(",", ":"), ensure_ascii=False`) of
-  `{"tool": <name>, "args": <raw args dict>}`.
-  - It uses the raw args because the hook only sees those.
+  `{"tool": <name>, "args": <normalized args dict>}`.
+  - The hook sees the raw args, the handler may see them after Hermes's
+    `coerce_tool_args`. Normalization (ruling R10) coerces the gated tools' array fields
+    (`labels`, `add_labels`, `remove_labels`) as `coerce_tool_args` does: a string that
+    JSON-parses to a list becomes that list, any other non-list, non-None value `v`
+    becomes `[v]`, lists and tuples stay lists, `None` stays `None`. It is idempotent, so
+    both digests agree.
   - The target UUIDs are not part of the digest: they are stored on the request, and
     step 5 re-checks them.
   - Identical arguments give the identical digest. Any other argument (body, title,
@@ -205,7 +212,7 @@ the answer, and the re-run asks again. This fails closed.
 |---------|-------------|
 | Out of scope, mode `approve`, first call | `APPROVAL_REQUIRED` (§2.1 step 2) |
 | Approved, or mode `allow` | The tool's normal result |
-| Denied by the human, timed out, or Hermes blocked it (no human present) | Hermes's own block result, `{"error": "BLOCKED: …"}` |
+| Denied by the human, timed out, or Hermes blocked it (no human present: cron, a non-gateway run) | Hermes's own block result, `{"error": "BLOCKED: …"}` |
 
 Hermes does not run `transform_tool_result` for pre-hook blocks (`agent/tool_executor.py`,
 `if not managed.blocked`), so the plugin cannot rewrite that result. The pending guidance
@@ -314,7 +321,7 @@ TDD, through the real tool registry (`plugin.tool_handler`) where a handler is i
 Live (project "hermes linear test project", after `deploy-live` and a gateway restart):
 
 1. From ticket X, run `linear_comment` on an unrelated ticket Y. The first call returns
-   `APPROVAL_REQUIRED` and the agent re-calls. A select appears with Approve once / Deny.
+   `APPROVAL_REQUIRED` and the agent re-calls. A select appears with Allow once / Deny.
    Approve posts as the app; Deny posts nothing.
 2. Let the select time out (pending), then answer later. The answer turn re-runs and posts
    without a second prompt. The same call with a different body prompts again.
@@ -347,8 +354,9 @@ Answered from Hermes at `caafe5389a` (`~/.hermes/hermes-agent`), Task 7 (RET-129
   the args *after* the agent loop's hook (`model_tools.py:923`; the loop calls it with
   `skip_pre_tool_call_hook=True`, `agent/tool_executor.py:1738-1748`). For the gated tools
   coercion only changes an array field (`labels`, `add_labels`, `remove_labels`) sent as a
-  string. Then the hook's digest and the handler's differ, the re-call finds no request,
-  and the handler answers `APPROVAL_REQUIRED` again: fail-closed, no write, no prompt. On
+  string. That is handled by the R10 normalization in `tool_approval.digest` (§2.2): the
+  hook's digest of the raw args equals the handler's digest of the coerced args (tested in
+  `tests/test_tool_approval.py` and `tests/test_tool_approval_e2e.py`). On
   the `model_tools` path (`execute_code`, bridges) coercion runs before the hook
   (`model_tools.py:923` then `:984`), so the digests agree.
 - **Tool Search bridge.** The agent loop unwraps `tool_call` before any hook runs

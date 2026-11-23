@@ -96,7 +96,7 @@ class Hermes:
             register_gateway_settle(SK, rid, on_settle)  # False once a grant resolved it
 
     # --- agent loop (tool_executor._dispatch_authorized_once, on a tool worker thread)
-    def call(self, tool: str, args: dict, cid: str) -> dict:
+    def call(self, tool: str, args: dict, cid: str, coerced: dict | None = None) -> dict:
         from gateway.session_context import clear_session_vars, set_session_vars
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
         from tools.approval_context import reset_current_session_key, set_current_session_key
@@ -113,7 +113,9 @@ class Hermes:
                 hooks.on_post_tool_call(tool, args, result, "task-1", tool_call_id=cid,
                                         status="blocked")
             else:
-                result = plugin.tool_handler(tool)(dict(args), task_id="task-1",
+                # handle_function_call's coerce_tool_args runs after the loop's hook
+                handler_args = dict(args if coerced is None else coerced)
+                result = plugin.tool_handler(tool)(handler_args, task_id="task-1",
                                                    session_id="sess-1")
                 hooks.on_post_tool_call(tool, args, result, "task-1", tool_call_id=cid)
             return json.loads(result)
@@ -121,9 +123,11 @@ class Hermes:
             reset_current_session_key(token)
             clear_session_vars(tokens)
 
-    async def run(self, tool: str = TOOL, args: dict | None = None, cid: str = "c1") -> dict:
+    async def run(self, tool: str = TOOL, args: dict | None = None, cid: str = "c1",
+                  coerced: dict | None = None) -> dict:
         args = dict(ARGS if args is None else args)
-        return await asyncio.wait_for(asyncio.to_thread(self.call, tool, args, cid), WAIT_S)
+        return await asyncio.wait_for(
+            asyncio.to_thread(self.call, tool, args, cid, coerced), WAIT_S)
 
 
 def _lifecycle(hook_name, **kw):
@@ -286,3 +290,22 @@ async def test_e2e_in_scope_never_asks(e2e):
     assert out["ok"] is True and _comments(ws, SELF) == ["own ticket"]
     assert h.notified == []
     assert store.conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0] == 0
+
+
+async def test_e2e_coerced_array_arg_digests_agree(e2e):
+    """R10: the hook sees ``add_labels: "bug"``, the handler the coerced ``["bug"]``."""
+    h, a, client, gw, store, ws, config = e2e
+    tool, raw, coerced = "linear_issue_update", {"id": "OTH-9", "add_labels": "bug"}, \
+        {"id": "OTH-9", "add_labels": ["bug"]}
+    first = await h.run(tool, raw, cid="c-first", coerced=coerced)
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    d = tool_approval.digest(tool, raw)
+    assert d == tool_approval.digest(tool, coerced) and store.request(SK, d) is not None
+    task = asyncio.create_task(h.run(tool, raw, cid="c-again", coerced=coerced))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    assert h.notified[-1]["description"].endswith(f"digest: {d}")
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out["ok"] is True, out
+    assert ws.issues[OTHER]["labels"] == ["lb-bug"]
+    assert store.request(SK, d) is None
