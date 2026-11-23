@@ -23,6 +23,8 @@ WEBHOOK_SECRET_KEY = "LINEAR_WEBHOOK_SECRET"
 ALLOWED_USERS_ENV = "LINEAR_ALLOWED_USERS"
 ALLOW_ALL_USERS_ENV = "LINEAR_ALLOW_ALL_USERS"
 
+OUT_OF_SCOPE_MODES = ("approve", "deny", "allow")
+
 _TRUE = frozenset({"true", "1", "yes"})
 _FALSE = frozenset({"false", "0", "no", "off", ""})
 
@@ -42,6 +44,7 @@ class Settings:
     session_url: str
     listener_host: str
     listener_port: int
+    out_of_scope_writes: str = "approve"
 
 
 def _norm_entry(entry: object) -> str:
@@ -134,6 +137,14 @@ def load_settings(
     if not 0 < listener_port < 65536:
         raise SettingsError(f"setting 'listener_port' out of range: {listener_port}")
 
+    raw_mode = get_config("out_of_scope_writes", "approve")
+    out_of_scope_writes = _as_str(raw_mode).lower()
+    if out_of_scope_writes not in OUT_OF_SCOPE_MODES:
+        raise SettingsError(
+            f"invalid value for setting 'out_of_scope_writes': {raw_mode!r} "
+            f"(expected one of {', '.join(OUT_OF_SCOPE_MODES)})"
+        )
+
     return Settings(
         client_id=client_id,
         client_secret=client_secret,
@@ -145,6 +156,7 @@ def load_settings(
         listener_host=_as_str(get_config("listener_host", DEFAULT_LISTENER_HOST))
         or DEFAULT_LISTENER_HOST,
         listener_port=listener_port,
+        out_of_scope_writes=out_of_scope_writes,
     )
 
 
@@ -170,6 +182,7 @@ def only_global_allowlist(get_secret: Callable[[str], str | None]) -> bool:
 
 __all__ = [
     "GLOBAL_ALLOWLIST_WARNING",
+    "OUT_OF_SCOPE_MODES",
     "Settings",
     "SettingsError",
     "load_scoped_settings",

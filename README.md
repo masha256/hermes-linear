@@ -245,6 +245,7 @@ Settings live at `plugins.entries.linear.settings.<key>` in each profile's `conf
 | `auto_start` | bool | `true` | When a human delegates a ticket that is in Backlog / Todo / Triage, move it to the team's first *started* status when work begins. Tickets delegated by automations are left alone. |
 | `public_host` | string | `""` | Public HTTPS host (optionally `:port`) that Linear reaches the listener on. Used to build and print the webhook URL (`https://<public_host>/linear/<profile>/webhook`); set by `hermes linear setup`. Empty = Tailscale name if detected. |
 | `session_url` | string | `""` | Optional link shown as **Open** on the Linear agent session, e.g. `https://hermes.example.com/sessions/{session_id}`. Empty = no link. |
+| `out_of_scope_writes` | string | `approve` | What a Linear session does when an agent tool would write to an issue outside its write scope: `approve` asks a human in Linear first, `deny` refuses (`OUT_OF_SCOPE`), `allow` writes without asking (trusted single-user setups only). Case-insensitive. |
 | `listener_host` | string | `127.0.0.1` | Bind address of the shared webhook listener. **Read from the default profile only.** |
 | `listener_port` | int | `8650` | Port of the shared webhook listener. **Read from the default profile only.** |
 

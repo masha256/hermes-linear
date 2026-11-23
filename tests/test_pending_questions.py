@@ -1076,6 +1076,19 @@ async def test_restart_sweep_clears_grants(tmp_path, session_env):
         await a.disconnect()
 
 
+async def test_restart_sweep_drops_requests(tmp_path, session_env):
+    async def setup(a, client, gw, store):
+        store.put_request("K", "d1", "linear_comment", ["u-1"], "msg")
+        store.arm_request("K", "d1")
+
+    db = await _before_restart(tmp_path, session_env, setup)
+    a, client, gw, store = await _after_restart(db)
+    try:
+        assert store.request("K", "d1") is None
+    finally:
+        await a.disconnect()
+
+
 async def test_restart_drops_live_row_without_question(tmp_path, session_env, caplog):
     async def setup(a, client, gw, store):
         # A row written by pre-RET-94 code: no question text, so it cannot be framed.

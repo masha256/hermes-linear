@@ -8,7 +8,8 @@ import pytest
 
 from hermes_linear.constants import DEDUP_TTL_S, MAX_PENDING_ITEMS, USER_CACHE_TTL_S
 from hermes_linear.models import ContextItem
-from hermes_linear.store import Store
+from hermes_linear import store as store_mod
+from hermes_linear.store import ApprovalRequest, Store
 
 
 @pytest.fixture
@@ -412,6 +413,66 @@ def test_drop_all_grants(store):
     store.drop_all_grants()
     assert store.take_grant("K", "c") is None and store.take_grant("K2", "d") is None
     store.drop_all_grants()  # idempotent on an empty table
+
+
+# ------------------------------------------------------------- approval requests (RET-124)
+
+
+def test_request_put_arm_take(store):
+    store.put_request("K", "d1", "linear_comment", ["u-1", "u-2"], "msg")
+    r = store.request("K", "d1")
+    assert isinstance(r, ApprovalRequest)
+    assert (r.session_key, r.digest, r.tool, r.targets, r.message, r.armed) == (
+        "K", "d1", "linear_comment", ["u-1", "u-2"], "msg", False)
+    assert store.request("K", "other") is None and store.request("K2", "d1") is None
+    assert store.take_armed_request("K", "d1") is None  # not armed yet
+    armed = store.arm_request("K", "d1")
+    assert armed is not None and armed.armed is True and armed.targets == ["u-1", "u-2"]
+    taken = store.take_armed_request("K", "d1")
+    assert taken == armed
+    assert store.take_armed_request("K", "d1") is None
+    assert store.request("K", "d1") is None  # deleted by the take
+    assert store.arm_request("K", "d1") is None  # nothing left to arm
+
+
+def test_request_disarm_blocks_take(store):
+    store.put_request("K", "d1", "linear_comment", ["u-1"], "msg")
+    store.arm_request("K", "d1")
+    store.disarm_request("K", "d1")
+    assert store.take_armed_request("K", "d1") is None
+    r = store.request("K", "d1")
+    assert r is not None and r.armed is False  # the request itself stays
+    store.disarm_request("K", "missing")  # no-op
+
+
+def test_request_put_replaces_and_disarms(store):
+    store.put_request("K", "d1", "linear_comment", ["u-1"], "first")
+    store.arm_request("K", "d1")
+    store.put_request("K", "d1", "linear_issue_update", ["u-2"], "second")
+    r = store.request("K", "d1")
+    assert (r.tool, r.targets, r.message, r.armed) == (
+        "linear_issue_update", ["u-2"], "second", False)
+    assert store.take_armed_request("K", "d1") is None
+
+
+def test_request_ttl_prune(store, monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(store_mod.time, "time", lambda: now)
+    store.put_request("K", "old", "linear_comment", ["u-1"], "m")
+    now += 25 * 3600
+    assert store.request("K", "old") is not None  # reads never prune
+    store.put_request("K", "new", "linear_comment", ["u-1"], "m")
+    assert store.request("K", "old") is None
+    assert store.request("K", "new") is not None
+    assert store_mod.REQUEST_TTL_S == 86_400
+
+
+def test_drop_all_requests(store):
+    store.put_request("K", "d1", "linear_comment", ["u-1"], "m")
+    store.put_request("K2", "d2", "linear_comment", [], "m")
+    store.drop_all_requests()
+    assert store.request("K", "d1") is None and store.request("K2", "d2") is None
+    store.drop_all_requests()  # idempotent on an empty table
 
 
 # ------------------------------------------------------------- created issues (RET-110)

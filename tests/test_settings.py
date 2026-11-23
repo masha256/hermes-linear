@@ -77,6 +77,22 @@ def test_load_settings_defaults():
     assert s.listener_port == 8650
 
 
+def test_out_of_scope_writes_default_approve():
+    get_config, get_secret = _getters()
+    assert load_settings(get_config, get_secret, {}).out_of_scope_writes == "approve"
+
+
+def test_out_of_scope_writes_case_insensitive():
+    get_config, get_secret = _getters({**REQUIRED_CONFIG, "out_of_scope_writes": " Deny "})
+    assert load_settings(get_config, get_secret, {}).out_of_scope_writes == "deny"
+
+
+def test_out_of_scope_writes_invalid_raises():
+    get_config, get_secret = _getters({**REQUIRED_CONFIG, "out_of_scope_writes": "ask"})
+    with pytest.raises(SettingsError, match="'out_of_scope_writes'"):
+        load_settings(get_config, get_secret, {})
+
+
 def test_load_settings_explicit_values():
     get_config, get_secret = _getters(
         config={

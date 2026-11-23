@@ -111,6 +111,18 @@ CREATE TABLE IF NOT EXISTS approval_grants (
 );
 CREATE INDEX IF NOT EXISTS grants_turn ON approval_grants(turn_mid);
 
+-- Out-of-scope write approvals (RET-119 spec §2.3): one per (session, call digest).
+CREATE TABLE IF NOT EXISTS approval_requests (
+    session_key TEXT NOT NULL,
+    digest      TEXT NOT NULL,
+    tool        TEXT NOT NULL,
+    targets     TEXT NOT NULL,  -- JSON list of issue UUIDs
+    message     TEXT NOT NULL,
+    armed       INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (session_key, digest)
+);
+
 CREATE TABLE IF NOT EXISTS seen_webhooks (
     webhook_id TEXT PRIMARY KEY,
     at         REAL NOT NULL
@@ -143,6 +155,9 @@ CREATE TABLE IF NOT EXISTS created_issues (
 );
 CREATE INDEX IF NOT EXISTS created_owner ON created_issues(owner_issue_id);
 """
+
+# Approval requests older than this are pruned on ``put_request``.
+REQUEST_TTL_S = 86_400
 
 # Columns added to ``pending_controls`` after release; migrated in ``Store.__init__``.
 _CONTROL_COLUMNS = (
@@ -216,6 +231,24 @@ class UserRow:
 
 
 # ----------------------------------------------------------------- store
+
+
+@dataclass(frozen=True)
+class ApprovalRequest:
+    session_key: str
+    digest: str
+    tool: str
+    targets: list[str]
+    message: str
+    armed: bool
+    created_at: float
+
+
+def _request_row(r: sqlite3.Row) -> ApprovalRequest:
+    return ApprovalRequest(
+        session_key=r["session_key"], digest=r["digest"], tool=r["tool"],
+        targets=list(json.loads(r["targets"])), message=r["message"],
+        armed=bool(r["armed"]), created_at=r["created_at"])
 
 
 class Store:
@@ -754,6 +787,76 @@ class Store:
         self._write(lambda: self.conn.execute(
             "DELETE FROM approval_grants WHERE turn_mid = ?", (turn_mid,)))
 
+    # approval requests (out-of-scope writes) -----------------------------
+
+    _REQUEST_COLS = "session_key, digest, tool, targets, message, armed, created_at"
+
+    def put_request(
+        self, session_key: str, digest: str, tool: str, targets: list[str], message: str
+    ) -> None:
+        """Store the approval request for ``(session_key, digest)``, replacing (and so
+        disarming) any earlier one; prunes requests older than ``REQUEST_TTL_S``."""
+
+        def go() -> None:
+            now = time.time()
+            self.conn.execute(
+                "DELETE FROM approval_requests WHERE created_at < ?", (now - REQUEST_TTL_S,))
+            self.conn.execute(
+                "INSERT OR REPLACE INTO approval_requests (session_key, digest, tool, "
+                "targets, message, armed, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                (session_key, digest, tool, json.dumps(list(targets)), message, now))
+
+        self._write(go)
+
+    def request(self, session_key: str, digest: str) -> ApprovalRequest | None:
+        with self._lock:
+            r = self._one(
+                f"SELECT {self._REQUEST_COLS} FROM approval_requests "
+                "WHERE session_key = ? AND digest = ?", (session_key, digest))
+        return _request_row(r) if r is not None else None
+
+    def arm_request(self, session_key: str, digest: str) -> ApprovalRequest | None:
+        """Mark the request armed (a human is being asked) and return it, or None."""
+
+        def go() -> ApprovalRequest | None:
+            cur = self.conn.execute(
+                "UPDATE approval_requests SET armed = 1 WHERE session_key = ? AND digest = ?",
+                (session_key, digest))
+            if cur.rowcount == 0:
+                return None
+            r = self._one(
+                f"SELECT {self._REQUEST_COLS} FROM approval_requests "
+                "WHERE session_key = ? AND digest = ?", (session_key, digest))
+            return _request_row(r) if r is not None else None
+
+        return self._write(go)
+
+    def take_armed_request(self, session_key: str, digest: str) -> ApprovalRequest | None:
+        """Consume an armed request: return it and delete it in one operation, or None
+        (no request, or not armed; an unarmed request is left in place)."""
+
+        def go() -> ApprovalRequest | None:
+            r = self._one(
+                f"SELECT {self._REQUEST_COLS} FROM approval_requests "
+                "WHERE session_key = ? AND digest = ? AND armed = 1", (session_key, digest))
+            if r is None:
+                return None
+            self.conn.execute(
+                "DELETE FROM approval_requests WHERE session_key = ? AND digest = ?",
+                (session_key, digest))
+            return _request_row(r)
+
+        return self._write(go)
+
+    def disarm_request(self, session_key: str, digest: str) -> None:
+        self._write(lambda: self.conn.execute(
+            "UPDATE approval_requests SET armed = 0 WHERE session_key = ? AND digest = ?",
+            (session_key, digest)))
+
+    def drop_all_requests(self) -> None:
+        """Delete every approval request (restart sweep, alongside ``drop_all_grants``)."""
+        self._write(lambda: self.conn.execute("DELETE FROM approval_requests"))
+
     # name caches ---------------------------------------------------------
 
     def record_created(self, owner_issue_id: str, issue_id: str) -> None:
@@ -836,4 +939,4 @@ class Store:
             (user_id, email, name, now)))
 
 
-__all__ = ["ControlRow", "SessionRow", "Store", "Ticket", "TurnRow", "UserRow"]
+__all__ = ["ApprovalRequest", "ControlRow", "SessionRow", "Store", "Ticket", "TurnRow", "UserRow"]
