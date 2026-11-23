@@ -35,7 +35,7 @@ Linear: RET-119
 
 ---
 
-### Task 1: `linear_query` (read-only guard + tool)
+### Task 1: `linear_query` (read-only guard + tool) — RET-123
 
 **Files:**
 - Create: `hermes_linear/graphql_guard.py`
@@ -104,7 +104,7 @@ Linear: RET-119
 - [ ] **Step 8: Run** the full suite and `hermes plugins validate .`. Expected: PASS. Update the skill tool-roster test only if it asserts an exact tool set; the skill text itself changes in Task 7.
 - [ ] **Step 9: Commit** with `feat: linear_query read-only GraphQL tool (<T1 ID>)`.
 
-### Task 2: `out_of_scope_writes` setting + approval-request store
+### Task 2: `out_of_scope_writes` setting + approval-request store — RET-124
 
 **Files:**
 - Modify: `hermes_linear/settings.py`, `hermes_linear/store.py`, `hermes_linear/adapter.py:287` (restart sweep)
@@ -136,7 +136,7 @@ Linear: RET-119
 - [ ] **Step 4: Run** the full suite. Expected: PASS.
 - [ ] **Step 5: Commit** with `feat: out_of_scope_writes setting and approval-request store (<T2 ID>)`.
 
-### Task 3: Tool-approval helpers (digest, message, command keys)
+### Task 3: Tool-approval helpers (digest, message, command keys) — RET-125
 
 **Files:**
 - Create: `hermes_linear/tool_approval.py`
@@ -169,7 +169,7 @@ Linear: RET-119
 - [ ] **Step 4: Run** them. Expected: PASS.
 - [ ] **Step 5: Commit** with `feat: tool-approval digest and message helpers (<T3 ID>)`.
 
-### Task 4: Gated write handlers
+### Task 4: Gated write handlers — RET-126
 
 **Files:**
 - Modify: `hermes_linear/agent_tools.py` (`ToolContext`, `_writable`, `_tool`, `_create`, `_update`, `_comment`, schema descriptions of the three gated tools)
@@ -213,7 +213,7 @@ Linear: RET-119
 - [ ] **Step 4: Run** the full suite. Expected: PASS. Old out-of-scope tests are updated as listed under Files.
 - [ ] **Step 5: Commit** with `feat: gated out-of-scope writes record an approval request (<T4 ID>)`.
 
-### Task 5: Hooks: approve directive, disarm, result rewrite
+### Task 5: Hooks: approve directive, disarm, result rewrite — RET-127
 
 **Files:**
 - Modify: `hermes_linear/hooks.py`
@@ -243,7 +243,7 @@ Linear: RET-119
 - [ ] **Step 4: Run** the full suite. Expected: PASS.
 - [ ] **Step 5: Commit** with `feat: pre_tool_call approves recorded out-of-scope writes (<T5 ID>)`.
 
-### Task 6: Outbound and answers for tool approvals
+### Task 6: Outbound and answers for tool approvals — RET-128
 
 **Files:**
 - Modify: `hermes_linear/outbound.py` (`approval_prompt`, `_use_grant`), `hermes_linear/sessions_open.py` (`answer_pending` head text)
@@ -273,7 +273,7 @@ Linear: RET-119
 - [ ] **Step 4: Run** the full suite. Expected: PASS.
 - [ ] **Step 5: Commit** with `feat: tool approvals render once/deny with digest-bound grants (<T6 ID>)`.
 
-### Task 7: End-to-end through Hermes + skill and docs
+### Task 7: End-to-end through Hermes + skill and docs — RET-129
 
 **Files:**
 - Test: `tests/test_tool_approval_e2e.py`
