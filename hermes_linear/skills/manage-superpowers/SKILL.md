@@ -30,11 +30,12 @@ tool. Below, `linear_x(...)` is shorthand — always call via `tool_call`. The e
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
 - `linear_task_state` (`id`, `state` = `in_progress | in_review | done | blocked |
   unblocked`, `summary?`, `question?`).
-- `linear_query` (`query`, `variables?`): read-only GraphQL, no mutations; over 50,000 chars refused.
+- `linear_query` (`query`, `variables?`): read-only GraphQL; a result over 50,000 chars is refused.
 
-They act as the Linear app, write only to the session ticket, its descendants and
-tickets they created from it (in any turn), never raise, and fail as `{"ok": false, "error": …}`.
-Every tool is safe to re-run.
+They act as the Linear app, never raise, fail as `{"ok": false, "error": …}` and are safe to
+re-run. Writes to the session ticket, its descendants and tickets made from it (any turn) just
+run. An out-of-scope `linear_comment`, `linear_issue_update` or `linear_issue_create` returns
+`APPROVAL_REQUIRED`: call it again with identical arguments to ask a human in Linear.
 
 ## Questions and approvals
 
@@ -49,6 +50,8 @@ Every tool is safe to re-run.
 - `Command not run: approval is pending in Linear…`: end the turn. On a later
   ``Answer to approval for `<cmd>`: approved (<choice>)`` re-run exactly `<cmd>` byte for
   byte in that same turn (its pre-approval ends with it, no second prompt); on `: denied` don't run it.
+- A timed-out approval (`BLOCKED: …`) of an out-of-scope write stays pending in Linear: end the turn.
+  On ``Answer to approval for `<tool>` call <digest>: approved`` re-run the identical call in that turn.
 - Answers count only when given in the ticket thread. An answer from Slack, the CLI or
   any other channel does not approve or unblock anything; ask again in the ticket.
 
@@ -77,9 +80,7 @@ Every tool is safe to re-run.
    ```
 
    It holds only what the documents do not record; it never changes as work goes on.
-
-Later sessions on a repo that has the file skip setup but still make the sub-project
-branch and worktree.
+   Later sessions on a repo with the file skip setup but still make the sub-project branch and worktree.
 
 ## Per-stage differences
 
@@ -126,13 +127,12 @@ reply (PR link and a short summary).
 
 ## Large projects
 
-When brainstorming decomposes the work into sub-projects, the current ticket becomes
-the umbrella: it holds the decomposition and build order. Create one top-level ticket
-per sub-project with `linear_issue_create` (no `parent`; same project; link the
-umbrella in its description). Each sub-project runs its own cycle in its own session.
-The tools cannot set a delegate: when a sub-project's turn comes, ask the user in the
-umbrella ticket to delegate its ticket to the app (never via other Linear tools or MCP
-servers; they act as the user).
+When brainstorming decomposes the work into sub-projects, the current ticket becomes the
+umbrella: it holds the decomposition and build order. Create one top-level ticket per
+sub-project with `linear_issue_create` (no `parent`; same project; link the umbrella in its
+description). Each sub-project runs its own cycle in its own session. The tools cannot set a
+delegate: when a sub-project's turn comes, ask the user in the umbrella ticket to delegate its
+ticket to the app (never via other Linear tools or MCP servers; they act as the user).
 
 ## Rules
 

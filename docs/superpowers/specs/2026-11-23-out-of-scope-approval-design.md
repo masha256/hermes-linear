@@ -43,7 +43,7 @@ Coverage (proposed with Q3, accepted):
 ## 1. Configuration
 
 `out_of_scope_writes: approve | deny | allow` in the plugin config
-(`plugins.entries.linear.config` / `ctx.get_config`), read into `Settings`:
+(`plugins.entries.linear.settings` / `ctx.get_config`), read into `Settings`:
 
 | Value | Out-of-scope target in a Linear session |
 |-------|-----------------------------------------|
@@ -126,9 +126,10 @@ The gated tools are `linear_comment`, `linear_issue_update` and `linear_issue_cr
    digest, so a later call that skips hooks can't use an approval that was denied or
    blocked. The request itself stays, so the deferred re-run (§2.4) still finds it.
 
-In-scope calls are one handler pass with no store traffic, exactly as today. An
-out-of-scope write costs one extra tool call (the identical re-call) and one extra round
-of reads.
+In-scope calls are one handler pass, as today, plus one store operation: the
+`take_armed_request` lookup that every gated call makes before its pass (Ruling R7). It
+finds nothing and writes nothing. An out-of-scope write costs one extra tool call (the
+identical re-call) and one extra round of reads.
 
 ### 2.2 Digest, message and rule key
 
@@ -262,9 +263,10 @@ the code only. `linear_query` maps errors itself and adds `message`:
   - list `linear_query`;
   - say that out-of-scope writes from comment, update and create ask for approval;
   - explain that `APPROVAL_REQUIRED` means call again with identical arguments (that asks the
-    human), that `APPROVAL_PENDING` means end the turn, and that on
-    ``Answer to approval for `<tool>` call <digest>: approved`` the agent re-runs the
-    same call with identical arguments in that turn.
+    human); that an approval which times out (Hermes's `BLOCKED: …` result, §2.5; there is
+    no `APPROVAL_PENDING` after Ruling R9) stays pending in Linear, so the agent ends the
+    turn; and that on ``Answer to approval for `<tool>` call <digest>: approved`` the agent
+    re-runs the same call with identical arguments in that turn.
 - The neo `linear-agent-sessions` skill is updated after deploy and restart, never before.
 - README:
   - the behaviour table and the configuration reference (`out_of_scope_writes`);
@@ -325,21 +327,55 @@ Live (project "hermes linear test project", after `deploy-live` and a gateway re
 
 ## 6. Verify during implementation
 
-- The pending row lookup matches a tool approval by the digest in the row's stored
-  `question` (the prompt text), not by `command`: confirm that `prompt.text` carries the
-  description and therefore the `digest:` line. If it does not, store the digest on the
-  row from `prompt.description`.
-- Whether Hermes's generic tool deadline (`timeouts.tools.concurrent_batch`) covers the
-  pre-hook approval wait; if it can cut it, document the interaction.
-- The args the hook sees equal the args the handler receives (no `modify` hook in
-  between), and the Tool Search bridge unwraps `tool_call` before hooks run, so the
-  hook sees the real tool name. If the bridge can leave it wrapped, unwrap as
-  `hooks._silent` does.
-- `post_tool_call` fires for a call blocked by the approval gate (needed for disarm).
-- `execute_code`'s tool RPC runs `pre_tool_call` (if not, a sandboxed call simply gets
-  `APPROVAL_REQUIRED` every time: safe, but document it).
-- Hermes's `ExecApprovalPrompt.choices` for a plugin rule. Narrowing keeps only
-  offered choices, so a Deny-only card stays Deny-only.
+Answered from Hermes at `caafe5389a` (`~/.hermes/hermes-agent`), Task 7 (RET-129).
+
+- **Digest on the pending row.** Hermes may cut `prompt.text` (`_ea_fit`,
+  `gateway/platforms/base.py:2693`), so the row does not rely on it: `approval_prompt`
+  reads the digest from `prompt.description` and stores the digest-bound key
+  `command#digest` as the row's `command` (`hermes_linear/outbound.py:578-581`, §2.4).
+- **Generic tool deadline.** `timeouts.tools.concurrent_batch` does not cut the
+  approval wait. The gateway wait runs inside `human_wait_window`
+  (`tools/approval_gateway_wait.py:88`), and both executors add that time back to their
+  deadline (`agent/tool_executor.py:475-547`, `_ConcurrentToolAuthorizationGate.excluded_seconds`;
+  used at `:891` for the sequential poll and `:1464`/`:1474` for the batch). Only
+  `approvals.timeout` ends the wait.
+- **Hook args vs handler args.** No `modify` hook runs in between: Hermes merges
+  `modify` directives and returns them as `modified_args` (`hermes_cli/plugins.py:1153-1167`),
+  and this plugin never returns one (the e2e test asserts `modified_args is None`). The
+  agent loop passes the hook's `ref.args` to the handler (`agent/tool_executor.py:708-709`
+  and `:754`). One difference remains: `handle_function_call` runs `coerce_tool_args` on
+  the args *after* the agent loop's hook (`model_tools.py:923`; the loop calls it with
+  `skip_pre_tool_call_hook=True`, `agent/tool_executor.py:1738-1748`). For the gated tools
+  coercion only changes an array field (`labels`, `add_labels`, `remove_labels`) sent as a
+  string. Then the hook's digest and the handler's differ, the re-call finds no request,
+  and the handler answers `APPROVAL_REQUIRED` again: fail-closed, no write, no prompt. On
+  the `model_tools` path (`execute_code`, bridges) coercion runs before the hook
+  (`model_tools.py:923` then `:984`), so the digests agree.
+- **Tool Search bridge.** The agent loop unwraps `tool_call` before any hook runs
+  (`agent/tool_executor.py:387-432`, `_unwrap_tool_search_call`), and `handle_function_call`
+  re-dispatches the underlying call with its own hooks (`model_tools.py:945-970`). The
+  wrapper is kept only for an unresolvable call, a connector batch, or an out-of-scope or
+  invalid underlying call (blocked before the handler). `hooks._bridged_call` still unwraps
+  a single-call wrapper.
+- **`post_tool_call` on a gate block.** It fires: `_blocked_tool_result` emits it with
+  `status="blocked"` (`agent/tool_executor.py:655`), as does `handle_function_call`
+  (`model_tools.py:987`). `transform_tool_result` does not run for a blocked call
+  (`agent/tool_executor.py:1845`, `if not managed.blocked`), hence Ruling R9. Disarm stays in
+  `post_tool_call` only.
+- **`execute_code`.** Its RPC dispatch calls `handle_function_call` without
+  `skip_pre_tool_call_hook` (`tools/code_execution_rpc.py:28-35`), so `pre_tool_call` runs
+  (`model_tools.py:984`, `_pre_dispatch_guards`). The RPC thread inherits the turn's
+  approval context (`tools/code_execution_tool.py:628-629`, `propagate_context_to_thread`),
+  so a sandboxed re-call asks the human like a direct one.
+- **Choices of a plugin rule.** `request_tool_approval` is never one-shot for a plugin
+  rule, so the prompt offers once / session / always / deny (`allow_permanent` and
+  `allow_session` true, `tools/approval.py:1101`). `approval_prompt` narrows that to
+  once / deny and keeps a Deny-only card Deny-only (`hermes_linear/outbound.py:576-582`).
+- **End to end.** `tests/test_tool_approval_e2e.py` drives Hermes's real
+  `_dispatch_pre_tool_call_hooks` → `request_tool_approval` → gateway wait with the
+  plugin's hooks, handler, `approval_prompt` and answer path: approve writes, deny does
+  not, a timeout leaves the row pending and the later answer's identical re-run resolves
+  through the grant with no new select; yolo writes without a prompt.
 
 ## 7. Out of scope
 

@@ -17,6 +17,7 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 ## Contents
 
 - [How it behaves](#how-it-behaves)
+- [Agent tools](#agent-tools)
 - [Requirements](#requirements)
 - [Install](#install)
 - [Create the Linear OAuth app](#create-the-linear-oauth-app)
@@ -44,9 +45,26 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 | @mention the agent on a ticket that is *not* delegated | A one-off session for that thread only. |
 | Press **Stop** | The running turn is interrupted; the agent reports what it finished and what it didn't. |
 | Answer an approval / question pick-list | The agent continues. Free text never counts as approval of a risky action. |
+| The agent wants to write to a ticket outside its own (not the session ticket, its sub-tickets or tickets it created from it) | It asks first: an **Approve once / Deny** pick-list in the thread names the tool, the target ticket and the arguments. *Approve once* runs exactly that call; any other call asks again. Unanswered within Hermes's `approvals.timeout`, the question stays pending: answer it later and the agent re-runs the call without a second prompt. Set with `out_of_scope_writes`. |
 | Remove the delegation | Any running turn stops. The session's memory is kept; re-delegating resumes it — unless the ticket is Done or Canceled, which starts a fresh session. |
 
 Everything the agent does appears in Linear's agent session panel: every tool call as an *action* with its result preview, commentary as *thoughts*, the final answer as a comment in the thread. Two prompts arriving at once (e.g. from two threads) are queued, never interleaved.
+
+## Agent tools
+
+The plugin gives the agent these tools. They act as the Linear app (every write is attributed to it), never raise, and answer `{"ok": false, "error": "<CODE>"}` on failure.
+
+| Tool | What it does |
+|---|---|
+| `linear_issue_get` | Read any issue: state, labels, project and its links, parent, children. |
+| `linear_issue_create` | Create an issue in the session ticket's team and project, optionally under a `parent`. |
+| `linear_issue_update` | Change title, description, state, labels or parent. |
+| `linear_comment` | Comment on an issue, or edit the app's own marked comment. |
+| `linear_sync_spec`, `linear_sync_plan` | Render a committed spec / plan into the ticket description, the plan comment and task sub-tickets. |
+| `linear_task_state` | Move a task sub-ticket along (`in_progress`, `in_review`, `done`, `blocked`, `unblocked`). |
+| `linear_query` | Run a read-only GraphQL query as the app (mutations and subscriptions are refused; a result over 50,000 characters is refused with `RESPONSE_TOO_LARGE`). Works in any session. |
+
+**Write scope.** In a Linear session, writes go without asking to the session ticket, its descendants, and tickets the app created from it. A `linear_comment`, `linear_issue_update` or `linear_issue_create` aimed elsewhere first answers `APPROVAL_REQUIRED`; the agent's identical re-call asks a human in the thread (see [How it behaves](#how-it-behaves) and `out_of_scope_writes`). `linear_sync_spec`, `linear_sync_plan` and `linear_task_state` refuse any other ticket (`OUT_OF_SCOPE`). Outside a Linear session (e.g. Slack) the write tools refuse (`NOT_LINEAR_SESSION`): an approval given anywhere but the ticket thread never authorizes a Linear write.
 
 ## Requirements
 
@@ -304,6 +322,7 @@ Use `hermes -p <profile> linear …` for other profiles.
 - Every webhook is HMAC-verified, rejected if older than 60 s, and de-duplicated.
 - Secrets are stored only in the profile's `.env`; tokens are held in memory.
 - Ticket text is untrusted input. Keep the allowlist tight and keep Hermes approvals on for risky tools; consider a narrower toolset for the Linear platform (`hermes tools … --platform linear`).
+- An out-of-scope write (`out_of_scope_writes: approve`) goes to a human through Hermes's own approval gate; one approval covers one call with identical arguments. Hermes's bypasses apply to it as to every approval: `/yolo` (or `--yolo`) and `approvals.mode: off` approve it without asking. Where Hermes has no human to ask, its gate blocks the write (cron follows `approvals.cron_mode`). `out_of_scope_writes: allow` skips the question entirely; use it only in trusted single-user setups.
 
 ## Limitations
 
