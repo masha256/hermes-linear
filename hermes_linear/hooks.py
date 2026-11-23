@@ -29,9 +29,9 @@ on the calling thread. ``Store`` is thread-safe; there is still no network I/O o
 
 Out-of-scope write approval (RET-119 spec §2.1 steps 3-6, §2.5) reads and writes the store
 the same way: for a gated write with a stored approval request, ``pre_tool_call`` arms it and
-returns Hermes's ``approve`` directive, ``post_tool_call`` disarms it, and
-``transform_tool_result`` turns Hermes's block / timeout text into ``APPROVAL_PENDING`` /
-``APPROVAL_DENIED``. Every failure gives None: without a directive the handler just refuses
+returns Hermes's ``approve`` directive, and ``post_tool_call`` disarms it. A denial or timeout
+leaves Hermes's own block result: Hermes does not run ``transform_tool_result`` for pre-hook
+blocks (Ruling R9). Every failure gives None: without a directive the handler just refuses
 again with ``APPROVAL_REQUIRED``.
 """
 
@@ -329,39 +329,10 @@ def _approval_result(session_key: str, args: Any, result: Any) -> str | None:
     return None
 
 
-def _is_tool_json(result: str) -> bool:
-    try:
-        data = json.loads(result)
-    except ValueError:
-        return False
-    return isinstance(data, dict) and "ok" in data
-
-
-def _gated_result(tool_name: Any, args: Any, result: Any) -> str | None:
-    """Spec §2.5: Hermes's block / timeout text for a gated call with a stored request
-    becomes ``APPROVAL_PENDING`` (timeout and this turn's pending row for the digest) or
-    ``APPROVAL_DENIED`` (carrying Hermes's text). The tool's own JSON is never rewritten."""
-    if not isinstance(result, str) or _is_tool_json(result):
-        return None
-    found = _gated_request(tool_name, args)
-    if found is None:
-        return None
-    _store, session_key, tool, d, _req = found
-    if _APPROVAL_TIMEOUT_MARK in result:
-        for _s, row in _turn_controls(session_key, "approval"):
-            if row.state == "pending" and \
-                    tool_approval.split_grant_command(row.command) == (tool, d):
-                return json.dumps({"ok": False, "error": "APPROVAL_PENDING",
-                                   "message": tool_approval.PENDING_TEXT}, ensure_ascii=False)
-    return json.dumps({"ok": False, "error": "APPROVAL_DENIED", "message": result},
-                      ensure_ascii=False)
-
-
 def on_transform_tool_result(tool_name: str, args: Any = None, result: Any = None,
                              **kw: Any) -> str | None:
     """In a Linear session, a timed-out clarify / approval whose question is still stored reads
-    as pending, not as a timeout; a clarify answered elsewhere drops its stale row; a gated
-    write's blocked result reads as ``APPROVAL_PENDING`` / ``APPROVAL_DENIED``. Only
+    as pending, not as a timeout; a clarify answered elsewhere drops its stale row. Only
     rows asked during this turn (``turn_mid``) are considered. Runs on
     the agent thread: store access only, no network I/O or loop hop; any failure leaves the
     result untouched (None)."""
@@ -373,9 +344,6 @@ def on_transform_tool_result(tool_name: str, args: Any = None, result: Any = Non
             return None
         if _silent(tool_name, args):
             return _clarify_result(session_key, result)
-        gated = _gated_result(tool_name, args, result)
-        if gated is not None:
-            return gated
         return _approval_result(session_key, args, result)
     except Exception as exc:  # noqa: BLE001 - fail open: never alter a result on error
         log.debug("linear: transform_tool_result hook failed: %s", type(exc).__name__)

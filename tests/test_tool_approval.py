@@ -10,7 +10,6 @@ import pytest
 
 from hermes_linear.tool_approval import (
     GATED_TOOLS,
-    PENDING_TEXT,
     REQUIRED_TEXT,
     approval_message,
     digest,
@@ -29,17 +28,17 @@ def test_constants_verbatim():
     )
     assert REQUIRED_TEXT == (
         "Not run: {targets} is outside this session's write scope. Call {tool} "
-        "again with identical arguments to ask a human for approval in Linear."
-    )
-    assert PENDING_TEXT == (
-        "Not run: approval is pending in Linear. End this turn. If it is approved, "
-        "the next message says so and re-running this same call with identical "
-        "arguments is pre-approved once."
+        "again with identical arguments to ask a human for approval in Linear. "
+        "If that approval times out, the question stays pending in Linear: end this "
+        "turn; an approval arrives as the next message, and re-running the identical "
+        "call is then pre-approved once."
     )
     assert REQUIRED_TEXT.format(targets="OTH-9, OTH-10", tool="linear_comment") == (
         "Not run: OTH-9, OTH-10 is outside this session's write scope. Call "
         "linear_comment again with identical arguments to ask a human for "
-        "approval in Linear."
+        "approval in Linear. If that approval times out, the question stays pending "
+        "in Linear: end this turn; an approval arrives as the next message, and "
+        "re-running the identical call is then pre-approved once."
     )
 
 

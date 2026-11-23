@@ -1,8 +1,8 @@
 """Out-of-scope write approval in the tool hooks (RET-119 spec §2.1 steps 3-6, §2.5).
 
 ``pre_tool_call`` arms a stored approval request and returns Hermes's ``approve``
-directive; ``post_tool_call`` disarms it; ``transform_tool_result`` rewrites Hermes's
-block / timeout text for a gated tool into ``APPROVAL_PENDING`` / ``APPROVAL_DENIED``.
+directive; ``post_tool_call`` disarms it. ``transform_tool_result`` leaves a gated tool's
+result alone: Hermes never runs it for pre-hook blocks (Ruling R9).
 """
 
 from __future__ import annotations
@@ -22,8 +22,10 @@ TOOL = "linear_comment"
 ARGS = {"issue": "RET-50", "body": "hello"}
 D = tool_approval.digest(TOOL, ARGS)
 MESSAGE = f"Approve `{TOOL}` outside this session's tickets?\ndigest: {D}"
-TIMEOUT = "BLOCKED: Command timed out without user response. Silence is not consent."
-BLOCKED = "BLOCKED: approval is required but no human is present."
+# Hermes's real pre-hook block results: json.dumps({"error": "BLOCKED: ..."}).
+TIMEOUT = json.dumps({"error": "BLOCKED: Command timed out without user response. "
+                               "Silence is not consent."})
+BLOCKED = json.dumps({"error": "BLOCKED: approval is required but no human is present."})
 
 
 class FakeLoop:
@@ -127,6 +129,18 @@ def test_pre_tool_call_none_on_store_error(store, session, monkeypatch):
     assert hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1") is None
 
 
+def test_pre_tool_call_none_on_request_read_error(store, session, monkeypatch):
+    _request(store)
+
+    def boom(*a, **k):
+        raise RuntimeError("store closed")
+
+    monkeypatch.setattr(store, "request", boom)
+    assert hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1", tool_call_id="c1") is None
+    calls = adapter_mod.ADAPTERS["neo"].event_loop.calls
+    assert len(calls) == 1 and calls[0][1][1] == "start"  # action event still scheduled
+
+
 def test_pre_tool_call_still_schedules_action_event(store, session):
     _request(store)
     assert hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1", tool_call_id="c1") is not None
@@ -151,62 +165,26 @@ def test_post_tool_call_disarms(store, session):
     assert adapter_mod.ADAPTERS["neo"].event_loop.calls[-1][1][1] == "finish"
 
 
+def test_post_tool_call_disarm_error_is_swallowed(store, session, monkeypatch):
+    _request(store)
+
+    def boom(*a, **k):
+        raise RuntimeError("store closed")
+
+    monkeypatch.setattr(store, "disarm_request", boom)
+    assert hooks.on_post_tool_call(TOOL, dict(ARGS), BLOCKED, "task-1") is None
+    assert adapter_mod.ADAPTERS["neo"].event_loop.calls[-1][1][1] == "finish"
+
+
 # ----------------------------------------------------------- transform_tool_result
 
 
-def test_transform_pending(store, session):
+def test_transform_never_rewrites_gated_result(store, session):
+    """Even with a stored request and this turn's pending row for the digest, the
+    transform leaves a gated tool's result alone (no APPROVAL_PENDING / _DENIED)."""
     _request(store)
     _pending_row(store)
-    out = json.loads(hooks.on_transform_tool_result(TOOL, dict(ARGS), TIMEOUT))
-    assert out == {"ok": False, "error": "APPROVAL_PENDING",
-                   "message": tool_approval.PENDING_TEXT}
-
-
-def test_transform_timeout_without_pending_row_is_denied(store, session):
-    _request(store)
-    _pending_row(store, turn_mid="other-turn")
-    out = json.loads(hooks.on_transform_tool_result(TOOL, dict(ARGS), TIMEOUT))
-    assert out["error"] == "APPROVAL_DENIED" and out["message"] == TIMEOUT
-
-
-def test_transform_timeout_live_or_other_digest_row_is_denied(store, session):
-    _request(store)
-    _pending_row(store, state="live")
-    assert json.loads(hooks.on_transform_tool_result(TOOL, dict(ARGS), TIMEOUT))[
-        "error"] == "APPROVAL_DENIED"
-    _pending_row(store, d="0" * 16)
-    assert json.loads(hooks.on_transform_tool_result(TOOL, dict(ARGS), TIMEOUT))[
-        "error"] == "APPROVAL_DENIED"
-
-
-def test_transform_denied(store, session):
-    _request(store)
-    out = json.loads(hooks.on_transform_tool_result(TOOL, dict(ARGS), BLOCKED))
-    assert out == {"ok": False, "error": "APPROVAL_DENIED", "message": BLOCKED}
-
-
-def test_transform_never_rewrites_tool_json(store, session):
-    _request(store)
-    _pending_row(store)
-    required = json.dumps({"ok": False, "error": "APPROVAL_REQUIRED",
-                           "message": "timed out without user response"})
-    assert hooks.on_transform_tool_result(TOOL, dict(ARGS), required) is None
-    assert hooks.on_transform_tool_result(TOOL, dict(ARGS), json.dumps({"ok": True})) is None
-
-
-def test_transform_no_request_untouched(store, session):
-    _pending_row(store)
-    assert hooks.on_transform_tool_result(TOOL, dict(ARGS), TIMEOUT) is None
-    assert hooks.on_transform_tool_result(TOOL, dict(ARGS), BLOCKED) is None
-    _request(store)
-    assert hooks.on_transform_tool_result(TOOL, {**ARGS, "body": "x"}, BLOCKED) is None
-    session(HERMES_SESSION_PLATFORM="slack", HERMES_SESSION_KEY=SK,
-            HERMES_SESSION_MESSAGE_ID=MID)
-    assert hooks.on_transform_tool_result(TOOL, dict(ARGS), BLOCKED) is None
-
-
-def test_transform_bridged_single_call(store, session):
-    _request(store)
-    wrapped = {"calls": [{"name": TOOL, "arguments": dict(ARGS)}]}
-    out = json.loads(hooks.on_transform_tool_result("tool_call", wrapped, BLOCKED))
-    assert out["error"] == "APPROVAL_DENIED"
+    for result in (TIMEOUT, BLOCKED, json.dumps({"ok": True})):
+        assert hooks.on_transform_tool_result(TOOL, dict(ARGS), result) is None
+        wrapped = {"calls": [{"name": TOOL, "arguments": dict(ARGS)}]}
+        assert hooks.on_transform_tool_result("tool_call", wrapped, result) is None

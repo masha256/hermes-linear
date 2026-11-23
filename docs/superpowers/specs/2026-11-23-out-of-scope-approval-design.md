@@ -89,7 +89,7 @@ The gated tools are `linear_comment`, `linear_issue_update` and `linear_issue_cr
 
      ```json
      {"ok": false, "error": "APPROVAL_REQUIRED",
-      "message": "Not run: <RET-50> is outside this session's write scope. Call <tool> again with identical arguments to ask a human for approval in Linear."}
+      "message": "Not run: <RET-50> is outside this session's write scope. Call <tool> again with identical arguments to ask a human for approval in Linear. If that approval times out, the question stays pending in Linear: end this turn; an approval arrives as the next message, and re-running the identical call is then pre-approved once."}
      ```
 
      Nothing has been written.
@@ -109,8 +109,8 @@ The gated tools are `linear_comment`, `linear_issue_update` and `linear_issue_cr
      `approvals.timeout`.
    - `yolo` and `approvals.mode: off` approve at once. Smart approval is not used for
      plugin rules. A context with no human (subagent, cron) is blocked.
-   - Denial or timeout: the handler never runs. `transform_tool_result` rewrites the
-     result (§2.5).
+   - Denial or timeout: the handler never runs; the agent sees Hermes's own BLOCKED text
+     (§2.5).
 5. **Approved: the handler again.**
    - It takes the request for `(session key, digest)` only if it is **armed**, and
      deletes it in the same store operation.
@@ -204,21 +204,13 @@ the answer, and the re-run asks again. This fails closed.
 |---------|-------------|
 | Out of scope, mode `approve`, first call | `APPROVAL_REQUIRED` (§2.1 step 2) |
 | Approved, or mode `allow` | The tool's normal result |
-| Hermes timed out, and the plugin kept the question pending | `{"ok": false, "error": "APPROVAL_PENDING", "message": "Not run: approval is pending in Linear. End this turn. If it is approved, the next message says so and re-running this same call with identical arguments is pre-approved once."}` |
-| Denied by the human, the question expired, or Hermes blocked it (no human present) | `{"ok": false, "error": "APPROVAL_DENIED", "message": <Hermes's text>}` |
+| Denied by the human, timed out, or Hermes blocked it (no human present) | Hermes's own block result, `{"error": "BLOCKED: …"}` |
 
-"Pending" means an `approval` control row in state `pending` for this turn's mid whose
-`question` carries the `digest:` line.
-
-`transform_tool_result` produces both of the last two rows:
-
-- The rewrite applies only to a gated tool in a Linear session that has an approval
-  request for the call's digest, and only when the result is not the tool's own JSON
-  (`{"ok": …}`).
-- With Hermes's timeout mark and a pending row, the result becomes `APPROVAL_PENDING`.
-- Any other blocked result becomes `APPROVAL_DENIED`, carrying Hermes's text.
-- The hook reads the store only. On any error it leaves the result as it is.
-- The shell-approval rewrite already in `_approval_result` is unchanged.
+Hermes does not run `transform_tool_result` for pre-hook blocks (`agent/tool_executor.py`,
+`if not managed.blocked`), so the plugin cannot rewrite that result. The pending guidance
+(end the turn; an approval arrives as the next message) is carried by the `APPROVAL_REQUIRED`
+message instead (Ruling R9). The shell-approval rewrite already in `_approval_result` is
+unchanged.
 
 ## 3. `linear_query`
 
@@ -304,8 +296,7 @@ TDD, through the real tool registry (`plugin.tool_handler`) where a handler is i
   - a request returns the `approve` directive with the stored message and `<tool>:<digest>`, and arms it;
   - no request, or a non-gated tool, or a non-Linear session returns None;
   - `post_tool_call` disarms;
-  - end to end through Hermes's real `_dispatch_pre_tool_call_hooks` / `request_tool_approval` on a worker thread: approve writes, deny does not, timeout→`APPROVAL_PENDING`.
-- **transform:** pending vs denied rewrites; the tool's own JSON is never rewritten; shell approvals are unchanged.
+  - end to end through Hermes's real `_dispatch_pre_tool_call_hooks` / `request_tool_approval` on a worker thread: approve writes, deny does not, timeout→Hermes's BLOCKED result.
 - **Store:** request put / arm / take-armed / disarm / 24 h prune / restart sweep.
 - **Digest:** stable for identical args (key order irrelevant); it changes with the body, the title or the target.
 - **Outbound:**
