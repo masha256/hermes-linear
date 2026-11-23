@@ -183,8 +183,8 @@ description ends in a `digest: <hex>` line. For a tool approval:
 - The choices are narrowed to `once` and `deny`. There is no `session` choice.
 - The grant key is `f"{command}#{digest}"`. It is used when the answer stores the grant
   (`put_grant`) and when the re-run's prompt looks it up (`_use_grant`). The control row
-  keeps the plain command; the key is derived from the command plus the description, so
-  no grants migration is needed.
+  stores this digest-bound key `command#digest`, taken from `prompt.description` when the
+  prompt is posted (Hermes may cut `prompt.text`), so no migration is needed.
 - The answer turn reads
   ``Answer to approval for `<tool>` call <digest>: approved (once). Re-run the same call with identical arguments.``
   (or `: denied`). Shell approvals keep ``Answer to approval for `<cmd>`: …``.

@@ -1010,6 +1010,143 @@ async def test_grant_kept_on_deny_only_card(env, session_env, monkeypatch):
     assert _grants(store) == [("K", RM, "once", "u1", "answer-mid")]
 
 
+# --- RET-128: plugin tool approvals (spec §2.4) -------------------------------------------
+
+TOOL_RULE = "<linear_comment> (plugin approval rule)"
+D1, D2 = "0123456789abcdef", "fedcba9876543210"
+
+
+def _tool_prompt(rid="req-1", digest=D1, key="agent:main:linear:dm:x", text=None,
+                 description=None):
+    desc = description if description is not None else (
+        f"Approve `linear_comment` outside this session's tickets?\n- ENG-9 \"Other\"\n"
+        f"Arguments:\n{{\"body\": \"hi\"}}\ndigest: {digest}")
+    # Hermes may cut ``text`` (``_ea_fit``): the digest must come from ``description``.
+    return dataclasses.replace(_approval(rid), session_key=key, command=TOOL_RULE,
+                               description=desc, text=text or "Approve `linear_comment`…")
+
+
+async def _pending_tool_approval(a, gw, session_env, **kw):
+    await _delegated(a, gw, session_env)
+    assert (await a._send_exec_approval_prompt(_tool_prompt(**kw))).success
+    await a.edit_message(D_CHAT, "approval:req-1", "timed out")
+    await settle(a)
+    assert a._store.control("req-1").state == "pending"
+    await complete(a, gw.events[0])
+    await settle(a)
+    return len(gw.events)
+
+
+async def test_tool_approval_offers_once_and_deny(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    assert (await a._send_exec_approval_prompt(_tool_prompt())).success
+    assert [o["value"] for o in client.activities[-1][4]["options"]] == ["once", "deny"]
+    assert list(store.control("req-1").choices) == ["once", "deny"]
+
+
+async def test_tool_approval_deny_only_stays_deny_only(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    prompt = dataclasses.replace(_tool_prompt(), actions=[("Deny", "deny", "danger")])
+    assert (await a._send_exec_approval_prompt(prompt)).success
+    assert [o["value"] for o in client.activities[-1][4]["options"]] == ["deny"]
+
+
+async def test_tool_approval_row_command_has_digest(env, session_env):
+    a, client, gw, store, order = env
+    await _delegated(a, gw, session_env)
+    assert (await a._send_exec_approval_prompt(_tool_prompt(text="cut…"))).success
+    assert store.control("req-1").command == f"{TOOL_RULE}#{D1}"
+
+
+async def test_tool_approval_answer_text_and_grant(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    _authority(monkeypatch)
+    n = await _pending_tool_approval(a, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    ev = gw.events[-1]
+    assert ev.text.endswith(
+        f"Answer to approval for `linear_comment` call {D1}: approved (once). "
+        "Re-run the same call with identical arguments.")
+    assert store.take_grant("agent:main:linear:dm:x", f"{TOOL_RULE}#{D1}") == ("once", HUMAN)
+
+
+async def test_tool_approval_deny_text(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    _authority(monkeypatch)
+    n = await _pending_tool_approval(a, gw, session_env)
+    await deliver(a, prompted(D_SID, D_ISSUE, "deny", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    assert gw.events[-1].text.endswith(
+        f"Answer to approval for `linear_comment` call {D1}: denied")
+    assert _grants(store) == []
+
+
+async def test_tool_grant_matches_only_same_digest(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    calls = _stub_grant_path(monkeypatch)
+    await _delegated(a, gw, session_env)
+    store.put_grant("K", f"{TOOL_RULE}#{D1}", "once", "u1", "answer-mid")
+    n = len(client.activities)
+    assert (await a._send_exec_approval_prompt(_tool_prompt("req-2", D2, key="K"))).success
+    assert calls == []
+    assert len(_elicitations(client, n)) == 1
+    assert _grants(store) == [("K", f"{TOOL_RULE}#{D1}", "once", "u1", "answer-mid")]
+    n = len(client.activities)
+    res = await a._send_exec_approval_prompt(_tool_prompt("req-3", D1, key="K"))
+    assert res.success and res.message_id == "approval:req-3"
+    assert calls == [("refusal", "K", "u1", {"request_id": "req-3"}),
+                     ("resolve", ("K", "once", "req-3"), {"actor_id": "u1"})]
+    assert len(client.activities) == n and store.control("req-3") is None
+    assert _grants(store) == []
+
+
+async def test_tool_approval_live_answer_unchanged(env, session_env, monkeypatch):
+    """Answered inside Hermes's wait: the live path resolves the card; the digest-bound row
+    command plays no part, and no turn or grant follows."""
+    a, client, gw, store, order = env
+    calls = _stub_grant_path(monkeypatch)
+    await _delegated(a, gw, session_env)
+    assert (await a._send_exec_approval_prompt(_tool_prompt())).success
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    await settle(a)
+    assert calls == [("refusal", "agent:main:linear:dm:x", HUMAN, {"request_id": "req-1"}),
+                     ("resolve", ("agent:main:linear:dm:x", "once", "req-1"),
+                      {"actor_id": HUMAN})]
+    assert store.control("req-1") is None and len(gw.events) == 1 and _grants(store) == []
+
+
+async def test_tool_approval_without_digest_is_plain(env, session_env, monkeypatch):
+    a, client, gw, store, order = env
+    _authority(monkeypatch)
+    n = await _pending_tool_approval(a, gw, session_env, description="no digest here")
+    row = store.control("req-1")
+    assert row.command == TOOL_RULE and list(row.choices) == ["once", "session", "deny"]
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    assert gw.events[-1].text.endswith(
+        f"Answer to approval for `{TOOL_RULE}`: approved (once)")
+    assert [g[1] for g in _grants(store)] == [TOOL_RULE]
+
+
+async def test_ungated_grant_command_answers_in_shell_form(env, session_env, monkeypatch):
+    """A ``command#digest`` row for a tool outside GATED_TOOLS keeps the shell form."""
+    a, client, gw, store, order = env
+    _authority(monkeypatch)
+    n = await _pending_approval(a, client, gw, session_env)
+    other = f"<other_tool> (plugin approval rule)#{D1}"
+    store.conn.execute("UPDATE pending_controls SET command = ? WHERE request_id = ?", (other, "req-1"))
+    await deliver(a, prompted(D_SID, D_ISSUE, "deny", "act-ans"))
+    await settle(a)
+    assert len(gw.events) == n + 1
+    assert gw.events[-1].text.endswith(f"Answer to approval for `{other}`: denied")
+
+
 async def test_grant_dropped_at_turn_end(env, session_env):
     a, client, gw, store, order = env
     mid = await _delegated(a, gw, session_env)

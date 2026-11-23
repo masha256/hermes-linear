@@ -18,7 +18,7 @@ import time
 import uuid
 from typing import Any, Awaitable, Callable, Optional
 
-from . import questions, renderer
+from . import questions, renderer, tool_approval
 from .constants import ACK_TIMEOUT_S
 from .models import AwaitDelegation, ResolveControl, StartTurn
 from .router import ACK_TEXT, DEFAULT_AUTHOR, _session_key, message_id, ticket_chat_id, turn_header
@@ -78,6 +78,17 @@ def _requester_of(authority: dict | None) -> str:
 def _refusal_text(requester: str) -> str:
     from gateway.approval_actor import refusal_text
     return refusal_text(requester)
+
+
+def _approval_answer_head(command: str | None) -> tuple[str, str]:
+    """The answer turn's head and the approved-text suffix (spec §2.4): a gated tool's
+    ``command#digest`` row names the tool and call; any other row keeps the shell form."""
+    split = tool_approval.split_grant_command(command)
+    if split is not None and split[0] in tool_approval.GATED_TOOLS:
+        tool, digest = split
+        return (f"Answer to approval for `{tool}` call {digest}:",
+                ". Re-run the same call with identical arguments.")
+    return f"Answer to approval for `{command}`:", ""
 
 
 def _resolve_approval_card(session_key: str, choice: str, request_id: str, *, actor_id: str) -> int:
@@ -263,7 +274,7 @@ class SessionOpener:
             await post(sid, renderer.elicitation(REASK_TEXT), signal="select",
                        signal_metadata={"options": options})
             return
-        head = f"Answer to approval for `{row.command}`:"
+        head, rerun = _approval_answer_head(row.command)
         if choice == "deny":
             self.drop_pending([row])
             await self._start_answer_turn(d, f"{head} denied")
@@ -276,7 +287,7 @@ class SessionOpener:
             log.warning("linear: approval %s has no session key or command; no grant",
                         d.request_id)
         self.drop_pending([row])
-        if await self._start_answer_turn(d, f"{head} approved ({choice})") and grantable:
+        if await self._start_answer_turn(d, f"{head} approved ({choice}){rerun}") and grantable:
             # After the enqueue (no await in between, so the turn has not run yet); the turn
             # engine drops it if this turn is freed before hand-off.
             store.put_grant(row.session_key, row.command, choice, d.actor_id,

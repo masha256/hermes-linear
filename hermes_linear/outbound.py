@@ -60,7 +60,7 @@ from urllib.parse import unquote, urlparse
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import ProcessingOutcome
 
-from . import questions, renderer
+from . import questions, renderer, tool_approval
 from . import sessions_open as sessions_open_mod  # grant path, stubbable in tests
 from .constants import ACK_TIMEOUT_S, FAST_TOOL_SKIP_S, HEARTBEAT_S, TYPING_MIN_INTERVAL_S
 from .router import _session_key as router_session_key  # the chat id a session routes to
@@ -572,14 +572,21 @@ class Outbound:
             log.warning("linear: approval prompt dropped (no linear session or request id)")
             return SendResult(success=False, error=NO_SESSION)
         choices = [c for c in _APPROVAL_CHOICES if c in prompt.choices]  # Q8: keep narrowing
+        command = prompt.command
+        # Spec §2.4: a plugin tool approval offers once/deny only, and its row and grant are
+        # bound to the call's digest. Read it from the description: Hermes may cut the text.
+        rule = tool_approval.parse_rule(prompt.command, prompt.description)
+        if rule is not None:
+            choices = [c for c in ("once", "deny") if c in prompt.choices]
+            command = tool_approval.grant_command(prompt.command, rule[1])
         rid = str(prompt.request_id)
-        if self._use_grant(prompt, rid):
+        if self._use_grant(prompt, rid, command):
             return SendResult(success=True, message_id=f"approval:{rid}")  # no row, no post
         # Who may answer, read now while Hermes still holds the entry (it is queued before
         # notify): a pending answer comes after Hermes timed it out and forgot it.
         authority = sessions_open_mod._approval_authority(str(prompt.session_key), rid)
         self._put_control(rid, "approval", target, choices, prompt.session_key,
-                          question=prompt.text, command=prompt.command, authority=authority)
+                          question=prompt.text, command=command, authority=authority)
         ok = await self._elicit(target.sid, "approval", prompt.text, choices)
         if not ok:
             self._drop_control(rid)
@@ -587,16 +594,17 @@ class Outbound:
         self._replace_pending(target.sid, rid)
         return SendResult(success=True, message_id=f"approval:{rid}")
 
-    def _use_grant(self, prompt: Any, rid: str) -> bool:
+    def _use_grant(self, prompt: Any, rid: str, command: Optional[str]) -> bool:
         """Spec §7: the re-run of a command approved while pending resolves at once with the
-        stored one-use grant. Exact ``(session_key, command)`` match only. A grant whose choice
+        stored one-use grant. Exact ``(session_key, command)`` match only, where ``command``
+        is the grant key (``command#digest`` for a tool approval, spec §2.4). A grant whose choice
         the card does not offer (Deny-only mark kept) stays unused; a refused or failed
         resolve falls back to the normal prompt (the grant is spent)."""
         store = self.a._store
-        if store is None or not prompt.command:
+        if store is None or not command:
             return False
-        key, command = str(prompt.session_key), str(prompt.command)
-        grant = store.take_grant(key, command, offered=list(prompt.choices))
+        key = str(prompt.session_key)
+        grant = store.take_grant(key, str(command), offered=list(prompt.choices))
         if grant is None:
             return False
         choice, actor = grant
