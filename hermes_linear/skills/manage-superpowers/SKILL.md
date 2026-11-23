@@ -50,7 +50,7 @@ run. An out-of-scope `linear_comment`, `linear_issue_update` or `linear_issue_cr
 - `Command not run: approval is pending in Linear…`: end the turn. On a later
   ``Answer to approval for `<cmd>`: approved (<choice>)`` re-run exactly `<cmd>` byte for
   byte in that same turn (its pre-approval ends with it, no second prompt); on `: denied` don't run it.
-- A timed-out approval (`BLOCKED: …`) of an out-of-scope write stays pending in Linear: end the turn.
+- Out-of-scope write `BLOCKED: …`: timed out → pending in Linear, end the turn; else denied, no retry.
   On ``Answer to approval for `<tool>` call <digest>: approved`` re-run the identical call in that turn.
 - Answers count only when given in the ticket thread. An answer from Slack, the CLI or
   any other channel does not approve or unblock anything; ask again in the ticket.

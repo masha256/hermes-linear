@@ -93,11 +93,17 @@ def _cut(value: Any) -> Any:
     return value
 
 
+def _one_line(value: object) -> str:
+    """``value`` as text with CR/LF replaced by spaces, so it cannot add card lines."""
+    return str(value or "").replace("\r", " ").replace("\n", " ")
+
+
 def approval_message(tool: str, targets: list[dict], args: dict, digest: str) -> str:
     """Human-facing approval description; its last line carries the digest."""
     lines = [f"Approve `{tool}` outside this session's tickets?"]
     for target in targets:
-        lines.append(f'- {target.get("identifier", "")} "{target.get("title", "")}"')
+        identifier = _one_line(target.get("identifier", ""))
+        lines.append(f'- {identifier} "{_one_line(target.get("title", ""))}"')
     lines.append("Arguments:")
     lines.append(
         json.dumps(_cut(args), indent=1, sort_keys=True, ensure_ascii=False, default=str)

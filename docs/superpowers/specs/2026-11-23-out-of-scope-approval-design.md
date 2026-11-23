@@ -99,7 +99,8 @@ The gated tools are `linear_comment`, `linear_issue_update` and `linear_issue_cr
    - It looks up an approval request for `(session key, digest)` in the owning adapter's
      store. That is a store read only, as `transform_tool_result` does today; there is no
      network call and no hop onto the loop.
-   - If it finds one, it **arms** the request (stores `armed = 1`) and returns
+   - If it finds one, it **arms** the request (stores `armed = 1` and `armed_at` = now)
+     and returns
      `{"action": "approve", "message": <stored message>, "rule_key": "<tool>:<digest>"}`.
    - Anything else returns `None`, as today. That covers no request, a non-gated tool, a
      non-Linear session, and any error.
@@ -114,8 +115,11 @@ The gated tools are `linear_comment`, `linear_issue_update` and `linear_issue_cr
    - Denial or timeout: the handler never runs; the agent sees Hermes's own BLOCKED text
      (§2.5).
 5. **Approved: the handler again.**
-   - It takes the request for `(session key, digest)` only if it is **armed**, and
-     deletes it in the same store operation.
+   - It takes the request for `(session key, digest)` only if it is **armed**, was armed
+     at most `ARMED_WINDOW_S` (3600 s) ago, and is younger than the 24 h TTL; it deletes
+     it in the same store operation. The window bounds an arm left by an abandoned
+     (timed-out) `pre_tool_call` worker; it must exceed Hermes's `approvals.timeout`
+     (default 300 s, `tools/approval_context.py:327`).
    - It runs the body with `approved = {stored target uuids}`. `_writable` accepts an
      out-of-scope issue whose UUID is in `approved`.
    - A target that is out of scope and not approved is refused `OUT_OF_SCOPE`, with no
@@ -123,10 +127,13 @@ The gated tools are `linear_comment`, `linear_issue_update` and `linear_issue_cr
      resolves to another issue.
    - Without an armed request, the handler treats the call as a first call (step 1). This
      covers a hook that did not run, for example `ctx.dispatch_tool`, which skips hooks.
-     Such a call can never write out of scope unapproved.
-6. **Disarm.** `post_tool_call` for a gated tool clears `armed` on the request with that
-   digest, so a later call that skips hooks can't use an approval that was denied or
-   blocked. The request itself stays, so the deferred re-run (§2.4) still finds it.
+     Such a hook-skipping call (only another in-process plugin's `ctx.dispatch_tool` can
+     make one) with byte-identical args could use an approval while it is armed: between
+     the human's answer and the handler run, bounded by `ARMED_WINDOW_S`. In-process
+     plugins are trusted code.
+6. **Disarm.** `post_tool_call` for a gated tool clears `armed` and `armed_at` on the
+   request with that digest, so a later call that skips hooks can't use an approval that
+   was denied or blocked. The request itself stays, so the deferred re-run (§2.4) still finds it.
 
 In-scope calls are one handler pass, as today, plus one store operation: the
 `take_armed_request` lookup that every gated call makes before its pass (Ruling R7). It
@@ -150,7 +157,7 @@ identical re-call) and one extra round of reads.
     target reference) gives a new one.
 - `message` becomes Hermes's `description`, which is shown in the Linear select. It holds:
   - the tool and what it will do, e.g. ``linear_comment on RET-50 "Title"``;
-  - each target, as identifier and title;
+  - each target, as identifier and title (CR/LF replaced by spaces);
   - a preview of the args, with long strings (bodies, descriptions) cut at 1,500 chars
     and marked as cut;
   - a last line `digest: <hex>`.
@@ -170,13 +177,16 @@ The new table is `approval_requests`:
 | `message` | TEXT | |
 | `armed` | INTEGER | 0 or 1. |
 | `created_at` | REAL | |
+| `armed_at` | REAL | When armed; NULL when not. Added by `ALTER TABLE` to older tables. |
 
 Store methods:
 
-- `put_request` replaces any existing row for the key and disarms it.
-- `arm_request` returns the row, or None.
-- `take_armed_request` is an atomic select-and-delete of an armed row.
-- `disarm_request`.
+- `put_request` replaces any existing row for the key and disarms it (clears `armed_at`).
+- `arm_request` sets `armed = 1`, `armed_at` = now; returns the row, or None.
+- `take_armed_request` is an atomic select-and-delete of a row with `armed = 1`,
+  `armed_at >= now - ARMED_WINDOW_S` (`ARMED_WINDOW_S = 3600`, above Hermes's default
+  300 s `approvals.timeout`) and `created_at >= now - REQUEST_TTL_S`.
+- `disarm_request` clears `armed` and `armed_at`.
 - `drop_all_requests` is the restart sweep, alongside `drop_all_grants`.
 
 Rows older than 24 h are pruned on `put_request`. A stale row can only cause a prompt;

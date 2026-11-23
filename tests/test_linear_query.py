@@ -149,6 +149,13 @@ def test_query_too_complex(pin_ctx, stub):
     assert "first:" in out["message"]
 
 
+def test_query_too_complex_without_detail_uses_message(pin_ctx, stub):
+    stub.fail = LinearError("Query too complex: 20000", code="INPUT_ERROR", detail=None)
+    out = linear_query({"query": "{ a }"})
+    assert out == {"ok": False, "error": "QUERY_TOO_COMPLEX",
+                   "message": "Query too complex: 20000 Lower first: or the nesting depth."}
+
+
 def test_graphql_error_has_message(pin_ctx, stub):
     stub.fail = LinearError('Cannot query field "x"', code="GRAPHQL_VALIDATION_FAILED")
     out = linear_query({"query": "{ x }"})
@@ -161,7 +168,8 @@ def test_graphql_error_message_cut_at_1000_chars(pin_ctx, stub):
     assert out["error"] == "GRAPHQL_ERROR" and out["message"] == "y" * 1000
 
 
-@pytest.mark.parametrize("code", ["RATELIMITED", "NOT_FOUND", "UNAUTHENTICATED", "FORBIDDEN"])
+@pytest.mark.parametrize("code", [
+    "RATELIMITED", "NOT_FOUND", "UNAUTHENTICATED", "AUTHENTICATION_ERROR", "FORBIDDEN", "NETWORK"])
 def test_known_codes_keep_code(pin_ctx, stub, code):
     stub.fail = LinearError(f"{code} happened", code=code)
     assert linear_query({"query": "{ a }"}) == {"ok": False, "error": code,

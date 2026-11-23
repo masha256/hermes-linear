@@ -1112,7 +1112,7 @@ QUERY_MAX_RESULT_CHARS = 50_000
 QUERY_ERROR_MESSAGE_CHARS = 1_000
 #: ``LinearError`` codes ``linear_query`` answers as-is (plus ``message``).
 _QUERY_KEPT_CODES = {"RATELIMITED", "NOT_FOUND", "UNAUTHENTICATED", "AUTHENTICATION_ERROR",
-                     "FORBIDDEN"}
+                     "FORBIDDEN", "NETWORK"}
 _TOO_COMPLEX_PREFIX = "Query too complex"  # live probe: INPUT_ERROR with a presentable detail
 
 

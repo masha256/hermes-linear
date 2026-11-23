@@ -467,6 +467,77 @@ def test_request_ttl_prune(store, monkeypatch):
     assert store_mod.REQUEST_TTL_S == 86_400
 
 
+def test_armed_request_expires_after_window(store, monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(store_mod.time, "time", lambda: now)
+    store.put_request("K", "d1", "linear_comment", ["u-1"], "m")
+    store.arm_request("K", "d1")
+    now += 3601
+    assert store.take_armed_request("K", "d1") is None
+    assert store.request("K", "d1") is not None  # a stale arm leaves the row in place
+    assert store_mod.ARMED_WINDOW_S == 3600
+
+
+def test_armed_request_taken_within_window(store, monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(store_mod.time, "time", lambda: now)
+    store.put_request("K", "d1", "linear_comment", ["u-1"], "m")
+    now += 7200  # arming happens later than the put; the window runs from the arm
+    store.arm_request("K", "d1")
+    now += 3599
+    taken = store.take_armed_request("K", "d1")
+    assert taken is not None and taken.digest == "d1"
+
+
+def test_armed_request_past_ttl_not_taken(store, monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(store_mod.time, "time", lambda: now)
+    store.put_request("K", "d1", "linear_comment", ["u-1"], "m")
+    now += store_mod.REQUEST_TTL_S + 1
+    store.arm_request("K", "d1")  # freshly armed, but the request itself expired
+    assert store.take_armed_request("K", "d1") is None
+
+
+def test_disarm_and_put_clear_armed_at(store, monkeypatch):
+    now = 1_000_000.0
+    monkeypatch.setattr(store_mod.time, "time", lambda: now)
+    store.put_request("K", "d1", "linear_comment", ["u-1"], "m")
+    store.arm_request("K", "d1")
+    store.disarm_request("K", "d1")
+    armed_at = store.conn.execute(
+        "SELECT armed_at FROM approval_requests WHERE digest = 'd1'").fetchone()[0]
+    assert armed_at is None
+    store.put_request("K", "d1", "linear_comment", ["u-1"], "m")
+    store.arm_request("K", "d1")
+    store.put_request("K", "d1", "linear_comment", ["u-1"], "m")
+    armed_at = store.conn.execute(
+        "SELECT armed_at FROM approval_requests WHERE digest = 'd1'").fetchone()[0]
+    assert armed_at is None
+
+
+def test_approval_requests_armed_at_migrates_old_db(tmp_path, monkeypatch):
+    import sqlite3
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE approval_requests (session_key TEXT NOT NULL, digest TEXT NOT NULL, "
+        "tool TEXT NOT NULL, targets TEXT NOT NULL, message TEXT NOT NULL, "
+        "armed INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, "
+        "PRIMARY KEY (session_key, digest))")
+    conn.execute(
+        "INSERT INTO approval_requests VALUES ('K', 'old', 'linear_comment', '[]', 'm', 1, ?)",
+        (1_000_000.0,))
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(store_mod.time, "time", lambda: 1_000_000.0)
+    s = Store.open(path)
+    assert s.take_armed_request("K", "old") is None  # armed before migration: no armed_at
+    s.put_request("K", "d1", "linear_comment", ["u-1"], "m")
+    s.arm_request("K", "d1")
+    assert s.take_armed_request("K", "d1") is not None
+    s.close()
+
+
 def test_drop_all_requests(store):
     store.put_request("K", "d1", "linear_comment", ["u-1"], "m")
     store.put_request("K2", "d2", "linear_comment", [], "m")

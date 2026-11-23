@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     message     TEXT NOT NULL,
     armed       INTEGER NOT NULL DEFAULT 0,
     created_at  REAL NOT NULL,
+    armed_at    REAL,           -- when armed; NULL when not armed
     PRIMARY KEY (session_key, digest)
 );
 
@@ -156,8 +157,16 @@ CREATE TABLE IF NOT EXISTS created_issues (
 CREATE INDEX IF NOT EXISTS created_owner ON created_issues(owner_issue_id);
 """
 
-# Approval requests older than this are pruned on ``put_request``.
+# Approval requests older than this are pruned on ``put_request`` and never taken.
 REQUEST_TTL_S = 86_400
+
+# An armed request can be taken only this long after it was armed, so an abandoned
+# (timed-out) approval wait cannot leave a usable arm behind. Must exceed Hermes's
+# approvals.timeout (default 300 s, tools/approval_context.py:327).
+ARMED_WINDOW_S = 3600
+
+# Columns added to ``approval_requests`` after release; migrated in ``Store.__init__``.
+_REQUEST_COLUMNS = (("armed_at", "REAL"),)
 
 # Columns added to ``pending_controls`` after release; migrated in ``Store.__init__``.
 _CONTROL_COLUMNS = (
@@ -265,6 +274,10 @@ class Store:
             for col, ddl in _CONTROL_COLUMNS:  # pre-pending-question databases
                 if col not in cols:
                     conn.execute(f"ALTER TABLE pending_controls ADD COLUMN {col} {ddl}")
+            req_cols = {r[1] for r in conn.execute("PRAGMA table_info(approval_requests)")}
+            for col, ddl in _REQUEST_COLUMNS:  # pre-armed_at databases
+                if col not in req_cols:
+                    conn.execute(f"ALTER TABLE approval_requests ADD COLUMN {col} {ddl}")
             if conn.execute("PRAGMA user_version").fetchone()[0] == 0:
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.commit()
@@ -803,7 +816,7 @@ class Store:
                 "DELETE FROM approval_requests WHERE created_at < ?", (now - REQUEST_TTL_S,))
             self.conn.execute(
                 "INSERT OR REPLACE INTO approval_requests (session_key, digest, tool, "
-                "targets, message, armed, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                "targets, message, armed, created_at, armed_at) VALUES (?, ?, ?, ?, ?, 0, ?, NULL)",
                 (session_key, digest, tool, json.dumps(list(targets)), message, now))
 
         self._write(go)
@@ -816,12 +829,12 @@ class Store:
         return _request_row(r) if r is not None else None
 
     def arm_request(self, session_key: str, digest: str) -> ApprovalRequest | None:
-        """Mark the request armed (a human is being asked) and return it, or None."""
+        """Mark the request armed (a human is being asked) as of now and return it, or None."""
 
         def go() -> ApprovalRequest | None:
             cur = self.conn.execute(
-                "UPDATE approval_requests SET armed = 1 WHERE session_key = ? AND digest = ?",
-                (session_key, digest))
+                "UPDATE approval_requests SET armed = 1, armed_at = ? "
+                "WHERE session_key = ? AND digest = ?", (time.time(), session_key, digest))
             if cur.rowcount == 0:
                 return None
             r = self._one(
@@ -833,12 +846,16 @@ class Store:
 
     def take_armed_request(self, session_key: str, digest: str) -> ApprovalRequest | None:
         """Consume an armed request: return it and delete it in one operation, or None
-        (no request, or not armed; an unarmed request is left in place)."""
+        (no request, not armed, armed more than ``ARMED_WINDOW_S`` ago, or older than
+        ``REQUEST_TTL_S``; a request not taken is left in place)."""
 
         def go() -> ApprovalRequest | None:
+            now = time.time()
             r = self._one(
                 f"SELECT {self._REQUEST_COLS} FROM approval_requests "
-                "WHERE session_key = ? AND digest = ? AND armed = 1", (session_key, digest))
+                "WHERE session_key = ? AND digest = ? AND armed = 1 AND armed_at >= ? "
+                "AND created_at >= ?",
+                (session_key, digest, now - ARMED_WINDOW_S, now - REQUEST_TTL_S))
             if r is None:
                 return None
             self.conn.execute(
@@ -850,7 +867,8 @@ class Store:
 
     def disarm_request(self, session_key: str, digest: str) -> None:
         self._write(lambda: self.conn.execute(
-            "UPDATE approval_requests SET armed = 0 WHERE session_key = ? AND digest = ?",
+            "UPDATE approval_requests SET armed = 0, armed_at = NULL "
+            "WHERE session_key = ? AND digest = ?",
             (session_key, digest)))
 
     def drop_all_requests(self) -> None:
