@@ -31,7 +31,7 @@ Linear: RET-119
 2. **A call that skips hooks** (`ctx.dispatch_tool`), made while a request exists, must never write out of scope. Owned by Task 4 (unarmed request → `APPROVAL_REQUIRED` again, no write).
 3. **The re-run in the deferred answer turn** arrives after `post_tool_call` disarmed the request. The hook must re-arm it, and the grant must match `command#digest`. Owned by the Task 7 end-to-end test.
 4. **A `mutation` hidden in a comment, string or block string** is allowed. A real one after a valid `query` is refused. Owned by the Task 1 guard tests.
-5. **A transform rewrite must never touch the tool's own JSON**, including the tool's own `APPROVAL_REQUIRED`. Owned by the Task 5 transform test.
+5. **The transform must never rewrite a gated tool's result** (Ruling R9: Hermes does not run `transform_tool_result` for pre-hook blocks, so there is no tool-approval rewrite). Owned by the Task 5 `test_transform_never_rewrites_gated_result`.
 
 ---
 
@@ -155,7 +155,7 @@ Linear: RET-119
   - `parse_rule(command: str, description: str | None) -> tuple[str, str] | None` returns `(tool, digest)` when `command` matches `^<(linear_[a-z_]+)> \(plugin approval rule\)$` and the description's last non-empty line matches `^digest: ([0-9a-f]{16})$`. Otherwise it returns `None`.
   - `grant_command(command: str, digest: str) -> str` returns `f"{command}#{digest}"`.
   - `split_grant_command(command: str | None) -> tuple[str, str] | None` returns `(tool, digest)` for a `"<tool> (plugin approval rule)#<hex>"` string, else `None`.
-  - Copy constants `REQUIRED_TEXT = "Not run: {targets} is outside this session's write scope. Call {tool} again with identical arguments to ask a human for approval in Linear."` and `PENDING_TEXT` (the spec §2.5 string, verbatim).
+  - Copy constants `REQUIRED_TEXT = "Not run: {targets} is outside this session's write scope. Call {tool} again with identical arguments to ask a human for approval in Linear."` (R9 later extended `REQUIRED_TEXT` with the time-out guidance and removed `PENDING_TEXT`; see the spec §2.1 step 2).
 
 - [ ] **Step 1: Write the tests.**
   - `test_digest_stable_across_key_order`
@@ -220,21 +220,18 @@ Linear: RET-119
 - Test: `tests/test_hooks_approval.py`
 
 **Interfaces:**
-- Consumes: `tool_approval.GATED_TOOLS`, `digest`, `rule_key`, `PENDING_TEXT`, `parse_rule`/`split_grant_command` (Task 3); `Store.arm_request`, `request`, `disarm_request` (Task 2); control rows whose `command` is `grant_command(...)` for tool approvals (Task 6 writes them that way; for this task, test with rows built that way).
+- Consumes: `tool_approval.GATED_TOOLS`, `digest`, `rule_key`, `parse_rule`/`split_grant_command` (Task 3); `Store.arm_request`, `request`, `disarm_request` (Task 2); control rows whose `command` is `grant_command(...)` for tool approvals (Task 6 writes them that way; for this task, test with rows built that way).
 - Produces:
   - `on_pre_tool_call` returns `{"action": "approve", "message": req.message, "rule_key": rule_key(tool, d)}` when a gated tool in a Linear session has a request for `(HERMES_SESSION_KEY, digest)` in any adapter's store. It arms the request first. Otherwise it returns None, and the existing action-scheduling behaviour is kept in both cases.
   - `on_post_tool_call` disarms that request.
-  - `on_transform_tool_result` rewrites per spec §2.5.
+  - `on_transform_tool_result`: unchanged for tool approvals (Ruling R9, fix round 1).
 
 - [ ] **Step 1: Write the tests.** Bind session vars the way existing hook tests do (grep `tests/` for `HERMES_SESSION_PLATFORM` binding).
   - `test_pre_tool_call_approves_and_arms`: the directive's `message` and `rule_key` are as stored, and `take_armed_request` then succeeds.
   - `test_pre_tool_call_none_without_request` / `_non_gated_tool` / `_non_linear_session` / `_store_error` (store raises, giving None).
   - `test_pre_tool_call_still_schedules_action_event`: the existing start event is still scheduled.
   - `test_post_tool_call_disarms`
-  - `test_transform_pending`: the result is Hermes's timeout text (containing `timed out without user response`), with a pending approval control row for this turn's mid and `command == "<linear_comment> (plugin approval rule)#<d>"`. The output is JSON with `error == "APPROVAL_PENDING"` and `message == PENDING_TEXT`.
-  - `test_transform_denied`: a `BLOCKED…` text with a request present gives `APPROVAL_DENIED`, with that text as `message`.
-  - `test_transform_never_rewrites_tool_json` (Review Focus 5): `{"ok": false, "error": "APPROVAL_REQUIRED", …}` and `{"ok": true}` both give None.
-  - `test_transform_no_request_untouched`
+  - `test_transform_never_rewrites_gated_result` (Ruling R9 replaced the pending/denied rewrite tests).
   - The existing shell-approval transform tests stay green.
 - [ ] **Step 2: Run** them. Expected: FAIL.
 - [ ] **Step 3: Implement.**
@@ -292,12 +289,12 @@ Linear: RET-119
 - [ ] **Step 2: Write the e2e tests.** Model them on `tests/test_approval_grant_feasibility.py`: real `tools.approval`, `register_gateway_notify`, the session key contextvar, and the approval mode patched to `manual`. Drive Hermes's real `hermes_cli.plugins._dispatch_pre_tool_call_hooks("linear_comment", args, ...)` with the plugin's hooks registered (or `invoke_hook` patched to call `hooks.on_pre_tool_call`), on a worker thread, then the registered handler.
   - `test_e2e_approve_writes`: first call `APPROVAL_REQUIRED`; re-call, notify, resolve `once`, posted.
   - `test_e2e_deny_never_writes`
-  - `test_e2e_deferred_rerun_uses_grant` (Review Focus 3): first call; re-call; the approval times out (short `approvals.timeout`); the pending row is rewritten to `APPROVAL_PENDING`; `answer_pending` approves; the identical re-call in the answer turn resolves through `_use_grant` with no new elicitation and posts. A re-call with a different body posts a new select.
+  - `test_e2e_deferred_rerun_uses_grant` (Review Focus 3): first call; re-call; the approval times out (short `approvals.timeout`); the agent sees Hermes's BLOCKED result and the control row is `pending`; `answer_pending` approves; the identical re-call in the answer turn resolves through `_use_grant` with no new elicitation and posts. A re-call with a different body posts a new select.
   - `test_e2e_yolo_bypasses`: with yolo active, the re-call writes without a prompt.
 - [ ] **Step 3: Run** them. Expected: PASS. If a test fails on a real Hermes behaviour, fix the plugin, not the test, and note it in the ledger.
 - [ ] **Step 4: Skill text** (the 150-line cap is enforced by test):
   - Add `linear_query` to the tool list.
-  - Replace "write only to the session ticket…" with the gated rule: out-of-scope comment, update and create return `APPROVAL_REQUIRED`, so call again with identical arguments to ask. `APPROVAL_PENDING` means end the turn. On ``Answer to approval for `<tool>` call <digest>: approved``, re-run the same call with identical arguments in that turn.
-- [ ] **Step 5: README:** the behaviour table row, the configuration reference row for `out_of_scope_writes`, the tool list, and the security notes (approvals go to a human; the bypasses are `yolo` and `approvals.mode: off`; subagents are blocked). Edit the channel design spec §4 in place: the scope rule points to the RET-119 spec, and `linear_query` goes under §4.1.
+  - Replace "write only to the session ticket…" with the gated rule: out-of-scope comment, update and create return `APPROVAL_REQUIRED`, so call again with identical arguments to ask. If that approval times out (Hermes's BLOCKED text), the question stays pending in Linear: end the turn. On ``Answer to approval for `<tool>` call <digest>: approved``, re-run the same call with identical arguments in that turn.
+- [ ] **Step 5: README:** the behaviour table row, the configuration reference row for `out_of_scope_writes`, the tool list, and the security notes (approvals go to a human; the bypasses are `yolo` and `approvals.mode: off`; subagents are blocked). In the RET-119 spec: fix §4's skills bullet (no `APPROVAL_PENDING` after R9), §1's config path (`plugins.entries.linear.settings`), and §2.1's "no store traffic" sentence for in-scope calls (Ruling R7). Edit the channel design spec §4 in place: the scope rule points to the RET-119 spec, and `linear_query` goes under §4.1.
 - [ ] **Step 6: Run** the full suite and `hermes plugins validate .`. Expected: PASS, with no new private imports listed.
 - [ ] **Step 7: Commit** with `test+docs: tool approval end to end; skill, README, spec (<T7 ID>)`.
