@@ -65,9 +65,10 @@ with these changes:
    `out_of_scope_writes`. `deny` → `NOT_LINEAR_SESSION`; `allow` → run with the recorded
    targets approved; `approve` → store the request and return `APPROVAL_REQUIRED` with the
    outside wording (§2.1).
-4. **`can_request`** drops the `ctx.is_linear` requirement: a session key, a store and a
-   digest are enough. No session key (some cron or script contexts) under `approve` →
-   `OUT_OF_SCOPE` (nobody can be asked), as RET-119 does for the same case.
+4. **`can_request`** requires a Linear session OR an outside session (`ctx.is_linear or
+   ctx.outside`), plus a session key, a store and a digest. No session key (some cron or
+   script contexts) under `approve` → `OUT_OF_SCOPE` (nobody can be asked), as RET-119
+   does for the same case.
 5. **Hook:** `hooks._gated_request` no longer requires `HERMES_SESSION_PLATFORM ==
    "linear"`; it requires a bound `HERMES_SESSION_KEY` and finds the request in the
    profile's adapter store by `(session key, digest)`. Hermes session keys of different
@@ -89,16 +90,19 @@ with these changes:
 
 ## 3. `linear_issue_create` outside a session
 
-Schema: add `team` ("Team key, name or UUID; only outside a Linear session") and
-`project` ("Project name or UUID; only outside a Linear session"), both plain strings
-(non-array, so `FIELD_TYPES` / `ARRAY_FIELDS` sync: `ARRAY_FIELDS` unchanged). Description:
-"Create a Linear issue as the Linear app. In a Linear session: in the session issue's team
-and project. Elsewhere: in `team`/`project` or the configured defaults, after approval
-(`outside_session_writes`)."
+Schema: add `team` ("Team key, name or UUID. Outside a Linear session: where the issue
+goes (default: default_team). In a session: must match the session issue's team.") and
+`project` ("Project name or UUID. Outside a Linear session: where the issue goes (default:
+default_project). In a session: must match the session issue's project."), both plain
+strings (non-array, so `FIELD_TYPES` / `ARRAY_FIELDS` sync: `ARRAY_FIELDS` unchanged).
+Description: "Create a Linear issue as the Linear app. In a Linear session: in the session
+issue's team and project. Elsewhere: in `team`/`project` or the configured defaults
+(`outside_session_writes` decides whether a human is asked)."
 
-Inside a session: `team`/`project` given and different from the session ticket's →
-`BAD_ARGS` (the in-session create never leaves the session's team/project silently).
-Equal values are accepted.
+Inside a session: `team`/`project` naming an existing team/project different from the
+session ticket's → `BAD_ARGS` (the in-session create never leaves the session's
+team/project silently); one that doesn't exist → `TEAM_NOT_FOUND` / `PROJECT_NOT_FOUND`
+(controller ruling). Equal values are accepted.
 
 Outside, in order:
 1. Team = `team` arg, else `default_team`, else `BAD_ARGS`. Resolve via the existing
