@@ -548,6 +548,101 @@ def test_comment_marker_must_be_simple(pin_ctx, ws):
     assert ws.writes() == []
 
 
+# ------------------------------------------------ linear_comment threads (RET-121 §1.5)
+
+
+def _thread(ws, issue="RET-2", resolved_at=None):
+    """A human top-level comment on ``issue`` and a human reply to it: ``(top, reply)``."""
+    top = ws.add_comment(issue, "question?", user=HUMAN, resolved_at=resolved_at)
+    return top, ws.add_comment(issue, "more", user=HUMAN, parent=top)
+
+
+def test_reply_posts_with_parent(pin_ctx, ws):
+    top, _ = _thread(ws)
+    out = linear_comment({"id": "RET-2", "body": "answer", "reply_to": top})
+    assert out == {"ok": True, "comment_id": out["comment_id"], "edited": False,
+                   "issue": "RET-2", "url": "https://linear.app/x/issue/RET-2",
+                   "thread_id": top, "resolved": False}
+    c = ws.comments[out["comment_id"]]
+    assert (c["issue"], c["body"], c["parent"]) == ("uuid-child", "answer", top)
+    assert ws.writes() == [("comment_create", ("uuid-child", "answer", top))]
+
+
+def test_reply_to_reply_uses_thread(pin_ctx, ws):
+    """Linear refuses a reply's id as parentId (probe): the thread's top comment is used."""
+    top, reply = _thread(ws)
+    out = linear_comment({"id": "RET-2", "body": "answer", "reply_to": reply})
+    assert out["ok"] is True and out["thread_id"] == top and out["resolved"] is False
+    assert ws.comments[out["comment_id"]]["parent"] == top
+
+
+def test_reply_to_other_issue_refused(pin_ctx, ws):
+    """Review Focus 4: a comment on a different (in-scope) issue: no post."""
+    top, reply = _thread(ws, issue="RET-1")
+    for ref in (top, reply):
+        out = linear_comment({"id": "RET-2", "body": "x", "reply_to": ref})
+        assert out == {"ok": False, "error": "COMMENT_NOT_ON_ISSUE"}
+        out = linear_comment({"id": "RET-2", "body": "x", "reply_to": ref, "resolve": True})
+        assert out == {"ok": False, "error": "COMMENT_NOT_ON_ISSUE"}
+    assert ws.writes() == []
+
+
+def test_reply_to_unknown_refused(pin_ctx, ws):
+    out = linear_comment({"id": "RET-2", "body": "x", "reply_to": "comment-nope"})
+    assert out == {"ok": False, "error": "COMMENT_NOT_ON_ISSUE"}
+    assert ws.writes() == []
+
+
+def test_resolve_posts_then_resolves(pin_ctx, ws):
+    top, reply = _thread(ws)
+    out = linear_comment({"id": "RET-2", "body": "done", "reply_to": reply, "resolve": True})
+    assert out["ok"] is True and out["thread_id"] == top and out["resolved"] is True
+    assert "already_resolved" not in out
+    new = out["comment_id"]
+    assert ws.writes() == [("comment_create", ("uuid-child", "done", top)),
+                           ("comment_resolve", (top, new))]
+    assert ws.comments[top]["resolved_at"] is not None
+
+
+def test_resolve_already_resolved(pin_ctx, ws):
+    """Linear re-resolves a resolved thread (probe): the tool makes no resolve call."""
+    top, _ = _thread(ws, resolved_at="2026-11-20T00:00:00.000Z")
+    out = linear_comment({"id": "RET-2", "body": "again", "reply_to": top, "resolve": True})
+    assert out["ok"] is True and out["resolved"] is True and out["already_resolved"] is True
+    assert [w[0] for w in ws.writes()] == ["comment_create"]
+    assert ws.comments[top]["resolved_at"] == "2026-11-20T00:00:00.000Z"
+
+
+def test_reply_to_resolved_thread_without_resolve(pin_ctx, ws):
+    top, _ = _thread(ws, resolved_at="2026-11-20T00:00:00.000Z")
+    out = linear_comment({"id": "RET-2", "body": "fyi", "reply_to": top})
+    assert out["ok"] is True and out["resolved"] is True and "already_resolved" not in out
+    assert [w[0] for w in ws.writes()] == ["comment_create"]
+
+
+@pytest.mark.parametrize("args", [
+    {"resolve": True}, {"resolve": True, "reply_to": None}, {"resolve": True, "reply_to": " "},
+    {"reply_to": 5}, {"reply_to": "c", "resolve": "yes"}, {"resolve": False, "reply_to": ""}])
+def test_resolve_without_reply_to_bad_args(pin_ctx, ws, args):
+    assert linear_comment({"id": "RET-2", "body": "x", **args}) == {
+        "ok": False, "error": "BAD_ARGS"}
+    assert ws.calls == []  # refused before any I/O
+
+
+def test_marker_with_reply_to_bad_args(pin_ctx, ws):
+    top, _ = _thread(ws)
+    assert linear_comment({"id": "RET-2", "body": "x", "reply_to": top,
+                           "edit_marker": "status"}) == {"ok": False, "error": "BAD_ARGS"}
+    assert ws.calls == []
+
+
+def test_resolve_false_is_a_plain_reply(pin_ctx, ws):
+    top, _ = _thread(ws)
+    out = linear_comment({"id": "RET-2", "body": "x", "reply_to": top, "resolve": False})
+    assert out["ok"] is True and out["resolved"] is False
+    assert [w[0] for w in ws.writes()] == ["comment_create"]
+
+
 # ------------------------------------------- create / update field parity (RET-121 T4)
 
 ORION = "proj-orion"

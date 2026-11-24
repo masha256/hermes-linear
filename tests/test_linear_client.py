@@ -546,6 +546,48 @@ async def test_client_comment_create_and_update(fake, client):
                                                             "input": {"body": "edited"}}
 
 
+async def test_client_comment_create_with_parent(fake, client):
+    """A thread reply (RET-121 §1.5): ``parentId`` is sent only when given."""
+    fake.on("CommentCreate", {"data": {"commentCreate": {"success": True, "comment": {"id": "c2"}}}})
+    assert await client.comment_create("uuid-1", "re", parent_id="c1") == "c2"
+    assert fake.gql_calls("CommentCreate")[0].variables == {
+        "input": {"issueId": "uuid-1", "body": "re", "parentId": "c1"}}
+
+
+async def test_client_comment_get(fake, client):
+    fake.on("CommentGet", {"data": {"comment": {
+        "id": "c2", "resolvedAt": None, "issue": {"id": "uuid-1"}, "parent": {"id": "c1"}}}},
+            {"data": {"comment": {"id": "c1", "resolvedAt": "2026-11-24T15:25:05.210Z",
+                                  "issue": {"id": "uuid-1"}, "parent": None}}})
+    assert await client.comment_get("c2") == {"id": "c2", "issue_id": "uuid-1",
+                                              "parent_id": "c1", "resolved_at": None}
+    assert await client.comment_get("c1") == {"id": "c1", "issue_id": "uuid-1",
+                                              "parent_id": None,
+                                              "resolved_at": "2026-11-24T15:25:05.210Z"}
+    assert fake.gql_calls("CommentGet")[0].variables == {"id": "c2"}
+
+
+# Real Linear's answer for an unknown comment id, UUID or not (live probe RET-142).
+COMMENT_NOT_FOUND_BODY = {"data": None, "errors": [{
+    "message": "Entity not found: Comment", "path": ["comment"],
+    "extensions": {"code": "INPUT_ERROR", "type": "invalid input", "userError": True,
+                   "userPresentableMessage": "Could not find referenced Comment."}}]}
+
+
+async def test_client_comment_get_unknown_is_none(fake, client):
+    fake.on("CommentGet", COMMENT_NOT_FOUND_BODY, {"data": {"comment": None}})
+    assert await client.comment_get("nope") is None
+    assert await client.comment_get("null-node") is None
+
+
+async def test_client_comment_resolve(fake, client):
+    fake.on("CommentResolve", {"data": {"commentResolve": {"success": True,
+                                                           "comment": {"id": "c1"}}}})
+    assert await client.comment_resolve("c1", "c2") is None
+    assert fake.gql_calls("CommentResolve")[0].variables == {"id": "c1",
+                                                             "resolvingCommentId": "c2"}
+
+
 async def test_client_app_comments_only_viewer(fake, client):
     fake.on("IssueAppComments", {"data": {"issue": {"comments": {"nodes": [
         {"id": "c1", "body": "mine", "user": {"id": APP_USER}},

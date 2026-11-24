@@ -167,6 +167,16 @@ MUTATION_COMMENT_UPDATE = """mutation CommentUpdate($id: String!, $input: Commen
   commentUpdate(id: $id, input: $input) { success comment { id } }
 }"""
 
+# A comment's issue, thread parent and resolution (RET-121 §1.5). Linear refuses a reply's
+# id as ``parentId`` (live probe RET-142), so a thread is one level deep.
+QUERY_COMMENT_GET = """query CommentGet($id: String!) {
+  comment(id: $id) { id resolvedAt issue { id } parent { id } }
+}"""
+
+MUTATION_COMMENT_RESOLVE = """mutation CommentResolve($id: String!, $resolvingCommentId: String) {
+  commentResolve(id: $id, resolvingCommentId: $resolvingCommentId) { success comment { id } }
+}"""
+
 # Server-side filter on the app user; ``user.id`` is re-checked client-side. Paged.
 QUERY_ISSUE_APP_COMMENTS = """query IssueAppComments($id: String!, $userId: ID!, $after: String) {
   issue(id: $id) {
@@ -678,10 +688,36 @@ class LinearClient:
         data = await self.gql(MUTATION_ISSUE_UPDATE, {"id": issue_id, "input": input})
         return self._require_success(data, "issueUpdate").get("issue") or {"id": issue_id}
 
-    async def comment_create(self, issue_id: str, body: str) -> str:
-        data = await self.gql(MUTATION_COMMENT_CREATE,
-                              {"input": {"issueId": issue_id, "body": body}})
+    async def comment_create(self, issue_id: str, body: str,
+                             parent_id: str | None = None) -> str:
+        """``commentCreate``; with ``parent_id`` (a top-level comment) a thread reply."""
+        inp = {"issueId": issue_id, "body": body}
+        if parent_id is not None:
+            inp["parentId"] = parent_id
+        data = await self.gql(MUTATION_COMMENT_CREATE, {"input": inp})
         return self._require_success(data, "commentCreate")["comment"]["id"]
+
+    async def comment_get(self, comment_id: str) -> dict | None:
+        """``{id, issue_id, parent_id, resolved_at}``; ``None`` for an unknown comment."""
+        try:
+            data = await self.gql(QUERY_COMMENT_GET, {"id": comment_id})
+        except LinearError as exc:
+            if exc.code == "NOT_FOUND":
+                return None
+            raise
+        c = data.get("comment")
+        if not isinstance(c, dict) or not c.get("id"):
+            return None
+        return {"id": c["id"], "issue_id": (c.get("issue") or {}).get("id"),
+                "parent_id": (c.get("parent") or {}).get("id"),
+                "resolved_at": c.get("resolvedAt")}
+
+    async def comment_resolve(self, comment_id: str, resolving_comment_id: str) -> None:
+        """``commentResolve`` of thread ``comment_id`` by the reply ``resolving_comment_id``.
+        Linear accepts it on a resolved thread too (re-stamps ``resolvedAt``; probe)."""
+        data = await self.gql(MUTATION_COMMENT_RESOLVE, {
+            "id": comment_id, "resolvingCommentId": resolving_comment_id})
+        self._require_success(data, "commentResolve")
 
     async def comment_update(self, comment_id: str, body: str) -> None:
         data = await self.gql(MUTATION_COMMENT_UPDATE, {"id": comment_id, "input": {"body": body}})

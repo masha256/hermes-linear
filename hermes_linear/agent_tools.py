@@ -827,9 +827,16 @@ def _summary(issue: dict) -> dict:
 
 
 def _parse_comment(args: dict) -> dict:
+    reply_to = None if args.get("reply_to") is None else _req_str(args, "reply_to").strip()
+    resolve = False if args.get("resolve") is None else args["resolve"]
     a = {"id": _req_str(args, "id"), "body": _req_str(args, "body"),
-         "edit_marker": _opt_str(args, "edit_marker")}
+         "edit_marker": _opt_str(args, "edit_marker"), "reply_to": reply_to,
+         "resolve": resolve}
     if a["edit_marker"] is not None and not MARKER_RE.match(a["edit_marker"]):
+        raise _Refusal("BAD_ARGS")
+    # RET-121 §1.5: resolve needs reply_to; a marker edit is never a reply.
+    if not isinstance(resolve, bool) or (resolve and reply_to is None) \
+            or (reply_to is not None and a["edit_marker"] is not None):
         raise _Refusal("BAD_ARGS")
     return a
 
@@ -839,15 +846,41 @@ def _with_marker(body: str, marker: str) -> str:
     return f"{ANY_MARKER_RE.sub('', body).rstrip()}\n\n{_marker_tag(marker)}"
 
 
+async def _thread_of(ctx: ToolContext, issue: dict, reply_to: str) -> dict:
+    """The top-level comment of ``reply_to``'s thread (``comment_get`` shape), which must
+    be on ``issue``; else ``COMMENT_NOT_ON_ISSUE``. Linear refuses a reply's id as
+    ``parentId`` (live probe RET-142), so threads are one level deep."""
+    c = await ctx.client.comment_get(reply_to)
+    if c is None or c["issue_id"] != issue["id"]:
+        raise _Refusal("COMMENT_NOT_ON_ISSUE")
+    if not c["parent_id"]:
+        return c
+    top = await ctx.client.comment_get(c["parent_id"])
+    if top is None or top["issue_id"] != issue["id"]:
+        raise _Refusal("COMMENT_NOT_ON_ISSUE")
+    return top
+
+
 async def _comment(ctx: ToolContext, a: dict) -> dict:
     issue = await _writable(ctx, a["id"])
-    _check_gate(ctx)
+    thread = await _thread_of(ctx, issue, a["reply_to"]) if a["reply_to"] else None
+    _check_gate(ctx)  # after the scope and comment checks
     body, marker = a["body"], a["edit_marker"]
 
     def done(comment_id: str, edited: bool) -> dict:
         return {"ok": True, "comment_id": comment_id, "edited": edited,
                 "issue": issue.get("identifier"), "url": issue.get("url")}
 
+    if thread is not None:
+        out = done(await ctx.client.comment_create(issue["id"], body, parent_id=thread["id"]),
+                   False)
+        out.update(thread_id=thread["id"], resolved=bool(thread["resolved_at"]))
+        if a["resolve"] and thread["resolved_at"]:
+            out["already_resolved"] = True  # Linear would re-stamp it: no resolve call
+        elif a["resolve"]:
+            await ctx.client.comment_resolve(thread["id"], out["comment_id"])
+            out["resolved"] = True
+        return out
     if marker is None:
         return done(await ctx.client.comment_create(issue["id"], body), False)
     tag = _marker_tag(marker)
@@ -1364,12 +1397,19 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "name": "linear_comment",
         "description": ("Comment on a Linear issue as the Linear app. With edit_marker, edit "
                         "the app's earlier comment carrying that marker instead of adding a "
-                        "new one. " + _GATED_NOTE),
+                        "new one. With reply_to, reply in that comment's thread; resolve: true "
+                        "also resolves the thread (needs reply_to; not with edit_marker). "
+                        + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "body": {"type": "string", "description": "Markdown."},
             "edit_marker": {"type": "string",
                             "description": "Stable key, e.g. status (letters, digits, _.:-)."},
+            "reply_to": {"type": "string",
+                         "description": ("Comment UUID on this issue (linear_issue_get "
+                                         "comments); a reply's id means its thread.")},
+            "resolve": {"type": "boolean",
+                        "description": "With reply_to: resolve the thread after replying."},
         }, "required": ["id", "body"]},
     },
     "linear_sync_spec": {

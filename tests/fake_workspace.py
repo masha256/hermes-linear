@@ -184,10 +184,11 @@ class FakeWorkspace:
             raise _not_found("Project")
         return {"id": row["id"], "name": row["name"]}
 
-    def add_comment(self, issue_id: str, body: str, *, user: str = VIEWER) -> str:
+    def add_comment(self, issue_id: str, body: str, *, user: str = VIEWER,
+                    parent: str | None = None, resolved_at: str | None = None) -> str:
         cid = f"comment-{next(self._ids)}"
         self.comments[cid] = {"id": cid, "issue": self.issue(issue_id)["id"], "body": body,
-                              "user": user}
+                              "user": user, "parent": parent, "resolved_at": resolved_at}
         return cid
 
     # -- inspection ----------------------------------------------------
@@ -204,7 +205,7 @@ class FakeWorkspace:
         return [c for c in self.calls if c[0] in {
             "issue_create", "issue_update", "comment_create", "comment_update", "file_upload",
             "attachment_create", "attachment_link_url", "attachment_link_github_pr",
-            "relation_create"}]
+            "relation_create", "comment_resolve"}]
 
     def default_state(self, team: str) -> str:
         """The team's first ``backlog``/``unstarted`` state (see the module docstring)."""
@@ -316,9 +317,31 @@ class FakeWorkspace:
         i["fields"].update({k: inp[k] for k in _FIELD_KEYS if k in inp})
         return self._summary(i)
 
-    async def comment_create(self, issue_id: str, body: str) -> str:
-        self.calls.append(("comment_create", (issue_id, body)))
-        return self.add_comment(issue_id, body, user=VIEWER)
+    async def comment_create(self, issue_id: str, body: str,
+                             parent_id: str | None = None) -> str:
+        if parent_id is None:
+            self.calls.append(("comment_create", (issue_id, body)))
+            return self.add_comment(issue_id, body, user=VIEWER)
+        self.calls.append(("comment_create", (issue_id, body, parent_id)))
+        parent = self.comments.get(parent_id)
+        # Linear refuses a reply's id as parentId (live probe RET-142: "incorrect parent").
+        if parent is None or parent["parent"] or parent["issue"] != self.issue(issue_id)["id"]:
+            raise LinearError("incorrect parent", code="INPUT_ERROR", status=200)
+        return self.add_comment(issue_id, body, user=VIEWER, parent=parent_id)
+
+    async def comment_get(self, comment_id: str) -> dict | None:
+        self.calls.append(("comment_get", comment_id))
+        c = self.comments.get(comment_id)
+        if c is None:
+            return None
+        return {"id": c["id"], "issue_id": c["issue"], "parent_id": c["parent"],
+                "resolved_at": c["resolved_at"]}
+
+    async def comment_resolve(self, comment_id: str, resolving_comment_id: str) -> None:
+        self.calls.append(("comment_resolve", (comment_id, resolving_comment_id)))
+        if comment_id not in self.comments or resolving_comment_id not in self.comments:
+            raise _not_found("Comment")
+        self.comments[comment_id]["resolved_at"] = "2026-11-24T00:00:00.000Z"
 
     async def comment_update(self, comment_id: str, body: str) -> None:
         self.calls.append(("comment_update", (comment_id, body)))

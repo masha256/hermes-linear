@@ -36,7 +36,8 @@ _GRANT_RE = re.compile(r"^<([A-Za-z0-9_]+)> \(plugin approval rule\)#([0-9a-f]{1
 FIELD_TYPES: dict[str, dict[str, str]] = {
     "linear_attach": {"id": "string", "path": "string", "url": "string", "title": "string",
                       "subtitle": "string", "embed": "boolean"},
-    "linear_comment": {"id": "string", "body": "string", "edit_marker": "string"},
+    "linear_comment": {"id": "string", "body": "string", "edit_marker": "string",
+                       "reply_to": "string", "resolve": "boolean"},
     "linear_issue_create": {"title": "string", "description": "string", "parent": "string",
                             "labels": "array", "state": "string", "team": "string",
                             "project": "string", "assignee": "string", "delegate": "string",

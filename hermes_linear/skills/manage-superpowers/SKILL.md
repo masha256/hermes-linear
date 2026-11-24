@@ -26,7 +26,7 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The tw
   session's team and project.
 - `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`,
   `remove_labels?`, `parent?`): `parent: ""` detaches; a cycle is `PARENT_CYCLE`.
-- `linear_comment` (`id`, `body`, `edit_marker?`).
+- `linear_comment` (`id`, `body`, `edit_marker?`, `reply_to?`: a comment UUID's thread, `resolve?`).
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
 - `linear_task_state` (`id`, `state`, `summary?`, `question?`, `blocked_by?`); `state` is one of
   `in_progress|in_review|done|blocked|unblocked`.

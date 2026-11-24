@@ -69,6 +69,23 @@ def test_armed_request_writes_once(pin_ctx, ws, adapter):
     assert len(_comments_on(ws, "uuid-other")) == 1
 
 
+def test_out_of_scope_reply_needs_approval_writes_nothing(pin_ctx, ws, adapter):
+    """RET-121 §1.5: a thread reply on an out-of-scope issue asks first (comment check
+    included), posts and resolves only on the approved pass, and only once."""
+    top = ws.add_comment("OTH-9", "question?", user="human-1")
+    args = {"id": "OTH-9", "body": "answer", "reply_to": top, "resolve": True}
+    out = linear_comment(dict(args))
+    assert out["error"] == "APPROVAL_REQUIRED" and ws.writes() == []
+    dg = digest("linear_comment", args)
+    assert adapter._store.request("sk", dg).targets == ["uuid-other"]
+    assert adapter._store.arm_request("sk", dg) is not None
+    out = linear_comment(dict(args))
+    assert out["ok"] is True and out["thread_id"] == top and out["resolved"] is True
+    assert [w[0] for w in ws.writes()] == ["comment_create", "comment_resolve"]
+    assert linear_comment(dict(args))["error"] == "APPROVAL_REQUIRED"
+    assert len(ws.writes()) == 2
+
+
 def test_unarmed_request_never_writes(pin_ctx, ws, adapter):
     """Review Focus 2: a stored but unarmed request never lets a write through."""
     for _ in range(2):
