@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
-from .constants import TOKEN_RENEW_MARGIN_S, WRITE_RETRIES
+from .constants import PLAN_SYNC_TIMEOUT_S, TOKEN_RENEW_MARGIN_S, WRITE_RETRIES
 
 log = logging.getLogger(__name__)
 
@@ -198,6 +198,33 @@ QUERY_TEAM_LABELS = """query TeamLabels($teamId: ID!, $after: String) {
   }
 }"""
 
+MUTATION_FILE_UPLOAD = """mutation FileUpload($size: Int!, $filename: String!, $contentType: String!) {
+  fileUpload(size: $size, filename: $filename, contentType: $contentType) {
+    success uploadFile { uploadUrl assetUrl headers { key value } }
+  }
+}"""
+
+MUTATION_ATTACHMENT_CREATE = """mutation AttachmentCreate($input: AttachmentCreateInput!) {
+  attachmentCreate(input: $input) { success attachment { id url } }
+}"""
+
+# Re-linking a URL already on the issue is an INPUT_ERROR (live probe 2026-11-24):
+# neither mutation updates or duplicates the existing attachment.
+MUTATION_ATTACHMENT_LINK_URL = """mutation AttachmentLinkURL($issueId: String!, $url: String!,
+    $title: String) {
+  attachmentLinkURL(issueId: $issueId, url: $url, title: $title) {
+    success attachment { id url }
+  }
+}"""
+
+MUTATION_ATTACHMENT_LINK_GITHUB_PR = """mutation AttachmentLinkGitHubPR($issueId: String!,
+    $url: String!) {
+  attachmentLinkGitHubPR(issueId: $issueId, url: $url) { success attachment { id url } }
+}"""
+
+#: ``Cache-Control`` of every upload PUT (with ``Content-Type`` and the ``uploadFile.headers``).
+_UPLOAD_CACHE_CONTROL = "public, max-age=31536000"
+
 
 class LinearError(Exception):
     """A Linear API failure. ``code`` is the GraphQL/OAuth error code if any; ``detail`` is
@@ -213,6 +240,13 @@ class LinearError(Exception):
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (f"LinearError({str(self)!r}, code={self.code!r}, status={self.status!r}, "
                 f"detail={self.detail!r})")
+
+
+class UploadError(LinearError):
+    """The upload PUT answered a non-2xx ``status`` (``code`` is ``UPLOAD_FAILED``)."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"upload failed (HTTP {status})", code="UPLOAD_FAILED", status=status)
 
 
 def _first_error(body: Any) -> tuple[str | None, str, str | None]:
@@ -637,3 +671,60 @@ class LinearClient:
                                   lambda d: d.get("issueLabels"))
         return [{"id": lb["id"], "name": lb.get("name") or ""}
                 for lb in nodes if not lb.get("isGroup")]
+
+    # -- uploads and attachments (RET-120) ---------------------------------
+
+    async def file_upload(self, name: str, content_type: str, data: bytes) -> str:
+        """Upload ``data`` and return its ``assetUrl``: ``fileUpload``, then a PUT of the
+        bytes to the signed ``uploadUrl`` with ``Content-Type``, ``Cache-Control`` and every
+        returned header, and **no** bearer token. A non-2xx PUT raises ``UploadError``."""
+        res = await self.gql(MUTATION_FILE_UPLOAD, {
+            "size": len(data), "filename": name, "contentType": content_type})
+        up = self._require_success(res, "fileUpload").get("uploadFile")
+        if not isinstance(up, dict) or not up.get("uploadUrl") or not up.get("assetUrl"):
+            raise LinearError("fileUpload returned no uploadFile")
+        headers = {"Content-Type": content_type, "Cache-Control": _UPLOAD_CACHE_CONTROL}
+        for h in up.get("headers") or []:
+            if isinstance(h, dict) and h.get("key"):
+                headers[str(h["key"])] = str(h.get("value") or "")
+        try:
+            async with self._http().put(
+                up["uploadUrl"], data=data, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=PLAN_SYNC_TIMEOUT_S),
+            ) as resp:
+                status = resp.status
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise LinearError(f"upload failed: {type(exc).__name__}", code="NETWORK") from None
+        if not 200 <= status < 300:
+            raise UploadError(status)
+        return str(up["assetUrl"])
+
+    @staticmethod
+    def _attachment(data: dict, field: str) -> dict:
+        att = LinearClient._require_success(data, field).get("attachment")
+        if not isinstance(att, dict) or not att.get("id"):
+            raise LinearError(f"{field} returned no attachment")
+        return {"id": att["id"], "url": att.get("url")}
+
+    async def attachment_create(self, issue_id: str, title: str, subtitle: str | None,
+                                url: str) -> dict:
+        """``attachmentCreate``; returns ``{id, url}``. ``subtitle`` is sent only if set."""
+        inp: dict[str, Any] = {"issueId": issue_id, "title": title, "url": url}
+        if subtitle is not None:
+            inp["subtitle"] = subtitle
+        data = await self.gql(MUTATION_ATTACHMENT_CREATE, {"input": inp})
+        return self._attachment(data, "attachmentCreate")
+
+    async def attachment_link_url(self, issue_id: str, url: str, title: str | None) -> dict:
+        """``attachmentLinkURL``; returns ``{id, url}``. A URL already linked to the issue
+        is Linear's ``INPUT_ERROR`` (raised as ``LinearError``)."""
+        data = await self.gql(MUTATION_ATTACHMENT_LINK_URL,
+                              {"issueId": issue_id, "url": url, "title": title})
+        return self._attachment(data, "attachmentLinkURL")
+
+    async def attachment_link_github_pr(self, issue_id: str, url: str) -> dict:
+        """``attachmentLinkGitHubPR``; returns ``{id, url}``. A PR already linked to the
+        issue is Linear's ``INPUT_ERROR`` (raised as ``LinearError``)."""
+        data = await self.gql(MUTATION_ATTACHMENT_LINK_GITHUB_PR,
+                              {"issueId": issue_id, "url": url})
+        return self._attachment(data, "attachmentLinkGitHubPR")

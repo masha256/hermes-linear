@@ -719,3 +719,106 @@ async def test_graphql_error_carries_detail(fake, client):
         await client.viewer_id()
     assert ei.value.code == "INPUT_ERROR"
     assert ei.value.detail.startswith("The query is too complex.")
+
+
+# -- uploads and attachments (RET-133) -----------------------------------
+
+
+def _upload_resp(fake, name="a1"):
+    return {"data": {"fileUpload": {"success": True, "uploadFile": {
+        "uploadUrl": f"{fake.url}/upload/{name}",
+        "assetUrl": f"https://uploads.linear.app/{name}",
+        "headers": [{"key": "x-goog-content-length-range", "value": "5,5"},
+                    {"key": "Content-Disposition", "value": 'attachment; filename="x.png"'}],
+    }}}}
+
+
+async def test_file_upload_puts_bytes_without_bearer(fake, client):
+    fake.on("FileUpload", _upload_resp(fake))
+    url = await client.file_upload("x.png", "image/png", b"\x89PNG!")
+    assert url == "https://uploads.linear.app/a1"
+    (gql,) = fake.gql_calls("FileUpload")
+    assert gql.variables == {"size": 5, "filename": "x.png", "contentType": "image/png"}
+    assert gql.bearer == "tok-1"
+    (put,) = fake.upload_calls()
+    assert (put.method, put.path, put.body) == ("PUT", "/upload/a1", b"\x89PNG!")
+    assert put.headers["Content-Type"] == "image/png"
+    assert put.headers["Cache-Control"] == "public, max-age=31536000"
+    assert put.headers["x-goog-content-length-range"] == "5,5"
+    assert put.headers["Content-Disposition"] == 'attachment; filename="x.png"'
+    assert "Authorization" not in put.headers
+
+
+async def test_file_upload_non_2xx_raises_upload_error(fake, client):
+    from hermes_linear.linear_client import UploadError
+
+    fake.on("FileUpload", _upload_resp(fake))
+    fake.upload_status = 403
+    with pytest.raises(UploadError) as ei:
+        await client.file_upload("x.png", "image/png", b"\x89PNG!")
+    assert ei.value.status == 403
+    assert ei.value.code == "UPLOAD_FAILED"
+    assert isinstance(ei.value, LinearError)
+
+
+async def test_file_upload_unsuccessful_mutation_raises(fake, client):
+    fake.on("FileUpload", {"data": {"fileUpload": {"success": False, "uploadFile": None}}})
+    with pytest.raises(LinearError):
+        await client.file_upload("x.png", "image/png", b"x")
+    assert fake.upload_calls() == []
+
+
+ATTACHMENT = {"id": "att-1", "url": "https://example.com/doc"}
+
+
+async def test_attachment_create_input(fake, client):
+    fake.on("AttachmentCreate",
+            {"data": {"attachmentCreate": {"success": True, "attachment": ATTACHMENT}}},
+            {"data": {"attachmentCreate": {"success": True, "attachment": ATTACHMENT}}},
+            {"data": {"attachmentCreate": {"success": False, "attachment": None}}})
+    got = await client.attachment_create("uuid-1", "x.png", "sub", "https://uploads.linear.app/a1")
+    assert got == ATTACHMENT
+    (call,) = fake.gql_calls("AttachmentCreate")
+    assert call.variables == {"input": {"issueId": "uuid-1", "title": "x.png",
+                                        "subtitle": "sub",
+                                        "url": "https://uploads.linear.app/a1"}}
+    await client.attachment_create("uuid-1", "t", None, "u")
+    assert fake.gql_calls("AttachmentCreate")[1].variables["input"] == {
+        "issueId": "uuid-1", "title": "t", "url": "u"}  # no subtitle key when None
+    with pytest.raises(LinearError):
+        await client.attachment_create("uuid-1", "t", None, "u")
+
+
+async def test_attachment_link_url_input(fake, client):
+    fake.on("AttachmentLinkURL",
+            {"data": {"attachmentLinkURL": {"success": True, "attachment": ATTACHMENT}}},
+            {"data": {"attachmentLinkURL": {"success": True, "attachment": ATTACHMENT}}},
+            {"data": {"attachmentLinkURL": {"success": False, "attachment": None}}})
+    assert await client.attachment_link_url("uuid-1", "https://example.com/doc", "Doc") \
+        == ATTACHMENT
+    assert await client.attachment_link_url("uuid-1", "https://example.com/doc", None) \
+        == ATTACHMENT
+    first, second = fake.gql_calls("AttachmentLinkURL")
+    assert first.variables == {"issueId": "uuid-1", "url": "https://example.com/doc",
+                               "title": "Doc"}
+    assert second.variables == {"issueId": "uuid-1", "url": "https://example.com/doc",
+                                "title": None}
+    q = " ".join(first.json["query"].split())
+    assert "attachmentLinkURL(issueId: $issueId, url: $url, title: $title)" in q
+    with pytest.raises(LinearError):
+        await client.attachment_link_url("uuid-1", "https://example.com/doc", None)
+
+
+async def test_attachment_link_github_pr_input(fake, client):
+    pr = "https://github.com/masha256/hermes-linear/pull/11"
+    fake.on("AttachmentLinkGitHubPR",
+            {"data": {"attachmentLinkGitHubPR": {"success": True,
+                                                 "attachment": {"id": "att-2", "url": pr}}}},
+            {"data": {"attachmentLinkGitHubPR": {"success": False, "attachment": None}}})
+    assert await client.attachment_link_github_pr("uuid-1", pr) == {"id": "att-2", "url": pr}
+    (call,) = fake.gql_calls("AttachmentLinkGitHubPR")
+    assert call.variables == {"issueId": "uuid-1", "url": pr}
+    q = " ".join(call.json["query"].split())
+    assert "attachmentLinkGitHubPR(issueId: $issueId, url: $url)" in q
+    with pytest.raises(LinearError):
+        await client.attachment_link_github_pr("uuid-1", pr)

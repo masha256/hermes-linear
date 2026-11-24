@@ -136,7 +136,7 @@ Errors (in addition to A's `NOT_LINEAR_SESSION`, `OUT_OF_SCOPE`, `APPROVAL_REQUI
 |------|------|
 | `FILE_NOT_FOUND` | the file is missing or not a regular file (checked before the policy) |
 | `PATH_DENIED` | the path is not absolute, or `validate_media_delivery_path` returned `None` |
-| `FILE_TOO_LARGE` | the file exceeds `ATTACH_MAX_BYTES` (50 MB; the real limit is checked live, §4) |
+| `FILE_TOO_LARGE` | the file exceeds `ATTACH_MAX_BYTES` (50 MB; Linear accepts more, §4.2) |
 | `UPLOAD_FAILED` | the PUT answered with a non-2xx status (`status` included) |
 
 If the attachment step fails after a successful upload, the error also carries
@@ -308,11 +308,27 @@ Live, as the app, before the plan's tasks rely on these:
 1. ✅ (2026-11-24, brainstorm) `issue(RET-118) { comments(first: 50, filter: {parent: {null:
    true}}) { … children(first: 50) { … } } }` runs without a complexity error. Re-check
    with the final field list. If it fails, page the replies in a second query.
-2. Linear's real upload size limit: adjust `ATTACH_MAX_BYTES` to match.
+2. ✅ (2026-11-24) Linear's real upload size limit: adjust `ATTACH_MAX_BYTES` to match.
+   `fileUpload(size:, filename: "probe.bin", contentType: "application/octet-stream")`
+   returned `success: true` with an `uploadFile` for 60 MB, 100 MB, 200 MB, 500 MB and
+   1 GB (no bytes were PUT). The only refusal is GraphQL's 32-bit `Int` (5 GB:
+   `GRAPHQL_VALIDATION_FAILED`). The returned headers are `x-goog-content-length-range:
+   "<size>,<size>"` (the PUT must carry exactly the declared size) and
+   `Content-Disposition: attachment; filename="<name>"`. Nothing is refused up to 500 MB,
+   so `ATTACH_MAX_BYTES` stays 50 MB, bounded by the 120 s budget rather than by Linear.
 3. Whether `addedExternalUrls` de-duplicates a repeated URL. Pin the observed behaviour
    in a test and document it in the tool description.
-4. `attachmentLinkURL` and `attachmentLinkGitHubPR` as the app: the return shape, and
-   whether re-linking the same URL updates the attachment or adds a duplicate.
+4. ✅ (2026-11-24, on RET-92) `attachmentLinkURL` and `attachmentLinkGitHubPR` as the
+   app: the return shape, and whether re-linking the same URL updates the attachment or
+   adds a duplicate. Both return `{success, lastSyncId, attachment {…}}` and accept an
+   identifier (`"RET-92"`) as `issueId`. The default titles are `owner/repo` for a GitHub
+   file URL and `owner/repo#11` for the PR; `subtitle` is `""` and `sourceType` is `api`.
+   A re-link of the same URL on the same issue neither updates nor duplicates: it fails
+   with `INPUT_ERROR` ("Unable to create issue attachment" / "This URL has already been
+   linked with RET-92." for `attachmentLinkURL`, also when a new `title` is passed;
+   "Duplicate attachment for duplicate url" / "An attachment with the same URL already
+   exists." for `attachmentLinkGitHubPR`). So a repeated `linear_attach` of a URL answers
+   `LINEAR_ERROR` with that `detail`, and the issue keeps one attachment.
 5. `validate_media_delivery_path(path, session_key=…)` called from a plugin tool thread
    gives the same verdicts as in the gateway. Already probed from the Hermes venv:
    `~/.ssh/id_ed25519`, `state.db`, a repo `.env`, `/etc/hostname` and a relative path

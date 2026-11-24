@@ -33,7 +33,7 @@ from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
 from . import graphql_guard, sync, tool_approval
-from .constants import TOOL_TIMEOUT_S
+from .constants import PLAN_SYNC_TIMEOUT_S, TOOL_TIMEOUT_S
 from .linear_client import LinearError
 
 log = logging.getLogger(__name__)
@@ -788,11 +788,6 @@ async def _sync_spec(ctx: ToolContext, a: dict) -> dict:
 # -- linear_sync_plan (RET-78)
 
 PLAN_MARKER = "plan"
-#: Loop-side budget for one plan sync. A ~30-task plan costs up to ~30 issue reads, ~30
-#: writes and a few comment calls, one GraphQL round trip each (0.3–1 s live): more than
-#: the generic TOOL_TIMEOUT_S (30 s). Every step is idempotent, so a TIMEOUT is retried
-#: safely (children are adopted by their ``T<n> ·`` title on the rerun).
-PLAN_SYNC_TIMEOUT_S = 120.0
 PLAN_SORT_STEP = 10  # subIssueSortOrder = PLAN_SORT_STEP * position (1-based)
 _CLOSED = {"completed", "canceled"}
 

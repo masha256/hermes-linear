@@ -20,3 +20,9 @@ ACK_TIMEOUT_S = 8  # Linear calls on the event worker must finish inside Linear'
 TURN_SAFETY_TIMEOUT_S = 3 * 3600  # a handed-off turn that never completes frees its FIFO
 STOP_SETTLE_S = 30  # a stopped turn the gateway never completes is answered and freed (Q6)
 TOOL_TIMEOUT_S = 30.0  # agent tool bridge: bounded wait for a Linear call on the adapter loop
+#: Loop-side budget for one plan sync. A ~30-task plan costs up to ~30 issue reads, ~30
+#: writes and a few comment calls, one GraphQL round trip each (0.3–1 s live): more than
+#: the generic TOOL_TIMEOUT_S (30 s). Every step is idempotent, so a TIMEOUT is retried
+#: safely (children are adopted by their ``T<n> ·`` title on the rerun). Also the budget
+#: of a ``linear_attach`` upload (a 50 MB PUT; RET-120 spec §2.4).
+PLAN_SYNC_TIMEOUT_S = 120.0
