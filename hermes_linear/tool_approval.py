@@ -30,18 +30,23 @@ _DIGEST_LINE_RE = re.compile(r"^digest: ([0-9a-f]{16})$")
 _GRANT_RE = re.compile(r"^<([A-Za-z0-9_]+)> \(plugin approval rule\)#([0-9a-f]{16})$")
 
 
-# Array-typed fields of the gated tools' schemas (agent_tools.TOOL_SCHEMAS; a test keeps
-# them in sync — importing agent_tools here would be a cycle).
-ARRAY_FIELDS: dict[str, frozenset[str]] = {
-    "linear_attach": frozenset(),
-    "linear_comment": frozenset(),
-    "linear_issue_create": frozenset({"labels"}),
-    "linear_issue_update": frozenset({"add_labels", "remove_labels"}),
+# JSON type of every property of the gated tools' schemas (agent_tools.TOOL_SCHEMAS),
+# suffixed "|null" when the schema's type list allows null. A test keeps this in sync —
+# importing agent_tools here would be a cycle.
+FIELD_TYPES: dict[str, dict[str, str]] = {
+    "linear_attach": {"id": "string", "path": "string", "url": "string", "title": "string",
+                      "subtitle": "string", "embed": "boolean"},
+    "linear_comment": {"id": "string", "body": "string", "edit_marker": "string"},
+    "linear_issue_create": {"title": "string", "description": "string", "parent": "string",
+                            "labels": "array", "state": "string"},
+    "linear_issue_update": {"id": "string", "title": "string", "description": "string",
+                            "state": "string", "add_labels": "array",
+                            "remove_labels": "array", "parent": "string"},
 }
 
 
 def _as_array(value: Any) -> Any:
-    """Coerce one array-schema value as Hermes's ``coerce_tool_args`` does."""
+    """Coerce one non-null array-schema value as Hermes's ``coerce_tool_args`` does."""
     if value is None:
         return None
     if isinstance(value, (list, tuple)):
@@ -56,16 +61,54 @@ def _as_array(value: Any) -> Any:
     return [value]
 
 
-def normalize_args(tool: str, args: Any) -> dict:
-    """``args`` with the tool's array fields coerced; idempotent on coerced args.
+def _as_number(value: str, integer_only: bool) -> Any:
+    """A finite number: ``int`` when whole; a fraction stays a string when ``integer_only``."""
+    try:
+        f = float(value)
+    except (ValueError, OverflowError):
+        return value
+    if f != f or f in (float("inf"), float("-inf")):
+        return value
+    if f == int(f):
+        return int(f)
+    return value if integer_only else f
 
-    The ``pre_tool_call`` hook sees the model's raw args and the handler may see them
-    after Hermes's ``coerce_tool_args``; normalizing here makes both digests agree.
+
+def _coerce(field_type: str, value: Any) -> Any:
+    """One value coerced for ``field_type`` (a FIELD_TYPES entry) as Hermes does."""
+    base, _, null = field_type.partition("|")
+    if field_type == "array":
+        return _as_array(value)
+    if not isinstance(value, str):
+        return value
+    if null and value.strip().lower() == "null":
+        return None
+    if base == "array":
+        # A nullable array is a type union to Hermes: a JSON list string is parsed,
+        # anything else (a bare value included) is kept as is.
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            return value
+        return parsed if isinstance(parsed, list) else value
+    if base in ("integer", "number"):
+        return _as_number(value, integer_only=base == "integer")
+    if base == "boolean":
+        return {"true": True, "false": False}.get(value.strip().lower(), value)
+    return value
+
+
+def normalize_args(tool: str, args: Any) -> dict:
+    """``args`` coerced per the tool's FIELD_TYPES; idempotent on coerced args.
+
+    The ``pre_tool_call`` hook sees the model's raw args and the handler sees them
+    after Hermes's ``coerce_tool_args``; mirroring that coercion here (arrays, integers,
+    numbers, booleans, ``"null"`` for nullable fields) makes both digests agree.
     """
     if not isinstance(args, dict):
         return {}
-    fields = ARRAY_FIELDS.get(tool, frozenset())
-    return {k: (_as_array(v) if k in fields else v) for k, v in args.items()}
+    types = FIELD_TYPES.get(tool, {})
+    return {k: (_coerce(types[k], v) if k in types else v) for k, v in args.items()}
 
 
 def digest(tool: str, args: Any) -> str:
