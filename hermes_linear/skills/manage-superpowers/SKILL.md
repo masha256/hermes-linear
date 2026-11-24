@@ -19,17 +19,17 @@ The `linear_*` tools are deferred behind tool search. Load a schema with `tool_d
 (exact names), then call it with `tool_call`, one entry per call:
 `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])` (a batch of
 several plugin tools is rejected). Calling `linear_issue_get(...)` directly fails as an unknown
-tool. Below, `linear_x(...)` is shorthand — always call via `tool_call`. The eight tools:
+tool. Below, `linear_x(...)` is shorthand — always call via `tool_call`. The nine tools:
 
 - `linear_issue_get` (`id`, `comments?` = newest N threads): fields, relations, attachments, children.
-- `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`): in
-  the session ticket's team and project.
+- `linear_search` (`text?`, `team?`, `project?`, `state?`, `assignee?`, `label?`, `parent?`, …):
+  find issues (rows + `next_cursor`); complex filters go through `linear_query`.
+- `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`): session's team/project.
 - `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`,
   `remove_labels?`, `parent?`): `parent: ""` detaches; a cycle is `PARENT_CYCLE`.
 - `linear_comment` (`id`, `body`, `edit_marker?`).
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
-- `linear_task_state` (`id`, `state` = `in_progress | in_review | done | blocked |
-  unblocked`, `summary?`, `question?`).
+- `linear_task_state` (`id`, `state` = `in_progress|in_review|done|blocked|unblocked`, `summary?`, `question?`).
 - `linear_query` (`query`, `variables?`): read-only GraphQL; a result over 50,000 chars is refused.
 
 They act as the Linear app, never raise, fail as `{"ok": false, "error": …}` and are safe to

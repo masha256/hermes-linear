@@ -134,6 +134,26 @@ QUERY_ISSUE_THREADS = """query IssueThreads($id: String!, $first: Int!) {
   }
 }"""
 
+# ``linear_search`` rows (RET-120 §1.2): the node fields both queries return.
+_SEARCH_NODE = ("identifier title url updatedAt priority state { name } assignee { name } "
+                "delegate { name } project { name }")
+
+QUERY_SEARCH_ISSUES = """query SearchIssues($term: String!, $filter: IssueFilter,
+    $includeComments: Boolean, $first: Int!, $after: String) {
+  searchIssues(term: $term, filter: $filter, includeComments: $includeComments,
+               first: $first, after: $after) {
+    nodes { %s }
+    pageInfo { hasNextPage endCursor }
+  }
+}""" % _SEARCH_NODE
+
+QUERY_LIST_ISSUES = """query ListIssues($filter: IssueFilter, $first: Int!, $after: String) {
+  issues(filter: $filter, first: $first, after: $after, orderBy: updatedAt) {
+    nodes { %s }
+    pageInfo { hasNextPage endCursor }
+  }
+}""" % _SEARCH_NODE
+
 MUTATION_ISSUE_CREATE = """mutation IssueCreate($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier title url } }
 }"""
@@ -539,6 +559,28 @@ class LinearClient:
         in Linear's order. Null issue: ``NOT_FOUND``."""
         i = await self._issue_node(QUERY_ISSUE_THREADS, {"id": issue_id, "first": first})
         return self._nodes(i.get("comments"))
+
+    @staticmethod
+    def _connection(data: dict, key: str) -> dict:
+        conn = data.get(key)
+        if not isinstance(conn, dict):
+            raise LinearError(f"{key} returned no connection")
+        return conn
+
+    async def search_issues(self, term: str, filter: dict,  # noqa: A002 - SDL name
+                            include_comments: bool, first: int, after: str | None) -> dict:
+        """``searchIssues``: the raw connection ``{nodes, pageInfo}``."""
+        data = await self.gql(QUERY_SEARCH_ISSUES, {
+            "term": term, "filter": filter, "includeComments": include_comments,
+            "first": first, "after": after})
+        return self._connection(data, "searchIssues")
+
+    async def list_issues(self, filter: dict, first: int,  # noqa: A002 - SDL name
+                          after: str | None) -> dict:
+        """``issues`` ordered by ``updatedAt`` (newest first): the raw connection."""
+        data = await self.gql(QUERY_LIST_ISSUES,
+                              {"filter": filter, "first": first, "after": after})
+        return self._connection(data, "issues")
 
     async def issue_create(self, input: dict) -> dict:  # noqa: A002 - SDL argument name
         """``issueCreate``; returns ``{id, identifier, title, url}`` of the new issue."""

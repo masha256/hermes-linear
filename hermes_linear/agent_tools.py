@@ -1156,7 +1156,7 @@ _GATED_NOTE = ("Outside the session issue's tree (issues you did not create) the
                "returns APPROVAL_REQUIRED; call again with identical arguments to ask a human.")
 
 TOOL_SCHEMAS: dict[str, dict] = {
-    "linear_issue_get": {},  # first slot; filled from tools_read at the end of this module
+    "linear_issue_get": {},  # first slot; tools_read registers its schema here (Ruling R3)
     "linear_issue_create": {
         "name": "linear_issue_create",
         "description": ("Create a Linear issue as the Linear app, in the session issue's team "
@@ -1267,7 +1267,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
-    "linear_issue_get": None,  # type: ignore[dict-item]  # filled from tools_read below
+    "linear_issue_get": None,  # type: ignore[dict-item]  # registered by tools_read (R3)
     "linear_issue_create": linear_issue_create,
     "linear_issue_update": linear_issue_update,
     "linear_comment": linear_comment,
@@ -1280,13 +1280,11 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_comment", "linear_issue_create", "linear_issue_get", "linear_issue_update",
-           "linear_query", "linear_sync_plan", "linear_sync_spec", "linear_task_state",
-           "resolve_context", "resolve_state", "run_on_adapter"]
+           "linear_query", "linear_search", "linear_sync_plan", "linear_sync_spec",
+           "linear_task_state", "resolve_context", "resolve_state", "run_on_adapter"]
 
-# Bottom import: the tool modules import this module's machinery (RET-120 spec §2.1).
-# ``update`` keeps each existing key's slot, so ``linear_issue_get`` stays first.
-from . import tools_read as _tools_read  # noqa: E402
-
-TOOL_SCHEMAS.update(_tools_read.SCHEMAS)
-TOOL_HANDLERS.update(_tools_read.HANDLERS)
-linear_issue_get = _tools_read.linear_issue_get
+# Bottom import: the tool modules import this module's machinery (RET-120 spec §2.1) and
+# register themselves into TOOL_SCHEMAS / TOOL_HANDLERS and this module's namespace at
+# their own end, so either module can be imported first (Ruling R3). No attribute access
+# here: a tool module imported first is still partially initialized at this point.
+from . import tools_read  # noqa: E402,F401

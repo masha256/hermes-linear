@@ -452,6 +452,50 @@ async def test_issue_threads_null_issue_is_not_found(fake, client):
     assert ei.value.code == "NOT_FOUND"
 
 
+SEARCH_FIELDS = ("identifier", "title", "url", "updatedAt", "priority", "state { name }",
+                 "assignee { name }", "delegate { name }", "project { name }",
+                 "pageInfo { hasNextPage endCursor }")
+SEARCH_CONN = {"nodes": [{"identifier": "RET-1", "title": "T", "url": "u", "updatedAt": "t",
+                          "priority": 0, "state": {"name": "Todo"}, "assignee": None,
+                          "delegate": None, "project": None}],
+               "pageInfo": {"hasNextPage": True, "endCursor": "e1"}}
+
+
+async def test_search_issues_query(fake, client):
+    fake.on("SearchIssues", {"data": {"searchIssues": SEARCH_CONN}})
+    flt = {"team": {"key": {"eq": "RET"}}}
+    assert await client.search_issues("attach", flt, True, 7, "c1") == SEARCH_CONN
+    (call,) = fake.gql_calls("SearchIssues")
+    assert call.variables == {"term": "attach", "filter": flt, "includeComments": True,
+                              "first": 7, "after": "c1"}
+    q = " ".join(call.json["query"].split())
+    assert ("searchIssues(term: $term, filter: $filter, includeComments: $includeComments, "
+            "first: $first, after: $after)") in q
+    for field in SEARCH_FIELDS:
+        assert field in q, field
+
+
+async def test_list_issues_query(fake, client):
+    fake.on("ListIssues", {"data": {"issues": SEARCH_CONN}})
+    assert await client.list_issues({}, 25, None) == SEARCH_CONN
+    (call,) = fake.gql_calls("ListIssues")
+    assert call.variables == {"filter": {}, "first": 25, "after": None}
+    q = " ".join(call.json["query"].split())
+    assert "issues(filter: $filter, first: $first, after: $after, orderBy: updatedAt)" in q
+    for field in SEARCH_FIELDS:
+        assert field in q, field
+
+
+@pytest.mark.parametrize("op, key", [("SearchIssues", "searchIssues"), ("ListIssues", "issues")])
+async def test_search_and_list_missing_connection_is_linear_error(fake, client, op, key):
+    fake.on(op, {"data": {key: None}})
+    with pytest.raises(LinearError):
+        if op == "SearchIssues":
+            await client.search_issues("x", {}, False, 1, None)
+        else:
+            await client.list_issues({}, 1, None)
+
+
 async def test_client_issue_get_null_is_not_found(fake, client):
     fake.on("IssueGet", {"data": {"issue": None}})
     with pytest.raises(LinearError) as ei:
