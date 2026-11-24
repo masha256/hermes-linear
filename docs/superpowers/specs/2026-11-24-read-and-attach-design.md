@@ -317,8 +317,13 @@ Live, as the app, before the plan's tasks rely on these:
    "<size>,<size>"` (the PUT must carry exactly the declared size) and
    `Content-Disposition: attachment; filename="<name>"`. Nothing is refused up to 500 MB,
    so `ATTACH_MAX_BYTES` stays 50 MB, bounded by the 120 s budget rather than by Linear.
-3. Whether `addedExternalUrls` de-duplicates a repeated URL. Pin the observed behaviour
-   in a test and document it in the tool description.
+3. ✅ (2026-11-24, on RET-92) Whether `addedExternalUrls` de-duplicates a repeated URL.
+   It does. On the app's completed agent session on RET-92, two identical
+   `agentSessionUpdate(input: {addedExternalUrls: [{label: "Probe", url: …}]})` calls
+   both returned `success: true` (a completed session accepts the update), and
+   `agentSession { externalUrls }` then held one entry. `externalUrls` reads back as a
+   JSON-encoded string. So the tool passes every call through, and its description says
+   "Re-adding the same URL is a no-op" (pinned by `test_session_link_schema`).
 4. ✅ (2026-11-24, on RET-92) `attachmentLinkURL` and `attachmentLinkGitHubPR` as the
    app: the return shape, and whether re-linking the same URL updates the attachment or
    adds a duplicate. Both return `{success, lastSyncId, attachment {…}}` and accept an

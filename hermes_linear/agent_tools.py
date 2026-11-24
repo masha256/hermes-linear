@@ -1275,9 +1275,9 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_attach", "linear_comment", "linear_issue_create", "linear_issue_get",
-           "linear_issue_update", "linear_query", "linear_search", "linear_sync_plan",
-           "linear_sync_spec", "linear_task_state", "resolve_context", "resolve_state",
-           "run_on_adapter"]
+           "linear_issue_update", "linear_query", "linear_search", "linear_session_link",
+           "linear_sync_plan", "linear_sync_spec", "linear_task_state", "resolve_context",
+           "resolve_state", "run_on_adapter"]
 
 # Bottom import: the tool modules import this module's machinery (RET-120 spec §2.1) and
 # register themselves into TOOL_SCHEMAS / TOOL_HANDLERS and this module's namespace at

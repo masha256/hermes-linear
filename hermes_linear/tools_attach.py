@@ -163,6 +163,38 @@ linear_attach = agent_tools._tool(_parse_attach, _attach, gated="linear_attach",
                                   blocking_parse=True, timeout_s=PLAN_SYNC_TIMEOUT_S)
 
 
+# -- linear_session_link (RET-135; spec §1.4, §2.5)
+
+def _parse_session_link(args: dict) -> dict:
+    url = agent_tools._req_str(args, "url").strip()
+    if not _http_url(url):
+        raise _Refusal("BAD_ARGS")
+    label = None
+    if args.get("label") is not None:
+        label = agent_tools._req_str(args, "label")  # blank → BAD_ARGS
+    if label is None:
+        label = "Pull request" if GITHUB_PR_RE.match(url) else urlsplit(url).hostname or url
+    return {"url": url, "label": label}
+
+
+async def _session_link(ctx: agent_tools.ToolContext, a: dict) -> dict:
+    """Add ``{label, url}`` to the current turn's own agent session. No issue is targeted,
+    so there is no scope check. Called directly, not through the activity write queue: an
+    external URL is not an activity, so its order doesn't matter. Linear de-duplicates a
+    re-added URL (spec §4 item 3)."""
+    turns = getattr(ctx.adapter, "turns", None)
+    found = turns.turn_for_session_key(ctx.session_key) if turns is not None else None
+    if found is None:
+        raise _Refusal("NOT_LINEAR_SESSION")  # Slack, cron, a subagent, another session
+    sid = found[1].decision.agent_session_id
+    await ctx.client.update_session(sid, added_external_urls=[{"label": a["label"],
+                                                               "url": a["url"]}])
+    return {"ok": True, "agent_session_id": sid, "label": a["label"], "url": a["url"]}
+
+
+linear_session_link = agent_tools._tool(_parse_session_link, _session_link)
+
+
 def _prop(type_: str, description: str) -> dict:
     return {"type": type_, "description": description}
 
@@ -185,9 +217,22 @@ SCHEMAS: dict[str, dict] = {
             "embed": _prop("boolean", "With path and no id: upload only, return markdown."),
         }},
     },
+    "linear_session_link": {
+        "name": "linear_session_link",
+        "description": (
+            "Add a link (usually the PR) to the current Linear agent session as the Linear "
+            "app; it shows on the session in Linear. Only in a Linear ticket thread "
+            "(NOT_LINEAR_SESSION otherwise). Re-adding the same URL is a no-op."),
+        "parameters": {"type": "object", "properties": {
+            "url": _prop("string", "http(s) URL to link."),
+            "label": _prop("string", "Link label (default: \"Pull request\" for a GitHub PR "
+                                     "URL, else the URL's host)."),
+        }, "required": ["url"]},
+    },
 }
 
-HANDLERS: dict[str, Callable[..., dict]] = {"linear_attach": linear_attach}
+HANDLERS: dict[str, Callable[..., dict]] = {"linear_attach": linear_attach,
+                                            "linear_session_link": linear_session_link}
 
 # Register with ``agent_tools`` (Ruling R3).
 agent_tools.TOOL_SCHEMAS.update(SCHEMAS)

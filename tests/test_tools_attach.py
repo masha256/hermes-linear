@@ -16,8 +16,9 @@ import pytest
 
 from conftest import REPO_ROOT
 from test_agent_tools_generic import SELF, adapter, loop, pin_ctx, ws  # noqa: F401 - fixtures
+from test_agent_tools_runtime import put_turn
 
-from hermes_linear import agent_tools, plugin, tools_attach
+from hermes_linear import agent_tools, plugin, tool_approval, tools_attach
 from hermes_linear.agent_tools import TOOL_HANDLERS, TOOL_SCHEMAS
 from hermes_linear.linear_client import LinearError, UploadError
 from hermes_linear.tool_approval import digest
@@ -445,7 +446,8 @@ def test_schema():
     assert all(props[k]["type"] == "string" for k in ("id", "path", "url", "title", "subtitle"))
     assert all(p.get("description") for p in props.values())
     assert agent_tools.linear_attach is TOOL_HANDLERS["linear_attach"]
-    assert tools_attach.HANDLERS == {"linear_attach": TOOL_HANDLERS["linear_attach"]}
+    assert tools_attach.HANDLERS == {"linear_attach": TOOL_HANDLERS["linear_attach"],
+                                     "linear_session_link": TOOL_HANDLERS["linear_session_link"]}
     assert "linear_attach" in agent_tools.__all__
 
 
@@ -462,3 +464,106 @@ def test_roster_merge_any_import_order(imports):
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "linear_issue_get True True"
+
+
+# -- linear_session_link (RET-135; spec §1.4, §2.5)
+#
+# ``put_turn(adapter, "sk", SELF)`` puts a Linear turn in flight under session key ``sk``
+# with agent session ``sid-m1``; ``pin_ctx`` resolves every call to key ``sk``.
+
+def linear_session_link(args):
+    return TOOL_HANDLERS["linear_session_link"](args)
+
+
+@pytest.fixture
+def sessions(ws):
+    """Record ``update_session`` calls on the fake workspace (it has no session model)."""
+    seen: list[tuple] = []
+
+    async def update_session(sid, *, plan=None, external_urls=None, added_external_urls=None):
+        seen.append((sid, plan, external_urls, added_external_urls))
+
+    ws.update_session = update_session
+    return seen
+
+
+def test_links_current_turn_session(pin_ctx, adapter, sessions):
+    put_turn(adapter, "sk", SELF)
+    out = linear_session_link({"url": PR})
+    assert sessions == [("sid-m1", None, None, [{"label": "Pull request", "url": PR}])]
+    assert out == {"ok": True, "agent_session_id": "sid-m1", "label": "Pull request", "url": PR}
+
+
+def test_label_defaults_to_host(pin_ctx, adapter, sessions):
+    put_turn(adapter, "sk", SELF)
+    out = linear_session_link({"url": "https://docs.example.com/x"})
+    assert out["ok"] is True and out["label"] == "docs.example.com"
+    assert sessions[-1][3] == [{"label": "docs.example.com", "url": "https://docs.example.com/x"}]
+    out = linear_session_link({"url": PR, "label": "The fix"})
+    assert out["label"] == "The fix"
+    assert sessions[-1][3] == [{"label": "The fix", "url": PR}]
+
+
+def test_repeat_passes_through(pin_ctx, adapter, sessions):
+    """Linear de-duplicates a re-added URL (spec §4 item 3), so the tool doesn't track it."""
+    put_turn(adapter, "sk", SELF)
+    assert linear_session_link({"url": PR})["ok"] is True
+    assert linear_session_link({"url": PR})["ok"] is True
+    assert len(sessions) == 2
+
+
+def test_no_turn_is_not_linear_session(pin_ctx, adapter, sessions):
+    assert linear_session_link({"url": PR}) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    pin_ctx(linear=False)  # Slack, cron, a subagent: no session key
+    put_turn(adapter, "sk", SELF)
+    assert linear_session_link({"url": PR}) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert sessions == []
+
+
+def test_other_session_key_is_not_linear_session(pin_ctx, adapter, sessions):
+    put_turn(adapter, "sk", SELF)
+    pin_ctx(key="other")
+    assert linear_session_link({"url": PR}) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert sessions == []
+
+
+@pytest.mark.parametrize("args", [
+    {"url": "ftp://example.com/x"}, {"url": "javascript:alert(1)"}, {"url": ""},
+    {"url": "https://"}, {}, {"url": 7}, {"url": PR, "label": 3}, {"url": PR, "label": ""},
+])
+def test_non_http_url_bad_args(pin_ctx, adapter, sessions, args):
+    put_turn(adapter, "sk", SELF)
+    assert linear_session_link(args) == {"ok": False, "error": "BAD_ARGS"}
+    assert sessions == []
+
+
+def test_linear_error_passthrough(pin_ctx, adapter, ws):
+    async def limited(sid, **kw):
+        raise LinearError("slow down", code="RATELIMITED")
+
+    ws.update_session = limited
+    put_turn(adapter, "sk", SELF)
+    assert linear_session_link({"url": PR}) == {"ok": False, "error": "RATELIMITED"}
+
+
+def test_session_link_registry_returns_str(pin_ctx, adapter, sessions):
+    put_turn(adapter, "sk", SELF)
+    raw = plugin.tool_handler("linear_session_link")({"url": PR})
+    assert isinstance(raw, str) and json.loads(raw)["agent_session_id"] == "sid-m1"
+    raw = plugin.tool_handler("linear_session_link")({"url": "ftp://x"})
+    assert json.loads(raw) == {"ok": False, "error": "BAD_ARGS"}
+
+
+def test_session_link_schema():
+    s = TOOL_SCHEMAS["linear_session_link"]
+    assert s["name"] == "linear_session_link" and "Linear app" in s["description"]
+    assert "no-op" in s["description"]  # spec §4 item 3: Linear de-duplicates
+    assert agent_tools._GATED_NOTE not in s["description"]
+    params = s["parameters"]
+    assert params["required"] == ["url"]
+    assert list(params["properties"]) == ["url", "label"]
+    assert all(p["type"] == "string" and p.get("description")
+               for p in params["properties"].values())
+    assert agent_tools.linear_session_link is TOOL_HANDLERS["linear_session_link"]
+    assert "linear_session_link" in agent_tools.__all__
+    assert "linear_session_link" not in tool_approval.GATED_TOOLS
