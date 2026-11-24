@@ -48,6 +48,19 @@ SKILL_PATH = Path(__file__).parent / "skills" / SKILL_NAME / "SKILL.md"
 REQUIRED_ENV = [CLIENT_SECRET_KEY, WEBHOOK_SECRET_KEY]
 INSTALL_HINT = "run `hermes linear setup` to store the Linear client and webhook secrets"
 
+# Channels-page card (web dashboard + Desktop; Hermes hermes_cli/web_server_messaging.py).
+# The card edits env vars only; client_id is a plugin setting, so the description says where
+# it goes. ``dashboard_required_env`` stays unset: "configured" = REQUIRED_ENV.
+DASHBOARD_DESCRIPTION = (
+    "One Hermes session per delegated Linear ticket. The card holds the secrets and the "
+    "allowlist; client_id goes in plugins.entries.linear.settings (Config page, raw YAML) "
+    "or run `hermes linear setup`."
+)
+DOCS_URL = "https://github.com/masha256/hermes-linear#web-dashboard"
+#: No ALLOW_ALL_USERS_ENV: Hermes hides every ``*_ALLOW_ALL_USERS`` from setup forms on purpose
+#: (hermes_cli/setup_hidden_env.py: enabling it is a security decision).
+DASHBOARD_ENV_VARS = (*REQUIRED_ENV, ALLOWED_USERS_ENV)
+
 #: Secret reader (module-level so tests can swap it). Profile-scope aware.
 get_secret: Callable[..., Any] = get_scoped_secret
 
@@ -147,6 +160,9 @@ def register(ctx) -> None:
         validate_config=validate_config,
         required_env=list(REQUIRED_ENV),
         install_hint=INSTALL_HINT,
+        dashboard_description=DASHBOARD_DESCRIPTION,
+        docs_url=DOCS_URL,
+        dashboard_env_vars=DASHBOARD_ENV_VARS,
         allowed_users_env=ALLOWED_USERS_ENV,
         allow_all_env=ALLOW_ALL_USERS_ENV,
         setup_fn=setup_fn,
