@@ -57,6 +57,7 @@ def _rels(ws):
 def test_schema_and_registration():
     s = TOOL_SCHEMAS["linear_relation"]
     assert s["name"] == "linear_relation" and "Linear app" in s["description"]
+    assert "RELATION_CONFLICT" in s["description"] and "replaces" not in s["description"]
     assert "APPROVAL_REQUIRED" in s["description"]
     props = s["parameters"]["properties"]
     assert list(props) == ["id", "type", "other"]
@@ -114,12 +115,20 @@ def test_already_related_same_direction(pin_ctx, ws):
     assert ws.writes() == []
 
 
+def _conflict(rid, type_, direction):
+    return {"ok": False, "error": "RELATION_CONFLICT",
+            "existing": {"relation_id": rid, "type": type_, "direction": direction}}
+
+
 def test_already_related_blocks_direction(pin_ctx, ws):
-    """The reverse ``blocks`` is not a match: it is created (Linear replaces the old one)."""
+    """Ruling R9: the reverse ``blocks`` is not a match. Linear would replace it, so it is
+    RELATION_CONFLICT (direction relative to ``id``) and nothing is written."""
     old = ws.add_relation(CHILD2, CHILD, "blocks")
     out = linear_relation({"id": "RET-2", "type": "blocks", "other": "RET-3"})
-    assert out["ok"] is True and out["relation_id"] != old
-    assert _creates(ws) == [(CHILD, CHILD2, "blocks")]
+    assert out == _conflict(old, "blocks", "inbound")
+    out = linear_relation({"id": "RET-3", "type": "blocked_by", "other": "RET-2"})
+    assert out == _conflict(old, "blocks", "outbound")
+    assert ws.writes() == [] and _rels(ws) == [(CHILD2, CHILD, "blocks")]
 
 
 def test_already_related_related_either_way(pin_ctx, ws):
@@ -131,13 +140,30 @@ def test_already_related_related_either_way(pin_ctx, ws):
 
 
 def test_already_related_duplicate_direction(pin_ctx, ws):
-    ws.add_relation(CHILD2, CHILD, "duplicate")  # RET-3 is the duplicate of RET-2
+    old = ws.add_relation(CHILD2, CHILD, "duplicate")  # RET-3 is the duplicate of RET-2
     out = linear_relation({"id": "RET-2", "type": "duplicate_of", "other": "RET-3"})
-    assert out["ok"] is True and _creates(ws) == [(CHILD, CHILD2, "duplicate")]
+    assert out == _conflict(old, "duplicate", "inbound")
+    assert ws.writes() == [] and _rels(ws) == [(CHILD2, CHILD, "duplicate")]
 
 
-def test_other_type_is_not_a_match(pin_ctx, ws):
-    ws.add_relation(CHILD, CHILD2, "related")
+@pytest.mark.parametrize("seed, type_, direction", [
+    ((CHILD, CHILD2, "related"), "blocks", "outbound"),
+    ((CHILD2, CHILD, "related"), "duplicate_of", "inbound"),
+    ((CHILD, CHILD2, "blocks"), "related", "outbound"),
+    ((CHILD, CHILD2, "blocks"), "duplicate_of", "outbound"),
+    ((CHILD2, CHILD, "duplicate"), "blocked_by", "inbound"),
+    ((CHILD, CHILD2, "similar"), "related", "outbound"),  # Linear's own type
+    ((CHILD2, CHILD, "similar"), "blocks", "inbound"),
+])
+def test_other_type_is_a_conflict(pin_ctx, ws, seed, type_, direction):
+    old = ws.add_relation(*seed)
+    out = linear_relation({"id": "RET-2", "type": type_, "other": "RET-3"})
+    assert out == _conflict(old, seed[2], direction)
+    assert ws.writes() == [] and _rels(ws) == [seed]
+
+
+def test_relation_with_a_third_issue_is_no_conflict(pin_ctx, ws):
+    ws.add_relation(CHILD, SELF, "related")
     out = linear_relation({"id": "RET-2", "type": "blocks", "other": "RET-3"})
     assert out["ok"] is True and _creates(ws) == [(CHILD, CHILD2, "blocks")]
 
@@ -209,6 +235,18 @@ def test_out_of_scope_other_needs_approval_writes_nothing(pin_ctx, ws, adapter, 
     assert ws.writes() == []
     req = adapter._store.request("sk", digest("linear_relation", args))
     assert req is not None and req.targets == targets and req.tool == "linear_relation"
+
+
+@pytest.mark.parametrize("args, direction", [
+    ({"id": "RET-2", "type": "blocks", "other": "OTH-9"}, "inbound"),
+    ({"id": "OTH-9", "type": "related", "other": "RET-2"}, "outbound"),
+])
+def test_out_of_scope_conflict_needs_no_approval(pin_ctx, ws, adapter, args, direction):
+    """The conflict is a read before ``_check_gate``: refused without asking anyone."""
+    old = ws.add_relation(OTHER, CHILD, "blocks")
+    assert linear_relation(dict(args)) == _conflict(old, "blocks", direction)
+    assert ws.writes() == []
+    assert adapter._store.request("sk", digest("linear_relation", args)) is None
 
 
 def test_approved_rerun_writes_once(pin_ctx, ws, adapter):

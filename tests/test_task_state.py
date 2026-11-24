@@ -405,6 +405,30 @@ def test_blocked_by_existing_relation_not_created(pin_ctx, ws, blocker):
     assert _kinds(ws) == ["issue_update"]
 
 
+@pytest.mark.parametrize("seed, direction", [
+    ((TASK, BLOCKER, "blocks"), "inbound"),  # the reverse: the task blocks the blocker
+    ((BLOCKER, TASK, "related"), "outbound"),
+    ((TASK, BLOCKER, "duplicate"), "inbound"),
+    ((BLOCKER, TASK, "similar"), "outbound"),
+])
+def test_blocked_by_conflict_refused_before_writes(pin_ctx, ws, blocker, seed, direction):
+    """Ruling R9 / §1.6: the relation check runs before the label; a conflict writes
+    nothing (no label, no comment) and replaces nothing."""
+    old = ws.add_relation(*seed)
+    for args in ({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3"},
+                 {"id": "RET-2", "state": "blocked", "blocked_by": "RET-3", "question": "q"}):
+        assert linear_task_state(args) == {
+            "ok": False, "error": "RELATION_CONFLICT",
+            "existing": {"relation_id": old, "type": seed[2], "direction": direction}}
+    assert ws.writes() == [] and ws.comments == {}
+    assert ws.issues[TASK]["labels"] == [] and _relations(ws) == [seed]
+
+
+def test_blocked_by_reads_relations_once(pin_ctx, ws, blocker):
+    linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3"})
+    assert [c[1] for c in ws.calls if c[0] == "issue_relations"] == [BLOCKER]
+
+
 def test_blocked_by_out_of_tree_refused_before_writes(pin_ctx, ws, adapter):
     """The tool stays tree-only: an out-of-tree blocker is OUT_OF_SCOPE, no approval asked
     and zero writes (not even the label)."""

@@ -35,12 +35,12 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The tw
 - `linear_session_link` (`url`, `label?`): show a link (the PR) on this turn's agent session.
 - `linear_relation` (`id`, `type`: `blocks|blocked_by|related|duplicate_of`, `other`).
 
-They act as the Linear app, never raise and fail as `{"ok": false, "error": …}`. Re-runs are safe
-(a URL re-link is `ALREADY_LINKED`, a relation `ALREADY_RELATED`; session links de-duplicate),
-except that a `path` attach adds a second copy. Writes to the session ticket, its descendants and
-tickets made from it (any turn) just run. Out of that scope `linear_comment`, `linear_issue_create`,
-`linear_issue_update`, `linear_attach` and `linear_relation` answer `APPROVAL_REQUIRED`; an
-identical re-call asks a human in Linear.
+They act as the Linear app, never raise and fail as `{"ok": false, "error": …}`. Re-runs are safe (a
+URL re-link is `ALREADY_LINKED`, a relation `ALREADY_RELATED`, any other one between the pair
+`RELATION_CONFLICT`; session links de-duplicate), except that a `path` attach adds a second copy.
+Writes to the session ticket, its descendants and tickets made from it (any turn) just run. Out of
+that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `linear_attach` and
+`linear_relation` answer `APPROVAL_REQUIRED`; an identical re-call asks a human in Linear.
 
 ## Questions and approvals
 

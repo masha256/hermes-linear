@@ -35,24 +35,60 @@ def _is_match(rel: dict, linear_type: str, src: str, dst: str) -> bool:
     return ends == (src, dst) or (linear_type == "related" and ends == (dst, src))
 
 
+def _ends(issue: dict, other: dict, type: str) -> tuple[str, str, str]:  # noqa: A002
+    """``(linear_type, src, dst)`` for ``issue`` <type> ``other``; self is ``BAD_ARGS``."""
+    if issue["id"] == other["id"]:
+        raise _Refusal("BAD_ARGS")
+    linear_type, swapped = _LINEAR_TYPE[type]
+    if swapped:
+        return linear_type, other["id"], issue["id"]
+    return linear_type, issue["id"], other["id"]
+
+
+async def check_relation(ctx: agent_tools.ToolContext, issue: dict, other: dict,
+                         type: str) -> str | None:  # noqa: A002
+    """The id of the existing ``issue`` <type> ``other`` relation, else ``None``. A read.
+
+    Reads ``issue``'s relations (both directions). Linear keeps one relation per pair and
+    silently replaces it on a create of another type or direction, so any other relation
+    between the two (another type, the other direction, Linear's ``similar``) raises
+    ``RELATION_CONFLICT`` with ``existing: {relation_id, type, direction}`` (Ruling R9;
+    ``direction`` relative to ``issue``: ``outbound`` if the relation's issue is ``issue``).
+    No gate: callers run it before any write, so a refusal needs no approval.
+    """
+    linear_type, src, dst = _ends(issue, other, type)
+    for rel in await ctx.client.issue_relations(issue["id"]):
+        if {rel.get("issue_id"), rel.get("related_id")} != {src, dst} or not rel.get("id"):
+            continue
+        if _is_match(rel, linear_type, src, dst):
+            return rel["id"]
+        raise _Refusal("RELATION_CONFLICT", extra={"existing": {
+            "relation_id": rel["id"], "type": rel.get("type"),
+            "direction": "outbound" if rel.get("issue_id") == issue["id"] else "inbound"}})
+    return None
+
+
+async def create_relation(ctx: agent_tools.ToolContext, issue: dict, other: dict,
+                          type: str) -> str:  # noqa: A002
+    """Create ``issue`` <type> ``other`` after ``_check_gate`` (a gated first pass stops
+    here, writing nothing). Only after ``check_relation`` returned ``None``."""
+    linear_type, src, dst = _ends(issue, other, type)
+    agent_tools._check_gate(ctx)
+    return await ctx.client.relation_create(src, dst, linear_type)
+
+
 async def ensure_relation(ctx: agent_tools.ToolContext, issue: dict, other: dict,
                           type: str) -> tuple[str, bool]:  # noqa: A002
     """``issue`` <type> ``other`` (agent types, ``RELATION_TYPES``): ``(relation_id, created)``.
 
-    Reads ``issue``'s relations (both directions) first; a match returns its id with
-    ``created=False`` and writes nothing. Otherwise ``_check_gate`` (a gated first pass
-    stops here, so it writes nothing) and then the create. Both ends must already be
-    scope-checked by the caller. ``issue`` equal to ``other`` is ``BAD_ARGS``.
+    ``check_relation`` first (an existing match returns its id with ``created=False``; a
+    conflict refuses), then ``create_relation``. Both ends must already be scope-checked
+    by the caller. ``issue`` equal to ``other`` is ``BAD_ARGS``.
     """
-    if issue["id"] == other["id"]:
-        raise _Refusal("BAD_ARGS")
-    linear_type, swapped = _LINEAR_TYPE[type]
-    src, dst = (other["id"], issue["id"]) if swapped else (issue["id"], other["id"])
-    for rel in await ctx.client.issue_relations(issue["id"]):
-        if _is_match(rel, linear_type, src, dst) and rel.get("id"):
-            return rel["id"], False
-    agent_tools._check_gate(ctx)
-    return await ctx.client.relation_create(src, dst, linear_type), True
+    rid = await check_relation(ctx, issue, other, type)
+    if rid is not None:
+        return rid, False
+    return await create_relation(ctx, issue, other, type), True
 
 
 def _parse_relation(args: dict) -> dict:
@@ -89,7 +125,9 @@ SCHEMAS: dict[str, dict] = {
             "blocked_by (other blocks id), related, duplicate_of (id is a duplicate of "
             "other; Linear moves id to its Duplicate state). ALREADY_RELATED (with "
             "relation_id) if that relation exists. Linear keeps one relation per pair of "
-            "issues: another type or direction replaces the existing one. "
+            "issues, so any other relation between them (another type or direction) is "
+            "RELATION_CONFLICT with existing {relation_id, type, direction} and nothing "
+            "is written; a human changes it. "
             + agent_tools._GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": agent_tools._ISSUE_REF},

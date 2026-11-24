@@ -1203,12 +1203,17 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
     blocker = await _writable(ctx, a["blocked_by"]) if a["blocked_by"] else None
     if blocker is not None and blocker["id"] == task["id"]:
         raise _Refusal("BAD_ARGS")
+    rid = None
+    if blocker is not None:  # RELATION_CONFLICT refuses before any write (Ruling R9)
+        # ``tools_relation`` is bottom-imported (R3): bound by the time any tool runs
+        rid = await tools_relation.check_relation(ctx, blocker, task, "blocks")
     if label is not None and not carried:
         await client.issue_update(task["id"], {"addedLabelIds": [label]})
     rel: dict[str, Any] = {}
     if blocker is not None:  # an existing relation is kept: a re-run writes nothing
-        from .tools_relation import ensure_relation  # bottom-imported module (R3)
-        rid, created = await ensure_relation(ctx, blocker, task, "blocks")
+        created = rid is None
+        if created:
+            rid = await tools_relation.create_relation(ctx, blocker, task, "blocks")
         rel = {"relation_id": rid, "relation_created": created}
     if a["question"]:
         await client.comment_create(
