@@ -1405,8 +1405,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "new one. With reply_to, reply in that comment's thread; resolve: true "
                         "also resolves the thread (needs reply_to; not with edit_marker). "
                         "With reply_to, the result's thread_id is the thread and resolved "
-                        "its current state (already_resolved: true if it was resolved "
-                        "before). " + _GATED_NOTE),
+                        "its current state; with resolve: true on a thread resolved "
+                        "before, also already_resolved: true. " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "body": {"type": "string", "description": "Markdown."},

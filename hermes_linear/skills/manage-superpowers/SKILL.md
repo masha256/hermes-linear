@@ -66,9 +66,10 @@ that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `line
 
 1. `linear_issue_get` the session ticket: its identifier, team (key: `RET-81` → `RET`), project.
 2. Framework: select via `clarify`; the only choice is `superpowers`.
-3. Repo: a GitHub project link (`externalLinks`, step 1; the one labelled `repo` among several),
-   confirmed as a select even when alone. None: ask (select of local clones plus "Other") and
-   suggest the user add a project link labelled `repo` (tools can't edit projects).
+3. Repo: a GitHub link among the project's links (`externalLinks`, step 1) is a candidate;
+   the link labelled `repo` wins among several. Offer the result as a select (one repo is
+   still confirmed). With no GitHub link, ask in the ticket (select of known local clones plus
+   "Other") and suggest the user add a project link labelled `repo` (tools can't edit projects).
 4. Find a clone whose `origin` matches (workspace, then `~/git/*`); else clone to `~/git/<name>`.
 5. Branch `<identifier lowercase>-<slug>` (e.g. `ret-95-secret-reload`), worked in
    `.worktrees/<branch>`; load `superpowers:using-git-worktrees` for the mechanics.
@@ -112,7 +113,7 @@ names its sub-ticket, and commit messages carry the sub-ticket ID. Task progress
 on the sub-tickets; the project thread gets only stage changes, stop points and
 questions (a turn that only moves a task along ends with a one-line reply). Then:
 - dispatching a task's implementer: `linear_task_state(id, "in_progress")`; its review: `in_review`;
-- a fix round: back to `in_progress` (then `in_review`); `linear_comment` the findings on the task;
+- a fix round: back to `in_progress` (then `in_review`); `linear_comment` findings on the sub-ticket;
 - the clean review: `done` with `summary` (commits, test result, review verdict, number
   of fix rounds, deferred minors as a `- [ ]` checklist);
 - anything that needs the user: `blocked` with `question` (it posts the question; don't repeat
@@ -131,10 +132,9 @@ then end with the final reply (PR link and a short summary).
 When brainstorming decomposes the work into sub-projects, the current ticket becomes the
 umbrella: it holds the decomposition and build order. Create one top-level ticket per
 sub-project with `linear_issue_create` (no `parent`; same project; link the umbrella in its
-description). Each sub-project runs its own cycle in its own session. The tools can set a
-delegate, but a delegation by the app starts no session: when a sub-project's turn comes, ask
-the user in the umbrella ticket to delegate its ticket to the app (never via other Linear
-tools or MCP servers; they act as the user).
+description). Each runs its own cycle in its own session. The tools can set a delegate, but a
+delegation by the app starts no session: at a sub-project's turn, ask the user in the umbrella
+ticket to delegate it to the app (never via other Linear tools or MCP servers; they act as the user).
 
 ## Rules
 
