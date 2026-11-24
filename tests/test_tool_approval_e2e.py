@@ -309,3 +309,34 @@ async def test_e2e_coerced_array_arg_digests_agree(e2e):
     assert out["ok"] is True, out
     assert ws.issues[OTHER]["labels"] == ["lb-bug"]
     assert store.request(SK, d) is None
+
+
+async def test_out_of_scope_attach_end_to_end(e2e, tmp_path, monkeypatch):
+    """RET-134: an out-of-scope ``linear_attach`` of a file goes through the same approval
+    path. The first call uploads nothing; the identical re-call asks in Linear, and after
+    "Allow once" the upload and the attach run exactly once. The file is a real tmp file
+    judged by the real ``validate_media_delivery_path`` (HOME moved under ``tmp_path``)."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
+    h, a, client, gw, store, ws, config = e2e
+    f = tmp_path / "shot.png"
+    f.write_bytes(b"\x89PNG")
+    tool, args = "linear_attach", {"id": "OTH-9", "path": str(f)}
+    first = await h.run(tool, args, cid="c-first")
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert ws.writes() == []
+    d = tool_approval.digest(tool, args)
+    assert store.request(SK, d) is not None
+    task = asyncio.create_task(h.run(tool, args, cid="c-again"))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert data["command"] == f"<{tool}> (plugin approval rule)"
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []  # still nothing while the human is asked
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out["ok"] is True and out["issue"] == "OTH-9", out
+    assert [c[0] for c in ws.writes()] == ["file_upload", "attachment_create"]
+    [att] = ws.attachments.values()
+    assert att["issue"] == OTHER and att["url"] == out["asset_url"] and att["title"] == "shot.png"
+    assert store.request(SK, d) is None

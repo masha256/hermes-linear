@@ -13,7 +13,8 @@ import json
 import re
 from typing import Any
 
-GATED_TOOLS = frozenset({"linear_comment", "linear_issue_update", "linear_issue_create"})
+GATED_TOOLS = frozenset({"linear_comment", "linear_issue_update", "linear_issue_create",
+                         "linear_attach"})
 
 REQUIRED_TEXT = (
     "Not run: {targets} is outside this session's write scope. Call {tool} "
@@ -32,6 +33,7 @@ _GRANT_RE = re.compile(r"^<([A-Za-z0-9_]+)> \(plugin approval rule\)#([0-9a-f]{1
 # Array-typed fields of the gated tools' schemas (agent_tools.TOOL_SCHEMAS; a test keeps
 # them in sync — importing agent_tools here would be a cycle).
 ARRAY_FIELDS: dict[str, frozenset[str]] = {
+    "linear_attach": frozenset(),
     "linear_comment": frozenset(),
     "linear_issue_create": frozenset({"labels"}),
     "linear_issue_update": frozenset({"add_labels", "remove_labels"}),

@@ -33,7 +33,7 @@ from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
 from . import graphql_guard, sync, tool_approval
-from .constants import TOOL_TIMEOUT_S
+from .constants import PLAN_SYNC_TIMEOUT_S, TOOL_TIMEOUT_S
 from .linear_client import LinearError
 
 log = logging.getLogger(__name__)
@@ -597,17 +597,6 @@ def _team_of(issue: dict) -> str:
     return team
 
 
-# -- linear_issue_get
-
-
-def _parse_get(args: dict) -> dict:
-    return {"id": _req_str(args, "id")}
-
-
-async def _get(ctx: ToolContext, a: dict) -> dict:
-    return {"ok": True, "issue": await ctx.client.issue_get(a["id"])}
-
-
 # -- linear_issue_create
 
 
@@ -799,11 +788,6 @@ async def _sync_spec(ctx: ToolContext, a: dict) -> dict:
 # -- linear_sync_plan (RET-78)
 
 PLAN_MARKER = "plan"
-#: Loop-side budget for one plan sync. A ~30-task plan costs up to ~30 issue reads, ~30
-#: writes and a few comment calls, one GraphQL round trip each (0.3–1 s live): more than
-#: the generic TOOL_TIMEOUT_S (30 s). Every step is idempotent, so a TIMEOUT is retried
-#: safely (children are adopted by their ``T<n> ·`` title on the rerun).
-PLAN_SYNC_TIMEOUT_S = 120.0
 PLAN_SORT_STEP = 10  # subIssueSortOrder = PLAN_SORT_STEP * position (1-based)
 _CLOSED = {"completed", "canceled"}
 
@@ -1152,7 +1136,6 @@ async def _query(ctx: ToolContext, a: dict) -> dict:
     return {"ok": True, "data": data}
 
 
-linear_issue_get = _tool(_parse_get, _get)
 linear_issue_create = _tool(_parse_create, _create, gated="linear_issue_create")
 linear_issue_update = _tool(_parse_update, _update, gated="linear_issue_update")
 linear_comment = _tool(_parse_comment, _comment, gated="linear_comment")
@@ -1168,14 +1151,7 @@ _GATED_NOTE = ("Outside the session issue's tree (issues you did not create) the
                "returns APPROVAL_REQUIRED; call again with identical arguments to ask a human.")
 
 TOOL_SCHEMAS: dict[str, dict] = {
-    "linear_issue_get": {
-        "name": "linear_issue_get",
-        "description": ("Read a Linear issue as the Linear app: state, team, project and links, "
-                        "parent, labels and sub-issues."),
-        "parameters": {"type": "object", "properties": {"id": {"type": "string",
-                                                               "description": _ISSUE_REF}},
-                       "required": ["id"]},
-    },
+    "linear_issue_get": {},  # first slot; tools_read registers its schema here (Ruling R3)
     "linear_issue_create": {
         "name": "linear_issue_create",
         "description": ("Create a Linear issue as the Linear app, in the session issue's team "
@@ -1286,7 +1262,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
-    "linear_issue_get": linear_issue_get,
+    "linear_issue_get": None,  # type: ignore[dict-item]  # registered by tools_read (R3)
     "linear_issue_create": linear_issue_create,
     "linear_issue_update": linear_issue_update,
     "linear_comment": linear_comment,
@@ -1298,6 +1274,14 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
-           "linear_comment", "linear_issue_create", "linear_issue_get", "linear_issue_update",
-           "linear_query", "linear_sync_plan", "linear_sync_spec", "linear_task_state",
-           "resolve_context", "resolve_state", "run_on_adapter"]
+           "linear_attach", "linear_comment", "linear_issue_create", "linear_issue_get",
+           "linear_issue_update", "linear_query", "linear_search", "linear_session_link",
+           "linear_sync_plan", "linear_sync_spec", "linear_task_state", "resolve_context",
+           "resolve_state", "run_on_adapter"]
+
+# Bottom import: the tool modules import this module's machinery (RET-120 spec §2.1) and
+# register themselves into TOOL_SCHEMAS / TOOL_HANDLERS and this module's namespace at
+# their own end, so either module can be imported first (Ruling R3). No attribute access
+# here: a tool module imported first is still partially initialized at this point.
+from . import tools_read  # noqa: E402,F401
+from . import tools_attach  # noqa: E402,F401

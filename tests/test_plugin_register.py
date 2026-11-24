@@ -50,7 +50,8 @@ MARKER_SENTENCE = ("If the ticket says 'manage with hermes-linear', or the repo 
 SKILL_DESCRIPTION = "Use when a repo has .hermes-linear.yaml or ticket says so."
 SKILL_MD = REPO_ROOT / "hermes_linear" / "skills" / "manage-superpowers" / "SKILL.md"
 TOOL_NAMES = ["linear_issue_get", "linear_issue_create", "linear_issue_update", "linear_comment",
-              "linear_sync_spec", "linear_sync_plan", "linear_task_state", "linear_query"]
+              "linear_sync_spec", "linear_sync_plan", "linear_task_state", "linear_query",
+              "linear_search", "linear_attach", "linear_session_link"]
 
 
 class FakeCtx:
@@ -322,6 +323,15 @@ def test_skill_body_is_a_short_overlay_naming_every_tool():
     assert "tool_describe" in text and "tool_call" in text
     for stage in ("brainstorming", "writing-plans", "subagent-driven-development"):
         assert f"superpowers:{stage}" in text, stage
+
+
+def test_skill_finish_links_pr():
+    text = SKILL_MD.read_text()
+    _, _, rest = text.partition("**Finish.**")
+    finish = rest.split("\n## ", 1)[0]
+    assert finish, "no **Finish.** paragraph"
+    assert "`linear_session_link`" in finish
+    assert "`linear_attach`" in finish
 
 
 def test_skill_ships_as_package_data():

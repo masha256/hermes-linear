@@ -401,6 +401,101 @@ async def test_client_issue_get_shape(fake, client):
     assert i["parent"] == {"id": "uuid-0", "identifier": "RET-0"}
 
 
+DETAILS_NODE = {
+    "assignee": {"id": "u1", "name": "Mike"}, "delegate": None, "priority": 2,
+    "priorityLabel": "High", "estimate": 3, "dueDate": "2026-12-01",
+    "cycle": {"id": "c4", "number": 4, "name": "C4"}, "projectMilestone": None,
+    "relations": {"nodes": []}, "inverseRelations": {"nodes": []},
+    "attachments": {"nodes": [{"id": "a1", "title": "PR", "subtitle": None,
+                               "url": "https://e.test/a", "sourceType": "github"}]},
+}
+
+
+async def test_issue_details_query(fake, client):
+    fake.on("IssueDetails", {"data": {"issue": DETAILS_NODE}})
+    assert await client.issue_details("uuid-1") == DETAILS_NODE
+    (call,) = fake.gql_calls("IssueDetails")
+    assert call.variables == {"id": "uuid-1"}
+    q = call.json["query"]
+    for field in ("delegate { id name }", "priorityLabel", "projectMilestone { id name }",
+                  "relations(first: 50)", "inverseRelations(first: 50)",
+                  "attachments(first: 50)", "sourceType"):
+        assert field in q
+
+
+async def test_issue_details_null_is_not_found(fake, client):
+    fake.on("IssueDetails", {"data": {"issue": None}})
+    with pytest.raises(LinearError) as ei:
+        await client.issue_details("uuid-404")
+    assert ei.value.code == "NOT_FOUND"
+
+
+async def test_issue_threads_query(fake, client):
+    threads = [{"id": "c1", "url": "u", "body": "b", "createdAt": "2026-11-01T00:00:00Z",
+                "resolvedAt": None, "user": {"id": "u1", "name": "Mike"},
+                "children": {"nodes": [{"id": "c2", "body": "r", "createdAt": "x",
+                                        "resolvedAt": None, "user": None}]}}]
+    fake.on("IssueThreads", {"data": {"issue": {"comments": {"nodes": threads}}}})
+    assert await client.issue_threads("uuid-1", 7) == threads
+    (call,) = fake.gql_calls("IssueThreads")
+    assert call.variables == {"id": "uuid-1", "first": 7}
+    q = " ".join(call.json["query"].split())
+    assert ("comments(first: $first, orderBy: createdAt, filter: { parent: { null: true } })"
+            in q)
+    assert "children(first: 50, orderBy: createdAt)" in q
+
+
+async def test_issue_threads_null_issue_is_not_found(fake, client):
+    fake.on("IssueThreads", {"data": {"issue": None}})
+    with pytest.raises(LinearError) as ei:
+        await client.issue_threads("uuid-404", 1)
+    assert ei.value.code == "NOT_FOUND"
+
+
+SEARCH_FIELDS = ("identifier", "title", "url", "updatedAt", "priority", "state { name }",
+                 "assignee { name }", "delegate { name }", "project { name }",
+                 "pageInfo { hasNextPage endCursor }")
+SEARCH_CONN = {"nodes": [{"identifier": "RET-1", "title": "T", "url": "u", "updatedAt": "t",
+                          "priority": 0, "state": {"name": "Todo"}, "assignee": None,
+                          "delegate": None, "project": None}],
+               "pageInfo": {"hasNextPage": True, "endCursor": "e1"}}
+
+
+async def test_search_issues_query(fake, client):
+    fake.on("SearchIssues", {"data": {"searchIssues": SEARCH_CONN}})
+    flt = {"team": {"key": {"eq": "RET"}}}
+    assert await client.search_issues("attach", flt, True, 7, "c1") == SEARCH_CONN
+    (call,) = fake.gql_calls("SearchIssues")
+    assert call.variables == {"term": "attach", "filter": flt, "includeComments": True,
+                              "first": 7, "after": "c1"}
+    q = " ".join(call.json["query"].split())
+    assert ("searchIssues(term: $term, filter: $filter, includeComments: $includeComments, "
+            "first: $first, after: $after)") in q
+    for field in SEARCH_FIELDS:
+        assert field in q, field
+
+
+async def test_list_issues_query(fake, client):
+    fake.on("ListIssues", {"data": {"issues": SEARCH_CONN}})
+    assert await client.list_issues({}, 25, None) == SEARCH_CONN
+    (call,) = fake.gql_calls("ListIssues")
+    assert call.variables == {"filter": {}, "first": 25, "after": None}
+    q = " ".join(call.json["query"].split())
+    assert "issues(filter: $filter, first: $first, after: $after, orderBy: updatedAt)" in q
+    for field in SEARCH_FIELDS:
+        assert field in q, field
+
+
+@pytest.mark.parametrize("op, key", [("SearchIssues", "searchIssues"), ("ListIssues", "issues")])
+async def test_search_and_list_missing_connection_is_linear_error(fake, client, op, key):
+    fake.on(op, {"data": {key: None}})
+    with pytest.raises(LinearError):
+        if op == "SearchIssues":
+            await client.search_issues("x", {}, False, 1, None)
+        else:
+            await client.list_issues({}, 1, None)
+
+
 async def test_client_issue_get_null_is_not_found(fake, client):
     fake.on("IssueGet", {"data": {"issue": None}})
     with pytest.raises(LinearError) as ei:
@@ -624,3 +719,128 @@ async def test_graphql_error_carries_detail(fake, client):
         await client.viewer_id()
     assert ei.value.code == "INPUT_ERROR"
     assert ei.value.detail.startswith("The query is too complex.")
+
+
+# -- uploads and attachments (RET-133) -----------------------------------
+
+
+def _upload_resp(fake, name="a1"):
+    return {"data": {"fileUpload": {"success": True, "uploadFile": {
+        "uploadUrl": f"{fake.url}/upload/{name}",
+        "assetUrl": f"https://uploads.linear.app/{name}",
+        "headers": [{"key": "x-goog-content-length-range", "value": "5,5"},
+                    {"key": "Content-Disposition", "value": 'attachment; filename="x.png"'}],
+    }}}}
+
+
+async def test_file_upload_puts_bytes_without_bearer(fake, client):
+    fake.on("FileUpload", _upload_resp(fake))
+    url = await client.file_upload("x.png", "image/png", b"\x89PNG!")
+    assert url == "https://uploads.linear.app/a1"
+    (gql,) = fake.gql_calls("FileUpload")
+    assert gql.variables == {"size": 5, "filename": "x.png", "contentType": "image/png"}
+    assert gql.bearer == "tok-1"
+    (put,) = fake.upload_calls()
+    assert (put.method, put.path, put.body) == ("PUT", "/upload/a1", b"\x89PNG!")
+    assert put.headers["Content-Type"] == "image/png"
+    assert put.headers["Cache-Control"] == "public, max-age=31536000"
+    assert put.headers["x-goog-content-length-range"] == "5,5"
+    assert put.headers["Content-Disposition"] == 'attachment; filename="x.png"'
+    assert "Authorization" not in put.headers
+
+
+def test_upload_put_timeout_is_below_the_tool_budget():
+    from hermes_linear.constants import PLAN_SYNC_TIMEOUT_S, UPLOAD_PUT_TIMEOUT_S
+
+    assert UPLOAD_PUT_TIMEOUT_S < PLAN_SYNC_TIMEOUT_S
+
+
+async def test_file_upload_put_uses_upload_put_timeout(fake, client, monkeypatch):
+    """The PUT's own timeout fails it inside the tool's PLAN_SYNC_TIMEOUT_S budget."""
+    from hermes_linear.constants import UPLOAD_PUT_TIMEOUT_S
+
+    real, totals = aiohttp.ClientTimeout, []
+
+    def spy(*a, **kw):
+        totals.append(kw.get("total"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(aiohttp, "ClientTimeout", spy)
+    fake.on("FileUpload", _upload_resp(fake))
+    await client.file_upload("x.png", "image/png", b"\x89PNG!")
+    assert UPLOAD_PUT_TIMEOUT_S in totals
+
+
+async def test_file_upload_non_2xx_raises_upload_error(fake, client):
+    from hermes_linear.linear_client import UploadError
+
+    fake.on("FileUpload", _upload_resp(fake))
+    fake.upload_status = 403
+    with pytest.raises(UploadError) as ei:
+        await client.file_upload("x.png", "image/png", b"\x89PNG!")
+    assert ei.value.status == 403
+    assert ei.value.code == "UPLOAD_FAILED"
+    assert isinstance(ei.value, LinearError)
+
+
+async def test_file_upload_unsuccessful_mutation_raises(fake, client):
+    fake.on("FileUpload", {"data": {"fileUpload": {"success": False, "uploadFile": None}}})
+    with pytest.raises(LinearError):
+        await client.file_upload("x.png", "image/png", b"x")
+    assert fake.upload_calls() == []
+
+
+ATTACHMENT = {"id": "att-1", "url": "https://example.com/doc"}
+
+
+async def test_attachment_create_input(fake, client):
+    fake.on("AttachmentCreate",
+            {"data": {"attachmentCreate": {"success": True, "attachment": ATTACHMENT}}},
+            {"data": {"attachmentCreate": {"success": True, "attachment": ATTACHMENT}}},
+            {"data": {"attachmentCreate": {"success": False, "attachment": None}}})
+    got = await client.attachment_create("uuid-1", "x.png", "sub", "https://uploads.linear.app/a1")
+    assert got == ATTACHMENT
+    (call,) = fake.gql_calls("AttachmentCreate")
+    assert call.variables == {"input": {"issueId": "uuid-1", "title": "x.png",
+                                        "subtitle": "sub",
+                                        "url": "https://uploads.linear.app/a1"}}
+    await client.attachment_create("uuid-1", "t", None, "u")
+    assert fake.gql_calls("AttachmentCreate")[1].variables["input"] == {
+        "issueId": "uuid-1", "title": "t", "url": "u"}  # no subtitle key when None
+    with pytest.raises(LinearError):
+        await client.attachment_create("uuid-1", "t", None, "u")
+
+
+async def test_attachment_link_url_input(fake, client):
+    fake.on("AttachmentLinkURL",
+            {"data": {"attachmentLinkURL": {"success": True, "attachment": ATTACHMENT}}},
+            {"data": {"attachmentLinkURL": {"success": True, "attachment": ATTACHMENT}}},
+            {"data": {"attachmentLinkURL": {"success": False, "attachment": None}}})
+    assert await client.attachment_link_url("uuid-1", "https://example.com/doc", "Doc") \
+        == ATTACHMENT
+    assert await client.attachment_link_url("uuid-1", "https://example.com/doc", None) \
+        == ATTACHMENT
+    first, second = fake.gql_calls("AttachmentLinkURL")
+    assert first.variables == {"issueId": "uuid-1", "url": "https://example.com/doc",
+                               "title": "Doc"}
+    assert second.variables == {"issueId": "uuid-1", "url": "https://example.com/doc",
+                                "title": None}
+    q = " ".join(first.json["query"].split())
+    assert "attachmentLinkURL(issueId: $issueId, url: $url, title: $title)" in q
+    with pytest.raises(LinearError):
+        await client.attachment_link_url("uuid-1", "https://example.com/doc", None)
+
+
+async def test_attachment_link_github_pr_input(fake, client):
+    pr = "https://github.com/masha256/hermes-linear/pull/11"
+    fake.on("AttachmentLinkGitHubPR",
+            {"data": {"attachmentLinkGitHubPR": {"success": True,
+                                                 "attachment": {"id": "att-2", "url": pr}}}},
+            {"data": {"attachmentLinkGitHubPR": {"success": False, "attachment": None}}})
+    assert await client.attachment_link_github_pr("uuid-1", pr) == {"id": "att-2", "url": pr}
+    (call,) = fake.gql_calls("AttachmentLinkGitHubPR")
+    assert call.variables == {"issueId": "uuid-1", "url": pr}
+    q = " ".join(call.json["query"].split())
+    assert "attachmentLinkGitHubPR(issueId: $issueId, url: $url)" in q
+    with pytest.raises(LinearError):
+        await client.attachment_link_github_pr("uuid-1", pr)

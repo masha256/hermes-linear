@@ -16,6 +16,9 @@ provides_tools:
   - linear_sync_plan
   - linear_task_state
   - linear_query
+  - linear_search
+  - linear_attach
+  - linear_session_link
 provides_hooks:
   - pre_tool_call
   - post_tool_call

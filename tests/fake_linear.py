@@ -19,6 +19,10 @@ Tokens: each ``/oauth/token`` request issues ``tok-1``, ``tok-2``, ... unless
 ``token_responses`` is programmed. ``reject_tokens`` makes ``/graphql``
 return HTTP 401 for requests bearing any token in that set.
 
+Uploads: ``PUT /upload/{name}`` stands in for the signed storage URL that
+``fileUpload`` returns. It records the raw bytes in ``Call.body`` and answers
+``upload_status`` (default 200); ``upload_calls()`` lists those requests.
+
 Every request is appended to ``calls`` as a ``Call``.
 """
 
@@ -48,6 +52,7 @@ class Call:
     headers: dict
     form: dict | None = None
     json: dict | None = None
+    body: bytes | None = None
 
     @property
     def op(self) -> str | None:
@@ -73,10 +78,12 @@ class FakeLinear:
         self.token_responses: list = []
         self.reject_tokens: set[str] = set()
         self.expires_in = 2_591_999
+        self.upload_status = 200
         self._issued = 0
         app = web.Application()
         app.router.add_post("/oauth/token", self._token)
         app.router.add_post("/graphql", self._graphql)
+        app.router.add_put("/upload/{name}", self._upload)
         self.server = TestServer(app, host="127.0.0.1")
 
     # -- control -------------------------------------------------------
@@ -98,6 +105,9 @@ class FakeLinear:
 
     def gql_calls(self, op: str | None = None) -> list[Call]:
         return [c for c in self.calls if c.path == "/graphql" and (op is None or c.op == op)]
+
+    def upload_calls(self) -> list[Call]:
+        return [c for c in self.calls if c.path.startswith("/upload/")]
 
     # -- handlers ------------------------------------------------------
     @staticmethod
@@ -122,6 +132,11 @@ class FakeLinear:
             "expires_in": self.expires_in,
             "scope": form.get("scope", ""),
         })
+
+    async def _upload(self, request: web.Request) -> web.Response:
+        body = await request.read()
+        self.calls.append(Call(request.method, request.path, dict(request.headers), body=body))
+        return web.Response(status=self.upload_status)
 
     async def _graphql(self, request: web.Request) -> web.Response:
         body = await request.json()
