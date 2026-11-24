@@ -51,7 +51,8 @@ SKILL_DESCRIPTION = "Use when a repo has .hermes-linear.yaml or ticket says so."
 SKILL_MD = REPO_ROOT / "hermes_linear" / "skills" / "manage-superpowers" / "SKILL.md"
 TOOL_NAMES = ["linear_issue_get", "linear_issue_create", "linear_issue_update", "linear_comment",
               "linear_sync_spec", "linear_sync_plan", "linear_task_state", "linear_query",
-              "linear_search", "linear_attach", "linear_session_link", "linear_relation"]
+              "linear_search", "linear_attach", "linear_session_link", "linear_relation",
+              "linear_lookup"]
 
 
 class FakeCtx:
@@ -270,6 +271,25 @@ def test_registered_handlers_return_json_strings_real_registry(monkeypatch):
         normalized = ToolRegistry._normalize_handler_result(name, raw)
         assert "tool_result_contract" not in normalized, name
         assert _json.loads(raw)["ok"] is False
+
+
+@pytest.mark.parametrize("first", ["hermes_linear.tools_lookup", "hermes_linear.tools_relation"])
+def test_import_order_fresh_interpreter(first):
+    """A tool module imported first in a fresh interpreter still yields the full roster,
+    every slot filled, and ``agent_tools`` reaches the sibling modules' helpers."""
+    import subprocess
+    import sys
+
+    code = (f"import {first}; from hermes_linear import agent_tools as a; "
+            "print(','.join(a.TOOL_SCHEMAS), ','.join(a.TOOL_HANDLERS), "
+            "all(a.TOOL_SCHEMAS.values()), all(callable(h) for h in a.TOOL_HANDLERS.values()), "
+            "all(getattr(a, n) is a.TOOL_HANDLERS[n] for n in a.TOOL_HANDLERS), "
+            "callable(a.tools_relation.check_relation))")
+    proc = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT,
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    roster = ",".join(TOOL_NAMES)
+    assert proc.stdout.split() == [roster, roster, "True", "True", "True", "True"]
 
 
 def test_manifest_declares_every_tool():

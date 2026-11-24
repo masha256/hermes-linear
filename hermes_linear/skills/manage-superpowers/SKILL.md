@@ -17,7 +17,7 @@ rendered copies that link back to the committed files.
 The `linear_*` tools are deferred behind tool search: load a schema with `tool_describe` (exact
 names), then always call via `tool_call`, one entry per call (a batch of plugin tools is
 rejected): `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])`. A
-direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The twelve tools:
+direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The thirteen tools:
 
 - `linear_issue_get` (`id`, `comments?`: newest N threads): fields, relations, attachments, children.
 - `linear_search` (`text?`, `team?`, `project?`, `state?`, `assignee?`, `label?`, `parent?`, …):
@@ -34,6 +34,7 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The tw
 - `linear_attach` (`id` + `path` or `url`, `title?`; or `path` + `embed: true` → `markdown`).
 - `linear_session_link` (`url`, `label?`): show a link (the PR) on this turn's agent session.
 - `linear_relation` (`id`, `type`: `blocks|blocked_by|related|duplicate_of`, `other`).
+- `linear_lookup` (`kind`, `team?`, `project?`, `query?`): the names (and ids) write tools accept.
 
 They act as the Linear app, never raise and fail as `{"ok": false, "error": …}`. Re-runs are safe (a
 URL re-link is `ALREADY_LINKED`, a relation `ALREADY_RELATED`, any other one between the pair
@@ -86,9 +87,8 @@ that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `line
 
 ## Per-stage differences
 
-**Brainstorm.** Load `superpowers:brainstorming`. Each question is a turn in the ticket
-thread; multiple-choice questions and design-section approvals are selects. Do not
-offer the visual companion; it cannot work in a Linear ticket.
+**Brainstorm.** Load `superpowers:brainstorming`; no visual companion (it can't run in Linear).
+One question per thread turn; multiple-choice questions and design-section approvals are selects.
 
 **Spec.** Put a whole line `Linear: <session ticket ID>` in the spec's header (before
 the first `## ` heading). Commit, then `linear_sync_spec` with the spec's absolute
