@@ -36,7 +36,7 @@ Linear: RET-148
 
 ---
 
-### Task 1: Outside-session gate for comment, update and attach
+### Task 1: Outside-session gate for comment, update and attach — RET-151
 
 **Files:**
 - Modify: `hermes_linear/settings.py` (new `OUTSIDE_MODES = OUT_OF_SCOPE_MODES`; `Settings.outside_session_writes: str = "approve"`, `default_team: str = ""`, `default_project: str = ""`; parse in `load_settings`)
@@ -139,7 +139,7 @@ git add hermes_linear tests
 git commit -m "feat: outside-session writes for comment/update/attach via outside_session_writes (RET-148)"
 ```
 
-### Task 2: `linear_issue_create` outside a session, and the origin footer
+### Task 2: `linear_issue_create` outside a session, and the origin footer — RET-152
 
 **Files:**
 - Modify: `hermes_linear/linear_client.py` (new `QUERY_PROJECTS_BY_NAME`, `QUERY_PROJECT`, `async def projects_named(name: str) -> list[dict]`, `async def project(ref: str) -> dict | None`; each project dict `{"id", "name", "team_ids": [..]}`)
@@ -214,7 +214,7 @@ git add hermes_linear tests
 git commit -m "feat: linear_issue_create outside a session (team/project, defaults) and origin footer (RET-148)"
 ```
 
-### Task 3: Docs and skill text
+### Task 3: Docs and skill text — RET-153
 
 **Files:**
 - Modify: `README.md` (write-scope paragraph at ~line 73; "How it behaves" table row ~line 50; settings table ~line 310: rows for `outside_session_writes`, `default_team`, `default_project`; approvals note ~line 369: presence rules, `approvals.cron_mode`, Slack/Telegram card shows Hermes's full choice set, *session*/*always* only cover identical calls)
