@@ -749,6 +749,28 @@ async def test_file_upload_puts_bytes_without_bearer(fake, client):
     assert "Authorization" not in put.headers
 
 
+def test_upload_put_timeout_is_below_the_tool_budget():
+    from hermes_linear.constants import PLAN_SYNC_TIMEOUT_S, UPLOAD_PUT_TIMEOUT_S
+
+    assert UPLOAD_PUT_TIMEOUT_S < PLAN_SYNC_TIMEOUT_S
+
+
+async def test_file_upload_put_uses_upload_put_timeout(fake, client, monkeypatch):
+    """The PUT's own timeout fails it inside the tool's PLAN_SYNC_TIMEOUT_S budget."""
+    from hermes_linear.constants import UPLOAD_PUT_TIMEOUT_S
+
+    real, totals = aiohttp.ClientTimeout, []
+
+    def spy(*a, **kw):
+        totals.append(kw.get("total"))
+        return real(*a, **kw)
+
+    monkeypatch.setattr(aiohttp, "ClientTimeout", spy)
+    fake.on("FileUpload", _upload_resp(fake))
+    await client.file_upload("x.png", "image/png", b"\x89PNG!")
+    assert UPLOAD_PUT_TIMEOUT_S in totals
+
+
 async def test_file_upload_non_2xx_raises_upload_error(fake, client):
     from hermes_linear.linear_client import UploadError
 

@@ -341,7 +341,7 @@ Use `hermes -p <profile> linear …` for other profiles.
 
 - Webhooks only; there is no polling mode, so Linear must be able to reach your listener.
 - Documents, initiatives, customers and project-level agent sessions are not handled.
-- File uploads in Linear appear to the agent as links inside the ticket description or comment, not as attachments.
+- Files pasted inline into Linear comments or descriptions still appear to the agent as links; issue attachments are listed by `linear_issue_get` (and can be added with `linear_attach`).
 
 ## Development
 

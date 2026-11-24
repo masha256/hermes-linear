@@ -138,10 +138,11 @@ Errors (in addition to A's `NOT_LINEAR_SESSION`, `OUT_OF_SCOPE`, `APPROVAL_REQUI
 | `PATH_DENIED` | the path is not absolute, or `validate_media_delivery_path` returned `None` |
 | `FILE_TOO_LARGE` | the file exceeds `ATTACH_MAX_BYTES` (50 MB; Linear accepts more, §4.2) |
 | `UPLOAD_FAILED` | the PUT answered with a non-2xx status (`status` included) |
-| `ALREADY_LINKED` | URL mode: Linear refused a re-link of a URL the issue already has (`INPUT_ERROR` whose message contains "already been linked" or "already exists", case-insensitive; `message` is Linear's). Any other `INPUT_ERROR` stays `LINEAR_ERROR` (Ruling R4) |
+| `ALREADY_LINKED` | URL mode: Linear refused a re-link of a URL the issue already has (`INPUT_ERROR` whose message contains "already been linked" or "already exists", case-insensitive; `message` is Linear's). Any other Linear error returns its own code (e.g. `INPUT_ERROR`, `RATELIMITED`; `LINEAR_ERROR` when it has none) with `message`, as in file mode and the other tools (Ruling R4) |
 
-If the attachment step fails after a successful upload, the error also carries
-`asset_url`, so the agent can embed the file instead or retry. The orphaned asset stays,
+If the attachment step fails after a successful upload, the error is `LINEAR_ERROR` with
+`message`, Linear's `code` when it has one, and `asset_url`, so the agent can embed the
+file instead or retry. The orphaned asset stays,
 because the API has no way to delete an upload.
 
 ### 1.4 `linear_session_link(url, label?)`
@@ -211,7 +212,8 @@ A pure function `build_issue_filter(args, parent_id)` returns the `IssueFilter`:
 | `parent` | `parent: {id: {eq: parent_id}}` |
 
 Only one step does I/O: `parent` is resolved to a UUID with `client.issue_get`. An
-unknown parent is Linear's `NOT_FOUND`, which comes back as `LINEAR_ERROR` with the code.
+unknown parent is Linear's `NOT_FOUND`, returned as the error code (`{ok: false, error:
+"NOT_FOUND"}`), like any Linear error code.
 The body then calls `search_issues` or `list_issues` with `first: limit, after: cursor`.
 `next_cursor` is `pageInfo.endCursor` when `hasNextPage` is true, else `null`.
 
@@ -242,12 +244,13 @@ The body runs on the adapter loop:
    - a non-2xx answer → `UPLOAD_FAILED` with `status`; the result is `asset_url`.
 4. Attach: `attachment_create(issue_uuid, title, subtitle, asset_url)`, or for `url`
    `attachment_link_github_pr(issue_uuid, url)` / `attachment_link_url(issue_uuid, url,
-   title)`. A failure after the upload returns `LINEAR_ERROR` plus `asset_url`.
+   title)`. A failure after the upload returns `LINEAR_ERROR` plus `code` and `asset_url`.
 
 The tool is registered with `gated="linear_attach"` and `timeout_s=PLAN_SYNC_TIMEOUT_S`
-(120 s), to allow for a 50 MB PUT. `_tool` currently rejects `finish` together with
-`gated`, not `blocking_parse` together with `gated`. Both are needed here and are
-compatible: parse runs once per handler call, before `_gated`'s passes.
+(120 s), to allow for a 50 MB PUT. The PUT itself times out at `UPLOAD_PUT_TIMEOUT_S`
+(100 s), so a slow PUT fails as `NETWORK` inside that budget. `_tool` currently rejects
+`finish` together with `gated`, not `blocking_parse` together with `gated`. Both are
+needed here and are compatible: parse runs once per handler call, before `_gated`'s passes.
 
 ### 2.5 `linear_session_link`
 

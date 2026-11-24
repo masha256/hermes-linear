@@ -26,3 +26,6 @@ TOOL_TIMEOUT_S = 30.0  # agent tool bridge: bounded wait for a Linear call on th
 #: safely (children are adopted by their ``T<n> ·`` title on the rerun). Also the budget
 #: of a ``linear_attach`` upload (a 50 MB PUT; RET-120 spec §2.4).
 PLAN_SYNC_TIMEOUT_S = 120.0
+#: Timeout of the ``linear_attach`` storage PUT: below PLAN_SYNC_TIMEOUT_S so a slow PUT
+#: fails as UPLOAD_FAILED/NETWORK inside the tool budget, not as a tool TIMEOUT.
+UPLOAD_PUT_TIMEOUT_S = 100.0

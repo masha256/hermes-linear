@@ -21,6 +21,7 @@ from test_agent_tools_runtime import new_adapter
 
 from hermes_linear import agent_tools, tools_read
 from hermes_linear.agent_tools import TOOL_HANDLERS, TOOL_SCHEMAS
+from hermes_linear.linear_client import LinearError
 
 linear_issue_get = TOOL_HANDLERS["linear_issue_get"]
 APP = "app-user"
@@ -266,6 +267,7 @@ def test_schema():
         "type": "integer", "minimum": 0, "maximum": 50}
     assert set(comments) == {"type", "minimum", "maximum", "description"}
     assert comments["description"]
+    assert "up to its 50 newest replies" in comments["description"]  # QUERY_ISSUE_THREADS cap
     assert s["parameters"]["required"] == ["id"]
 
 
@@ -373,6 +375,26 @@ def test_parent_resolved_by_issue_get(pin_ctx, stub):
         ("issue_get", "RET-5"),
         ("list_issues", {"and": [{"labels": {"some": {"name": {"eqIgnoreCase": "bug"}}}},
                                  {"parent": {"id": {"eq": "uuid-5"}}}]}, 25, None)]
+
+
+def test_unknown_parent_is_not_found(pin_ctx, stub):
+    async def missing(ref):
+        stub.calls.append(("issue_get", ref))
+        raise LinearError("Entity not found", code="NOT_FOUND")
+
+    stub.issue_get = missing
+    assert linear_search({"parent": "NOPE-1"}) == {"ok": False, "error": "NOT_FOUND"}
+    assert stub.calls == [("issue_get", "NOPE-1")]  # no search after the failed lookup
+
+
+@pytest.mark.parametrize("method, args", [("search_issues", {"text": "x"}),
+                                          ("list_issues", {})])
+def test_search_passes_linear_error_code(pin_ctx, stub, method, args):
+    async def limited(*a):
+        raise LinearError("rate limited", code="RATELIMITED")
+
+    setattr(stub, method, limited)
+    assert linear_search(args) == {"ok": False, "error": "RATELIMITED"}
 
 
 @pytest.mark.parametrize("args", [

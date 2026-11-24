@@ -139,8 +139,11 @@ async def _attach(ctx: agent_tools.ToolContext, a: dict) -> dict:
             att = await client.attachment_create(issue["id"], a["title"] or f.name,
                                                  a["subtitle"], asset)
         except LinearError as exc:  # the asset stays: the agent can embed it instead
-            return {"ok": False, "error": "LINEAR_ERROR", "message": _message(exc),
-                    "asset_url": asset}
+            out = {"ok": False, "error": "LINEAR_ERROR", "message": _message(exc),
+                   "asset_url": asset}
+            if exc.code:
+                out["code"] = exc.code
+            return out
         return {"ok": True, "attachment_id": att.get("id"), "asset_url": asset,
                 "issue": issue.get("identifier"), "url": att.get("url") or asset}
     url = a["url"]
@@ -154,7 +157,7 @@ async def _attach(ctx: agent_tools.ToolContext, a: dict) -> dict:
         text = f"{exc.detail or ''}\n{exc}"
         if exc.code == "INPUT_ERROR" and _ALREADY_LINKED_RE.search(text):
             return {"ok": False, "error": "ALREADY_LINKED", "message": _message(exc)}
-        return {"ok": False, "error": "LINEAR_ERROR", "message": _message(exc)}
+        return {"ok": False, "error": exc.code or "LINEAR_ERROR", "message": _message(exc)}
     return {"ok": True, "attachment_id": att.get("id"), "issue": issue.get("identifier"),
             "url": att.get("url") or url}
 

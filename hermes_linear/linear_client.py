@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
-from .constants import PLAN_SYNC_TIMEOUT_S, TOKEN_RENEW_MARGIN_S, WRITE_RETRIES
+from .constants import TOKEN_RENEW_MARGIN_S, UPLOAD_PUT_TIMEOUT_S, WRITE_RETRIES
 
 log = logging.getLogger(__name__)
 
@@ -690,7 +690,7 @@ class LinearClient:
         try:
             async with self._http().put(
                 up["uploadUrl"], data=data, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=PLAN_SYNC_TIMEOUT_S),
+                timeout=aiohttp.ClientTimeout(total=UPLOAD_PUT_TIMEOUT_S),
             ) as resp:
                 status = resp.status
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:

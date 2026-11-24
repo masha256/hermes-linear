@@ -359,7 +359,16 @@ def test_attach_failure_after_upload_returns_asset_url(pin_ctx, ws, png):
     out = linear_attach({"id": "RET-1", "path": str(png)})
     asset = next(iter(ws.uploads))
     assert out == {"ok": False, "error": "LINEAR_ERROR", "message": "Something else went wrong.",
-                   "asset_url": asset}
+                   "code": "INPUT_ERROR", "asset_url": asset}
+
+
+def test_attach_failure_after_upload_without_code_has_no_code_key(pin_ctx, ws, png):
+    async def boom(*a):
+        raise LinearError("Unable to create attachment")
+
+    ws.attachment_create = boom
+    out = linear_attach({"id": "RET-1", "path": str(png)})
+    assert out["error"] == "LINEAR_ERROR" and "code" not in out and out["asset_url"]
 
 
 @pytest.mark.parametrize("method,url,message", [
@@ -387,18 +396,21 @@ def test_relink_matches_the_message_text_case_insensitively(pin_ctx, ws):
     assert out["message"] == "THIS URL HAS ALREADY BEEN LINKED WITH RET-92."
 
 
-@pytest.mark.parametrize("exc", [
-    LinearError("Unable to create issue attachment", code="INPUT_ERROR",
-                detail="Argument Validation Error: url must be a URL."),
-    LinearError("An attachment with the same URL already exists.", code="RATELIMITED"),
+@pytest.mark.parametrize("exc, code", [
+    (LinearError("Unable to create issue attachment", code="INPUT_ERROR",
+                 detail="Argument Validation Error: url must be a URL."), "INPUT_ERROR"),
+    (LinearError("An attachment with the same URL already exists.", code="RATELIMITED"),
+     "RATELIMITED"),
+    (LinearError("boom"), "LINEAR_ERROR"),  # no code
 ])
-def test_other_url_errors_stay_linear_error(pin_ctx, ws, exc):
+def test_other_url_errors_pass_their_code(pin_ctx, ws, exc, code):
+    """Not a re-link: the raw Linear code, as in file mode and the other tools."""
     async def boom(*a):
         raise exc
 
     ws.attachment_link_url = boom
     out = linear_attach({"id": "RET-1", "url": "https://example.test/a"})
-    assert out["ok"] is False and out["error"] == "LINEAR_ERROR"
+    assert out["ok"] is False and out["error"] == code
     assert out["message"] == (exc.detail or str(exc)) and "asset_url" not in out
 
 

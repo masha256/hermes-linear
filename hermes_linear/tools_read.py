@@ -234,9 +234,10 @@ SCHEMAS: dict[str, dict] = {
             "id": {"type": "string", "description": _ISSUE_REF},
             "comments": {"type": "integer", "minimum": 0, "maximum": COMMENTS_MAX,
                          "description": ("Also return the newest N comment threads (default "
-                                         "0), newest first, each with its replies oldest "
-                                         "first. Past 50,000 chars the oldest threads are "
-                                         "dropped and comments_truncated is true.")},
+                                         "0), newest first, each with up to its 50 newest "
+                                         "replies, oldest first. Past 50,000 chars the "
+                                         "oldest threads are dropped and comments_truncated "
+                                         "is true.")},
         }, "required": ["id"]},
     },
     "linear_search": {
