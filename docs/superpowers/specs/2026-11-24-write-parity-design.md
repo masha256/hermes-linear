@@ -107,6 +107,9 @@ New args: `team`, `project`, `assignee`, `delegate`, `priority`, `estimate`, `du
   A different one is an approval target (§2.4): `team "<key>"` / `project "<name>"`.
 - `project: null` / `""` on create means "the base", not "no project" (to create without a
   project, use a parent without one or update afterwards).
+- A `team` that differs from the base without a `project` arg creates the issue with **no
+  project**: the base project belongs to the base team, and Linear would refuse it after a
+  human approved the team (Ruling R8, from the RET-140 review).
 - State, labels and cycle resolve in the resulting team; the milestone in the resulting
   project.
 - Result as today (`{ok, issue}`) plus `starts_session` / `warnings` for self-delegation.
