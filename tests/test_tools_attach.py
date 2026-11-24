@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +27,44 @@ from hermes_linear.agent_tools import TOOL_HANDLERS, TOOL_SCHEMAS
 from hermes_linear.linear_client import LinearError, UploadError
 from hermes_linear.tool_approval import digest
 from hermes_linear.tools_attach import AttachFile, load_attach_file
+
+
+def _hermes_refuses_env() -> bool:
+    """Ask the REAL policy, once, whether it refuses a project ``.env`` (spec Q1c).
+
+    Hermes versions up to 2026-11-09 (e.g. the CI-pinned 3b42157) have no project-.env
+    check: such a file outside the denylisted dirs passes. Behaviour-based: a fresh
+    ``.env`` and a plain control file side by side under a temp dir, with ``HOME`` and
+    strict mode set as the ``home`` fixture sets them. If even the control is refused the
+    answer is True, so the .env tests run and fail loudly instead of being skipped.
+    """
+    from gateway.platforms.base import validate_media_delivery_path
+
+    root = Path(tempfile.mkdtemp(prefix="hl-env-probe-"))
+    saved = {k: os.environ.get(k) for k in ("HOME", "HERMES_MEDIA_DELIVERY_STRICT")}
+    try:
+        (root / "home" / ".ssh").mkdir(parents=True)
+        work = root / "work"
+        work.mkdir()
+        (work / ".env").write_text("SECRET=1")
+        (work / "control.txt").write_text("hi")
+        os.environ["HOME"] = str(root / "home")
+        os.environ.pop("HERMES_MEDIA_DELIVERY_STRICT", None)
+        if not validate_media_delivery_path(str(work / "control.txt")):
+            return True
+        return not validate_media_delivery_path(str(work / ".env"))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(root, ignore_errors=True)
+
+
+HERMES_REFUSES_ENV = _hermes_refuses_env()
+needs_env_check = pytest.mark.skipif(
+    not HERMES_REFUSES_ENV, reason="installed Hermes's media policy predates the project .env check")
 
 
 @pytest.fixture
@@ -68,9 +110,26 @@ def test_directory_not_found(work):
     assert _code(work) == "FILE_NOT_FOUND"
 
 
+@needs_env_check
 def test_env_file_denied(work):
     (work / ".env").write_text("SECRET=1")
     assert _code(work / ".env") == "PATH_DENIED"
+
+
+def test_policy_accepted_path_is_read(work, monkeypatch):
+    """Spec Q1c: the plugin adds no check of its own; whatever the policy accepts is read.
+
+    Pins the older-Hermes behaviour on every Hermes: a policy that accepts a ``.env``
+    (as Hermes up to 2026-11-09 does) gets it attached, the same as Slack's MEDIA there.
+    """
+    import gateway.platforms.base as base
+
+    env = work / ".env"
+    env.write_text("SECRET=1")
+    monkeypatch.setattr(base, "validate_media_delivery_path",
+                        lambda path, session_key="": str(env))
+    f = load_attach_file(str(env), None)
+    assert (f.name, f.data) == (".env", b"SECRET=1")
 
 
 def test_ssh_dir_denied(home):
@@ -84,6 +143,10 @@ def test_symlink_to_denied_target_refused(home, work):
     key.write_text("PRIVATE KEY")
     (work / "innocent.txt").symlink_to(key)
     assert _code(work / "innocent.txt") == "PATH_DENIED"
+
+
+@needs_env_check
+def test_symlink_to_env_refused(work):
     env = work / "sub" / ".env"
     env.parent.mkdir()
     env.write_text("SECRET=1")
@@ -255,9 +318,14 @@ def test_bad_combinations(pin_ctx, ws, args):
     assert ws.calls == []
 
 
-def test_file_policy_errors_before_any_call(pin_ctx, ws, work):
+@needs_env_check
+def test_env_policy_error_before_any_call(pin_ctx, ws, work):
     (work / ".env").write_text("SECRET=1")
     assert linear_attach({"id": "RET-1", "path": str(work / ".env")})["error"] == "PATH_DENIED"
+    assert ws.calls == []
+
+
+def test_file_policy_errors_before_any_call(pin_ctx, ws, work):
     assert linear_attach({"id": "RET-1", "path": "rel.txt"})["error"] == "PATH_DENIED"
     assert linear_attach({"path": str(work / "nope.png"), "embed": True})["error"] == \
         "FILE_NOT_FOUND"

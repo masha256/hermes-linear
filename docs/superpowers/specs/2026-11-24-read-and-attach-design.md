@@ -28,6 +28,7 @@ write is attributed to the app.
 | # | Question | Decision |
 |---|----------|----------|
 | Q1 | Which local files `linear_attach` may upload | Reuse Hermes's media-delivery policy as it is: `gateway.platforms.base.validate_media_delivery_path` (a public module), honouring the operator's strict setting. The plugin adds: the path must be absolute, a size cap, and the refusal `PATH_DENIED`. There is no approval path for a refused path. |
+| Q1c | Older Hermes without the project-.env check | Accepted (decided in the RET-120 thread after CI found it on the pinned Hermes 3b42157): the plugin adds no .env check of its own; on such Hermes versions an existing project .env outside the denylisted dirs passes, the same as Slack's MEDIA delivery there. Tests skip the .env expectations when the installed Hermes lacks the check. |
 | Q2 | `linear_search` filter shape | Typed filters only. Anything more complex goes through `linear_query` (A). |
 | Q3 | `comments: N` shape and size bound | The last N threads, newest first, each with all its replies (oldest first, at most 50). Over 50,000 serialized chars, the oldest threads are dropped and `comments_truncated: true` is set. |
 | Q4 | Where the code lives | Two new modules, `hermes_linear/tools_read.py` and `hermes_linear/tools_attach.py`, built on the existing `_tool` / `_gated` machinery. `agent_tools.py` only registers them. |
@@ -52,7 +53,8 @@ Why Q1 lands there (facts from the brainstorm):
   denylist. The denylist covers `/etc`, `/proc`, `/sys`, `/dev`, `/root`, `/var/log` and
   `/var/lib`; `$HOME/{.ssh,.aws,.gnupg,.kube,.docker,.config,.azure,.gcloud}`; in every
   Hermes home `.env*`, `auth.json`, `config.yaml`, `state.db` (and its WAL files),
-  `sessions/`, `browser-profile/` and the credential stores; and `.env` files anywhere.
+  `sessions/`, `browser-profile/` and the credential stores; and, on Hermes versions after
+  2026-11-09 (not the CI-pinned 3b42157; see Q1c), `.env` files anywhere.
   Strict mode (`gateway.strict` / `HERMES_MEDIA_DELIVERY_STRICT=1`) allows only the Hermes
   cache dirs, `HERMES_MEDIA_ALLOW_DIRS` and freshly made files.
 - Known gap, the same as Slack's: in default mode a credential file outside the
