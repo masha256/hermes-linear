@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from .constants import ACK_TIMEOUT_S
+from .directory import for_client
 from .store import ControlRow, Store
 
 log = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ async def _set_blocked(client: Any, issue_id: str, on: bool) -> bool:
         log.warning("linear: Blocked label skipped, issue %s has no team", issue_id)
         return False
     want = BLOCKED_LABEL.casefold()
-    label = next((lb["id"] for lb in await client.team_labels(team)
+    label = next((lb["id"] for lb in await for_client(client).rows("labels", team)
                   if (lb.get("name") or "").casefold() == want and lb.get("id")), None)
     if label is None:
         level = logging.DEBUG if team in _warned_teams else logging.WARNING

@@ -221,11 +221,31 @@ def test_unblocked_noop_makes_no_writes(pin_ctx, ws):
     # not labelled
     out = linear_task_state({"id": "RET-2", "state": "unblocked"})
     assert out["ok"] is True and ws.writes() == []
-    # no Blocked label on the team at all
+
+
+def test_unblocked_without_label_makes_no_writes(pin_ctx, ws):
+    # no Blocked label on the team at all (a fresh workspace: labels are cached per client)
     ws.workspace_labels = []
     out = linear_task_state({"id": "RET-2", "state": "unblocked"})
     assert out == {"ok": True, "issue": "RET-2", "state": "Todo", "label_missing": True}
     assert ws.writes() == []
+
+
+def test_blocked_label_added_meanwhile_found_by_refetch(pin_ctx, ws):
+    ws.workspace_labels = []
+    assert linear_task_state({"id": "RET-2", "state": "unblocked"})["label_missing"] is True
+    ws.workspace_labels = [{"id": BLOCKED, "name": "Blocked"}]
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "question": "q"})
+    assert out["ok"] is True and ws.issues[TASK]["labels"] == [BLOCKED]
+
+
+def test_task_state_states_and_labels_cached(pin_ctx, ws):
+    for st in ("in_progress", "in_review", "done"):
+        assert linear_task_state({"id": "RET-2", "state": st})["ok"] is True
+    for _ in range(2):
+        assert linear_task_state({"id": "RET-2", "state": "unblocked"})["ok"] is True
+    assert [c for c in ws.calls if c[0] in {"team_states", "team_labels"}] == [
+        ("team_states", "team-1"), ("team_labels", "team-1")]
 
 
 def test_task_state_out_of_scope(pin_ctx, ws):

@@ -32,7 +32,7 @@ from typing import Any, Callable, Coroutine
 from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
-from . import graphql_guard, sync, tool_approval
+from . import directory, graphql_guard, sync, tool_approval
 from .constants import PLAN_SYNC_TIMEOUT_S, TOOL_TIMEOUT_S
 from .linear_client import LinearError
 
@@ -353,11 +353,16 @@ ANY_MARKER_RE = re.compile(r"[ \t]*<!--\s*hermes-linear:.*?-->", re.DOTALL)
 
 
 class _Refusal(Exception):
-    """Raised inside a tool coroutine to answer ``{"ok": False, "error": code}``."""
+    """Raised inside a tool coroutine to answer ``{"ok": False, "error": code, **extra}``
+    (``extra``: e.g. a miss's ``candidates``, RET-121 spec §2.2)."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, extra: dict | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.extra: dict = dict(extra or {})
+
+    def result(self) -> dict:
+        return {**_err(self.code), **self.extra}
 
 
 def resolve_state(states: list[dict], name_or_type: str) -> str | None:
@@ -454,7 +459,7 @@ def _tool(parse: Callable[[dict], dict],
             try:
                 parsed = parse(args)
             except _Refusal as r:
-                return _err(r.code)
+                return r.result()
             ctx = resolve_context(kw.get("session_id"))
             if ctx.client is None:
                 return _err("NOT_CONNECTED")
@@ -464,7 +469,7 @@ def _tool(parse: Callable[[dict], dict],
                     try:
                         return await body(c, parsed)
                     except _Refusal as r:
-                        return _err(r.code)
+                        return r.result()
                     except _NeedsApproval as n:
                         return {"ok": False, "error": _NEEDS_APPROVAL, "targets": n.targets}
                 return run_on_adapter(c, run, timeout_s=timeout_s)
@@ -556,36 +561,63 @@ def _check_gate(ctx: ToolContext) -> None:
         ctx.gate.check()
 
 
+def _state_row(states: list[dict], ref: str) -> dict | None:
+    """``resolve_state``'s pick as a row: a directory ``match``."""
+    sid = resolve_state(states, ref)
+    return next((s for s in states if s.get("id") == sid), None) if sid else None
+
+
+def _label_row(labels: list[dict], name: str) -> dict | None:
+    """The first label named ``name`` (case-insensitive): a directory ``match``."""
+    want = name.casefold()
+    return next((lb for lb in labels
+                 if (lb.get("name") or "").casefold() == want and lb.get("id")), None)
+
+
+def _labels_all_named(labels: list[dict], names: list[str]) -> dict | None:
+    """A directory ``match`` for several names at once: ``{"rows": labels}`` when every
+    name is a label, else ``None`` (a miss)."""
+    return {"rows": labels} if all(_label_row(labels, n) for n in names) else None
+
+
 async def _state_id(ctx: ToolContext, team_id: str, name: str) -> str:
-    sid = resolve_state(await ctx.client.team_states(team_id), name)
-    if sid is None:
-        raise _Refusal("BAD_ARGS")
-    return sid
+    """The team's state named (or typed) ``name``; a miss is ``STATE_NOT_FOUND`` with the
+    team's states as ``candidates`` (after the directory's refetch-once)."""
+    row = await directory.for_client(ctx.client).resolve("states", team_id, name, _state_row)
+    return row["id"]
+
+
+async def _cancel_state(ctx: ToolContext, team_id: str) -> str:
+    """The team's ``canceled`` state for plan sync. Not an agent-supplied name, so a team
+    without one stays ``BAD_ARGS`` (spec §2.5, as ``_target_state``)."""
+    try:
+        return await _state_id(ctx, team_id, "canceled")
+    except _Refusal:
+        raise _Refusal("BAD_ARGS") from None
 
 
 async def _label_ids(ctx: ToolContext, team_id: str, add: list[str],
                      remove: list[str] = ()) -> tuple[list[str], list[str]]:
     """Label ids for names to ``add`` and ``remove`` (case-insensitive).
 
-    An unknown name to add is ``LABEL_MISSING`` (probe P3: the app cannot create labels);
-    an unknown name to remove is skipped, since no issue can carry it (Ruling S13).
+    An unknown name to add is ``LABEL_MISSING`` with ``available`` (probe P3: the app
+    cannot create labels), after one refetch of the cached labels; an unknown name to
+    remove is skipped, since no issue can carry it (Ruling S13).
     """
     if not add and not remove:
         return [], []
-    by_name: dict[str, str] = {}
-    for lb in await ctx.client.team_labels(team_id):
-        by_name.setdefault((lb.get("name") or "").casefold(), lb["id"])
+    names = directory.for_client(ctx.client)
+    if add:  # one resolve: a miss refetches once (unless just fetched), then LABEL_MISSING
+        labels = (await names.resolve("labels", team_id, add, _labels_all_named))["rows"]
+    else:
+        labels = await names.rows("labels", team_id)
     out: list[list[str]] = []
-    for names, strict in ((add, True), (remove, False)):
+    for group in (add, remove):
         ids: list[str] = []
-        for n in names:
-            lid = by_name.get(n.casefold())
-            if lid is None:
-                if strict:
-                    raise _Refusal("LABEL_MISSING")
-                continue
-            if lid not in ids:
-                ids.append(lid)
+        for n in group:
+            row = _label_row(labels, n)
+            if row is not None and row["id"] not in ids:
+                ids.append(row["id"])
         out.append(ids)
     return out[0], out[1]
 
@@ -930,7 +962,7 @@ async def _sync_plan(ctx: ToolContext, a: dict) -> dict:
         if not _app_made(c, me):
             unmanaged.append(c["identifier"])  # a human's T<n> ticket: reported, never touched
             continue
-        cancel_state = cancel_state or await _state_id(ctx, team, "canceled")
+        cancel_state = cancel_state or await _cancel_state(ctx, team)
         # Reason first: a crash in between repeats the comment rather than losing it.
         await client.comment_create(
             c["id"], f"Removed from the plan in {info.commit or sync.UNCOMMITTED}.")
@@ -1026,10 +1058,15 @@ def _target_state(states: list[dict], current: dict, state: str) -> dict:
 
 
 async def _blocked_label(ctx: ToolContext, team: str) -> str | None:
-    """The id of the team's (or workspace's) ``Blocked`` label, case-insensitive."""
-    want = BLOCKED_LABEL.casefold()
-    return next((lb["id"] for lb in await ctx.client.team_labels(team)
-                 if (lb.get("name") or "").casefold() == want and lb.get("id")), None)
+    """The id of the team's (or workspace's) ``Blocked`` label, case-insensitive; None when
+    missing after the directory's refetch-once (the caller answers ``LABEL_MISSING`` in its
+    own shape, Ruling S18)."""
+    try:
+        row = await directory.for_client(ctx.client).resolve("labels", team, BLOCKED_LABEL,
+                                                             _label_row)
+    except _Refusal:
+        return None
+    return row["id"]
 
 
 def _track_open_task(ctx: ToolContext, task_id: str, open_: bool) -> None:
@@ -1049,7 +1086,8 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
                            "state": current.get("name"), "label_missing": False}
 
     if state in {"in_progress", "in_review", "done"}:
-        target = _target_state(await client.team_states(team), current, state)
+        target = _target_state(await directory.for_client(client).rows("states", team),
+                               current, state)
         summary = (a["summary"] or "").strip() if state == "done" else ""
         if state == "done":
             out["summary_posted"] = False

@@ -91,6 +91,23 @@ def test_schemas_and_handlers_pair_up():
         assert callable(TOOL_HANDLERS[name])
 
 
+def test_refusal_extra_merges_into_error(pin_ctx):
+    """RET-121 Ruling R3: one ``_Refusal`` type; its ``extra`` sits next to ``error``."""
+    from hermes_linear.agent_tools import _Refusal, _tool
+
+    def bad_parse(args):
+        raise _Refusal("X_PARSE", extra={"candidates": [1]})
+
+    async def bad_body(ctx, a):
+        raise _Refusal("X_BODY", extra={"available": ["a"]})
+
+    assert _tool(bad_parse, bad_body)({}) == {"ok": False, "error": "X_PARSE",
+                                              "candidates": [1]}
+    assert _tool(lambda a: a, bad_body)({}) == {"ok": False, "error": "X_BODY",
+                                                "available": ["a"]}
+    assert _Refusal("BAD_ARGS").extra == {}
+
+
 @pytest.mark.parametrize("handler", [linear_issue_get, linear_issue_create,
                                      linear_issue_update, linear_comment])
 @pytest.mark.parametrize("args", [None, "x", {}, {"id": 5, "title": 3, "body": None}])
@@ -213,10 +230,42 @@ def test_create_refused_outside_linear_session(pin_ctx, ws):
     assert ws.writes() == []
 
 
-def test_create_unknown_state_is_bad_args(pin_ctx, ws):
-    assert linear_issue_create({"title": "x", "state": "Limbo"}) == {"ok": False,
-                                                                     "error": "BAD_ARGS"}
+#: ``STATE_NOT_FOUND`` candidates for FakeWorkspace's default states (no substring match).
+STATE_CANDIDATES = [
+    {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
+    {"id": "st-todo", "name": "Todo", "type": "unstarted"},
+    {"id": "st-progress", "name": "In Progress", "type": "started"},
+    {"id": "st-review", "name": "In Review", "type": "started"},
+    {"id": "st-done", "name": "Done", "type": "completed"},
+    {"id": "st-cancel", "name": "Canceled", "type": "canceled"}]
+LABELS_AVAILABLE = ["Bug", "Feature", "superpowers:plan", "Blocked"]
+
+
+def test_create_unknown_state_is_state_not_found(pin_ctx, ws):
+    assert linear_issue_create({"title": "x", "state": "Limbo"}) == {
+        "ok": False, "error": "STATE_NOT_FOUND", "candidates": STATE_CANDIDATES}
     assert ws.writes() == []
+
+
+def test_unknown_state_candidates_substring_first(pin_ctx, ws):
+    out = linear_issue_create({"title": "x", "state": "review"})  # no state named "review"
+    assert out["error"] == "STATE_NOT_FOUND"
+    assert out["candidates"][0] == {"id": "st-review", "name": "In Review", "type": "started"}
+    assert len(out["candidates"]) == len(STATE_CANDIDATES)
+
+
+def test_state_added_meanwhile_resolves_after_refetch(pin_ctx, ws):
+    assert linear_issue_update({"id": "RET-2", "state": "Todo"})["ok"] is True  # cached
+    ws.states[TEAM].append({"id": "st-qa", "name": "QA", "type": "started"})
+    assert linear_issue_update({"id": "RET-2", "state": "qa"})["ok"] is True
+    assert ws.issues["uuid-child"]["state"] == "st-qa"
+    assert [c for c in ws.calls if c[0] == "team_states"] == [("team_states", TEAM)] * 2
+
+
+def test_states_cached_across_calls(pin_ctx, ws):
+    for name in ("Todo", "In Progress", "Done"):
+        assert linear_issue_update({"id": "RET-2", "state": name})["ok"] is True
+    assert [c for c in ws.calls if c[0] == "team_states"] == [("team_states", TEAM)]
 
 
 # ----------------------------------------------------------------- linear_issue_update
@@ -227,8 +276,8 @@ def test_update_state_by_name_and_type(pin_ctx, ws):
     assert ws.issues["uuid-child"]["state"] == "st-review"
     assert linear_issue_update({"id": "uuid-child", "state": "completed"})["ok"] is True
     assert ws.issues["uuid-child"]["state"] == "st-done"
-    assert linear_issue_update({"id": "RET-2", "state": "Limbo"}) == {"ok": False,
-                                                                      "error": "BAD_ARGS"}
+    assert linear_issue_update({"id": "RET-2", "state": "Limbo"}) == {
+        "ok": False, "error": "STATE_NOT_FOUND", "candidates": STATE_CANDIDATES}
 
 
 def test_update_title_description(pin_ctx, ws):
@@ -272,10 +321,25 @@ def test_remove_unknown_label_is_noop(pin_ctx, ws):
 
 def test_unknown_label_is_label_missing(pin_ctx, ws):
     out = linear_issue_update({"id": "RET-2", "add_labels": ["bug", "no-such-label"]})
-    assert out == {"ok": False, "error": "LABEL_MISSING"}
+    assert out == {"ok": False, "error": "LABEL_MISSING", "available": LABELS_AVAILABLE}
     out = linear_issue_create({"title": "x", "labels": ["no-such-label"]})
-    assert out == {"ok": False, "error": "LABEL_MISSING"}
+    assert out == {"ok": False, "error": "LABEL_MISSING", "available": LABELS_AVAILABLE}
     assert ws.writes() == []
+
+
+def test_label_added_meanwhile_resolves_after_one_refetch(pin_ctx, ws):
+    assert linear_issue_update({"id": "RET-2", "add_labels": ["bug"]})["ok"] is True
+    ws.labels[TEAM] += [{"id": "lb-a", "name": "A"}, {"id": "lb-b", "name": "B"}]
+    assert linear_issue_update({"id": "RET-2", "add_labels": ["a", "b"]})["ok"] is True
+    assert ws.issues["uuid-child"]["labels"] == ["lb-bug", "lb-a", "lb-b"]
+    assert [c for c in ws.calls if c[0] == "team_labels"] == [("team_labels", TEAM)] * 2
+
+
+def test_label_missing_after_refetch_fetches_once_more(pin_ctx, ws):
+    assert linear_issue_update({"id": "RET-2", "add_labels": ["bug"]})["ok"] is True
+    out = linear_issue_update({"id": "RET-2", "add_labels": ["nope", "nada"]})
+    assert out["error"] == "LABEL_MISSING"
+    assert [c for c in ws.calls if c[0] == "team_labels"] == [("team_labels", TEAM)] * 2
 
 
 def test_update_out_of_scope_refused(pin_ctx, ws, adapter):

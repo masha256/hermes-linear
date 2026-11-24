@@ -557,7 +557,8 @@ async def test_client_app_comments_only_viewer(fake, client):
     assert call.variables == {"id": "uuid-1", "userId": APP_USER, "after": None}
 
 
-async def test_client_team_states_cached(fake, client):
+async def test_team_states_not_cached(fake, client):
+    # The directory caches (RET-121 spec §2.1): the client asks Linear every time.
     fake.on("TeamStates", {"data": {"team": {"states": {"nodes": [
         {"id": "s2", "name": "Done", "type": "completed", "position": 5},
         {"id": "s1", "name": "Todo", "type": "unstarted", "position": 1},
@@ -566,7 +567,7 @@ async def test_client_team_states_cached(fake, client):
             {"id": "s2", "name": "Done", "type": "completed"}]
     assert await client.team_states("t1") == want
     assert await client.team_states("t1") == want
-    assert len(fake.gql_calls("TeamStates")) == 1
+    assert len(fake.gql_calls("TeamStates")) == 2
     assert fake.gql_calls("TeamStates")[0].variables == {"teamId": "t1"}
 
 
@@ -692,6 +693,102 @@ async def test_client_paging_stops_at_cap(fake, client):
                                  lambda d: d.get("issueLabels"), cap=3)
     assert [lb["id"] for lb in labels] == ["l0", "l1", "l2"]
     assert len(fake.gql_calls("TeamLabels")) == 2
+
+
+# -- directory lists (RET-121) -------------------------------------------
+
+
+async def test_client_users_pages(fake, client):
+    def u(uid, **kw):
+        return {"id": uid, "name": uid.upper(), "displayName": uid, "email": f"{uid}@x",
+                "app": False, "active": True, **kw}
+    fake.on("Users",
+            {"data": {"users": _page([u("ann")], "cur-1")}},
+            {"data": {"users": _page([u("bot", app=True, email=None, active=False)])}})
+    assert await client.users() == [
+        {"id": "ann", "name": "ANN", "displayName": "ann", "email": "ann@x", "app": False,
+         "active": True},
+        {"id": "bot", "name": "BOT", "displayName": "bot", "email": "", "app": True,
+         "active": False}]
+    calls = fake.gql_calls("Users")
+    assert [c.variables for c in calls] == [{"after": None}, {"after": "cur-1"}]
+    q = calls[0].json["query"]
+    assert "users(first: 250, after: $after)" in q
+    assert "id name displayName email app active" in q
+    assert "pageInfo { hasNextPage endCursor }" in q
+
+
+async def test_client_cycles_marks_current_and_next(fake, client):
+    def c(cid, number, starts, name=None):
+        return {"id": cid, "number": number, "name": name, "startsAt": starts,
+                "endsAt": starts.replace("-01T", "-08T")}
+    fake.on("TeamCycles",
+            {"data": {"team": {"activeCycle": {"id": "c2"}, "cycles": _page(
+                [c("c3", 3, "2026-12-01T00:00:00.000Z"),
+                 c("c1", 1, "2026-10-01T00:00:00.000Z", "First")], "cur-1")}}},
+            {"data": {"team": {"activeCycle": {"id": "c2"}, "cycles": _page(
+                [c("c2", 2, "2026-11-01T00:00:00.000Z"),
+                 c("c4", 4, "2027-01-01T00:00:00.000Z")])}}})
+    rows = await client.cycles("t1")
+    assert rows == [
+        {"id": "c1", "number": 1, "name": "First", "startsAt": "2026-10-01T00:00:00.000Z",
+         "endsAt": "2026-10-08T00:00:00.000Z"},
+        {"id": "c2", "number": 2, "name": "", "startsAt": "2026-11-01T00:00:00.000Z",
+         "endsAt": "2026-11-08T00:00:00.000Z", "current": True},
+        {"id": "c3", "number": 3, "name": "", "startsAt": "2026-12-01T00:00:00.000Z",
+         "endsAt": "2026-12-08T00:00:00.000Z", "next": True},
+        {"id": "c4", "number": 4, "name": "", "startsAt": "2027-01-01T00:00:00.000Z",
+         "endsAt": "2027-01-08T00:00:00.000Z"}]
+    calls = fake.gql_calls("TeamCycles")
+    assert [x.variables for x in calls] == [{"teamId": "t1", "after": None},
+                                            {"teamId": "t1", "after": "cur-1"}]
+    q = calls[0].json["query"]
+    assert "activeCycle { id }" in q and "cycles(first: 250, after: $after)" in q
+    assert "id number name startsAt endsAt" in q
+
+
+async def test_client_cycles_without_active_cycle(fake, client):
+    fake.on("TeamCycles", {"data": {"team": {"activeCycle": None, "cycles": _page([
+        {"id": "past", "number": 1, "name": "", "startsAt": "2000-01-01T00:00:00.000Z",
+         "endsAt": "2000-01-08T00:00:00.000Z"},
+        {"id": "later", "number": 3, "name": "", "startsAt": "2999-02-01T00:00:00.000Z",
+         "endsAt": "2999-02-08T00:00:00.000Z"},
+        {"id": "soon", "number": 2, "name": "", "startsAt": "2999-01-01T00:00:00.000Z",
+         "endsAt": "2999-01-08T00:00:00.000Z"}])}}})
+    rows = await client.cycles("t1")
+    assert [(r["id"], r.get("current"), r.get("next")) for r in rows] == [
+        ("past", None, None), ("soon", None, True), ("later", None, None)]
+
+
+async def test_client_cycles_null_team(fake, client):
+    fake.on("TeamCycles", {"data": {"team": None}})
+    assert await client.cycles("t1") == []
+
+
+async def test_client_projects_pages(fake, client):
+    fake.on("Projects",
+            {"data": {"projects": _page([{"id": "p1", "name": "Orion", "state": "started"}],
+                                        "cur-1")}},
+            {"data": {"projects": _page([{"id": "p2", "name": None, "state": None}])}})
+    assert await client.projects() == [{"id": "p1", "name": "Orion", "state": "started"},
+                                       {"id": "p2", "name": "", "state": ""}]
+    calls = fake.gql_calls("Projects")
+    assert [c.variables for c in calls] == [{"after": None}, {"after": "cur-1"}]
+    assert "projects(first: 250, after: $after)" in calls[0].json["query"]
+    assert "id name state" in calls[0].json["query"]
+
+
+async def test_client_milestones_pages(fake, client):
+    fake.on("ProjectMilestones",
+            {"data": {"project": {"projectMilestones": _page([{"id": "m1", "name": "Beta"}],
+                                                             "cur-1")}}},
+            {"data": {"project": {"projectMilestones": _page([{"id": "m2", "name": "GA"}])}}})
+    assert await client.milestones("p1") == [{"id": "m1", "name": "Beta"},
+                                             {"id": "m2", "name": "GA"}]
+    calls = fake.gql_calls("ProjectMilestones")
+    assert [c.variables for c in calls] == [{"projectId": "p1", "after": None},
+                                            {"projectId": "p1", "after": "cur-1"}]
+    assert "projectMilestones(first: 250, after: $after)" in calls[0].json["query"]
 
 
 # -- error detail (RET-119) ----------------------------------------------
