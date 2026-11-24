@@ -6,37 +6,39 @@ description: Use when a repo has .hermes-linear.yaml or ticket says so.
 # Manage with hermes-linear (superpowers through Linear)
 
 Load this when a delegated Linear ticket says "manage with hermes-linear", or when the
-repo you work in has `.hermes-linear.yaml` at its root. It runs the superpowers
-workflow (brainstorm → spec → plan → subagent-driven development) inside the ticket.
-
-This is an overlay. At each stage, load `superpowers:<stage>` and follow it, then apply
-the differences below. Never restate or edit superpowers itself. Git is the source of
-truth; Linear holds rendered copies that link back to the committed files.
+repo you work in has `.hermes-linear.yaml` at its root. It runs the superpowers workflow
+(brainstorm → spec → plan → subagent-driven development) inside the ticket. It is an
+overlay: at each stage, load `superpowers:<stage>` and follow it, then apply the differences
+below. Never restate or edit superpowers itself. Git is the source of truth; Linear holds
+rendered copies that link back to the committed files.
 
 ## Calling the tools
 
 The `linear_*` tools are deferred behind tool search: load a schema with `tool_describe` (exact
-names), then call it with `tool_call`, one entry per call (a batch of several plugin tools is
+names), then always call via `tool_call`, one entry per call (a batch of plugin tools is
 rejected): `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])`. A
-direct `linear_issue_get(...)` fails as an unknown tool; below, `linear_x(...)` is shorthand. The eleven tools:
+direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The eleven tools:
 
-- `linear_issue_get` (`id`, `comments?` = newest N threads): fields, relations, attachments, children.
+- `linear_issue_get` (`id`, `comments?`: newest N threads): fields, relations, attachments, children.
 - `linear_search` (`text?`, `team?`, `project?`, `state?`, `assignee?`, `label?`, `parent?`, …):
   find issues (rows + `next_cursor`); complex filters go through `linear_query`.
-- `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`): session's team/project.
+- `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`): in the
+  session's team and project.
 - `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`,
   `remove_labels?`, `parent?`): `parent: ""` detaches; a cycle is `PARENT_CYCLE`.
 - `linear_comment` (`id`, `body`, `edit_marker?`).
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
-- `linear_task_state` (`id`, `state` = `in_progress|in_review|done|blocked|unblocked`, `summary?`, `question?`).
+- `linear_task_state` (`id`, `state`, `summary?`, `question?`); `state` is one of
+  `in_progress|in_review|done|blocked|unblocked`.
 - `linear_query` (`query`, `variables?`): read-only GraphQL; a result over 50,000 chars is refused.
-- `linear_attach` (`id` + `path`/`url`, `title?`; or `path` + `embed: true` → `markdown`): file or link.
+- `linear_attach` (`id` + `path` or `url`, `title?`; or `path` + `embed: true` → `markdown`).
 - `linear_session_link` (`url`, `label?`): show a link (the PR) on this turn's agent session.
 
-They act as the Linear app, never raise, fail as `{"ok": false, "error": …}` and are safe to
-re-run. Writes to the session ticket, its descendants and tickets made from it (any turn) just
-run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue_create` or
-`linear_attach` returns `APPROVAL_REQUIRED`: call it again with identical arguments to ask a human in Linear.
+They act as the Linear app, never raise and fail as `{"ok": false, "error": …}`. Re-runs are safe
+(a URL re-link is `ALREADY_LINKED`; session links de-duplicate), except that a `path` attach adds
+a second copy. Writes to the session ticket, its descendants and tickets made from it (any turn)
+just run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue_create` or
+`linear_attach` answers `APPROVAL_REQUIRED`; an identical re-call asks a human in Linear.
 
 ## Questions and approvals
 
@@ -48,11 +50,11 @@ run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue_crea
   question (the plugin re-posts it after your final reply). The plugin adds and removes
   `Blocked` for a pending question itself: no `linear_task_state` `unblocked` for it.
   The answer comes later (restarts too) as the next turn: `Answer to "<question>": <value>`.
-- `Command not run: approval is pending in Linear…`: end the turn. On a later
-  ``Answer to approval for `<cmd>`: approved (<choice>)`` re-run exactly `<cmd>` byte for
-  byte in that same turn (its pre-approval ends with it, no second prompt); on `: denied` don't run it.
-- Out-of-scope write `BLOCKED: …`: timed out → pending in Linear, end the turn; else denied, no retry.
-  On ``Answer to approval for `<tool>` call <digest>: approved`` re-run the identical call in that turn.
+- `Command not run: approval is pending in Linear…`: end the turn. On a later ``Answer to
+  approval for `<cmd>`: approved (<choice>)`` re-run exactly `<cmd>` byte for byte in that
+  same turn (its pre-approval ends with it, no second prompt); on `: denied` don't run it.
+- Out-of-scope write `BLOCKED: …`: timed out → pending in Linear, end the turn; denied: no retry.
+  On ``Answer to approval for `<tool>` call <digest>: approved`` re-run the identical call now.
 - Answers count only when given in the ticket thread. An answer from Slack, the CLI or
   any other channel does not approve or unblock anything; ask again in the ticket.
 
@@ -61,13 +63,11 @@ run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue_crea
 1. `linear_issue_get` the session ticket. Note its identifier, team and project. The
    team key is the identifier's prefix (`RET-81` → `RET`).
 2. Framework: select via `clarify`; the only choice is `superpowers`.
-3. Repo: read the project's links (`externalLinks`) from step 1. A GitHub link is a
-   candidate; the link labelled `repo` wins when there are several. Offer the result
-   as a select (one repo is still confirmed). With no GitHub link, ask for the repo in
-   the ticket (select of known local clones plus "Other") and suggest the user add a
-   project link labelled `repo` (the tools cannot edit projects).
-4. Find a local clone whose `origin` matches (the workspace, then `~/git/*`). If none,
-   clone it into `~/git/<name>`.
+3. Repo: a GitHub link among the project's links (`externalLinks`, step 1) is a candidate;
+   the link labelled `repo` wins among several. Offer the result as a select (one repo is
+   still confirmed). With no GitHub link, ask in the ticket (select of known local clones plus
+   "Other") and suggest the user add a project link labelled `repo` (tools can't edit projects).
+4. Find a clone whose `origin` matches (workspace, then `~/git/*`); else clone to `~/git/<name>`.
 5. Branch `<identifier lowercase>-<slug>` (e.g. `ret-95-secret-reload`), worked in
    `.worktrees/<branch>`; load `superpowers:using-git-worktrees` for the mechanics.
 6. Commit `.hermes-linear.yaml` at the repo root with real values:
@@ -80,8 +80,8 @@ run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue_crea
    repo: <GitHub URL chosen in step 3>
    ```
 
-   It holds only what the documents do not record; it never changes as work goes on.
-   Later sessions on a repo with the file skip setup but still make the sub-project branch and worktree.
+   It holds only what the documents do not record; it never changes as work goes on. Later
+   sessions on a repo with the file skip setup but still make the sub-project branch and worktree.
 
 ## Per-stage differences
 
@@ -110,21 +110,21 @@ line 1 stays its identity line; line 2 is `Linear: <ID>`. Each task's ledger ent
 names its sub-ticket, and commit messages carry the sub-ticket ID. Task progress goes
 on the sub-tickets; the project thread gets only stage changes, stop points and
 questions (a turn that only moves a task along ends with a one-line reply). Then:
-- dispatching a task's implementer: `linear_task_state(id, "in_progress")`;
-- dispatching its review: `in_review`;
+- dispatching a task's implementer: `linear_task_state(id, "in_progress")`; its review: `in_review`;
 - a fix round after review: back to `in_progress` (then `in_review` again), and a
   `linear_comment` on the sub-ticket with the findings being fixed;
 - the clean review: `done` with `summary` (commits, test result, review verdict, number
   of fix rounds, deferred minors as a `- [ ]` checklist);
-- anything that needs the user: `blocked` with `question` (it posts the question; do
-  not repeat it through `clarify`). Then end the turn, or continue only with tasks
-  that do not depend on the answer. When it arrives in the thread: `unblocked`.
-  If it returns `LABEL_MISSING` (question posted), ask once for a team `Blocked` label.
+- anything that needs the user: `blocked` with `question` (it posts the question; don't repeat
+  it through `clarify`), then end the turn or go on only with tasks that don't depend on the
+  answer; when it arrives in the thread: `unblocked`. `LABEL_MISSING` (question posted): ask
+  once for a team `Blocked` label.
 
 **Finish.** Open the PR from the branch (load `superpowers:finishing-a-development-branch`
-for the mechanics; never merge). Move the project ticket to In Review
-(`linear_issue_update(id=<session ticket>, state="In Review")`), then end with the final
-reply (PR link and a short summary).
+for the mechanics; never merge). Then `linear_session_link` the PR URL and `linear_attach` it
+to the session ticket (`id=<session ticket>, url=<PR URL>`; `ALREADY_LINKED` means done). Move
+the project ticket to In Review (`linear_issue_update(id=<session ticket>, state="In Review")`),
+then end with the final reply (PR link and a short summary).
 
 ## Large projects
 
@@ -147,4 +147,4 @@ ticket to the app (never via other Linear tools or MCP servers; they act as the 
   task is still in the plan is recreated on the next plan sync; ask whether to drop it.
 - `T<n> · <name>` task sub-tickets are never delegated (the plugin declines): all SDD work
   runs in the project ticket's session. Sub-project tickets are top-level and delegated.
-- On resume (crash, restart, new prompt): re-read the ledger and `git log`, re-sync spec and plan, go on.
+- On resume (crash, restart, new prompt) re-read ledger and `git log`, re-sync spec and plan, go on.

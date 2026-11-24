@@ -325,6 +325,15 @@ def test_skill_body_is_a_short_overlay_naming_every_tool():
         assert f"superpowers:{stage}" in text, stage
 
 
+def test_skill_finish_links_pr():
+    text = SKILL_MD.read_text()
+    _, _, rest = text.partition("**Finish.**")
+    finish = rest.split("\n## ", 1)[0]
+    assert finish, "no **Finish.** paragraph"
+    assert "`linear_session_link`" in finish
+    assert "`linear_attach`" in finish
+
+
 def test_skill_ships_as_package_data():
     meta = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
     data = meta["tool"]["setuptools"]["package-data"]["hermes_linear"]

@@ -46,6 +46,7 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 | Press **Stop** | The running turn is interrupted; the agent reports what it finished and what it didn't. |
 | Answer an approval / question pick-list | The agent continues. Free text never counts as approval of a risky action. |
 | The agent wants to write to a ticket outside its own (not the session ticket, its sub-tickets or tickets it created from it) | It asks first: an **Allow once / Deny** pick-list in the thread names the tool, the target ticket and the arguments. *Allow once* runs exactly that call; any other call asks again. Unanswered within Hermes's `approvals.timeout`, the question stays pending: answer it later and the agent re-runs the call without a second prompt. Set with `out_of_scope_writes`. |
+| The agent attaches a file or link (e.g. its PR) | It shows in the ticket's attachments, added by the app. The agent also links its PR on the agent session (`linear_session_link`). Only files Hermes would deliver as media are uploaded (see [Attachments](#attachments)); another ticket asks first, like any out-of-scope write. |
 | Remove the delegation | Any running turn stops. The session's memory is kept; re-delegating resumes it — unless the ticket is Done or Canceled, which starts a fresh session. |
 
 Everything the agent does appears in Linear's agent session panel: every tool call as an *action* with its result preview, commentary as *thoughts*, the final answer as a comment in the thread. Two prompts arriving at once (e.g. from two threads) are queued, never interleaved.
@@ -56,15 +57,27 @@ The plugin gives the agent these tools. They act as the Linear app (every write 
 
 | Tool | What it does |
 |---|---|
-| `linear_issue_get` | Read any issue: state, labels, project and its links, parent, children. |
+| `linear_issue_get` | Read any issue: state, labels, project and its links, parent, children, assignee, delegate, priority, estimate, due date, cycle, milestone, relations (both directions) and attachments. `comments: N` (0–50, default 0) adds the newest N comment threads, newest first, each with its replies oldest first; past 50,000 characters the oldest threads are dropped and `comments_truncated` is `true`. |
+| `linear_search` | Find issues: full-text `text` (optionally `include_comments`), or the most recently updated issues. Typed filters, ANDed: `team` (key), `project` (UUID or name), `state` (workflow type or state name), `assignee` / `delegate` (`me`, an email or a name), `label`, `parent`. Pages of `limit` rows (1–50, default 25) with `next_cursor`; anything more complex goes through `linear_query`. |
 | `linear_issue_create` | Create an issue in the session ticket's team and project, optionally under a `parent`. |
 | `linear_issue_update` | Change title, description, state, labels or parent. |
 | `linear_comment` | Comment on an issue, or edit the app's own marked comment. |
 | `linear_sync_spec`, `linear_sync_plan` | Render a committed spec / plan into the ticket description, the plan comment and task sub-tickets. |
 | `linear_task_state` | Move a task sub-ticket along (`in_progress`, `in_review`, `done`, `blocked`, `unblocked`). |
 | `linear_query` | Run a read-only GraphQL query as the app (mutations and subscriptions are refused; a result over 50,000 characters is refused with `RESPONSE_TOO_LARGE`). Works in any session. |
+| `linear_attach` | Attach to an issue: `path` + `id` uploads a local file (see [Attachments](#attachments)); `url` + `id` links a URL (a GitHub PR URL as a PR attachment; a URL the issue already has answers `ALREADY_LINKED`); `path` + `embed: true` (no `id`) only uploads and returns `markdown` to put in a comment. |
+| `linear_session_link` | Show a link (usually the PR) on the current turn's Linear agent session. Label defaults to `Pull request` for a GitHub PR URL, else the URL's host; re-adding the same URL is a no-op. |
 
-**Write scope.** In a Linear session, writes go without asking to the session ticket, its descendants, and tickets the app created from it. A `linear_comment`, `linear_issue_update` or `linear_issue_create` aimed elsewhere first answers `APPROVAL_REQUIRED`; the agent's identical re-call asks a human in the thread (see [How it behaves](#how-it-behaves) and `out_of_scope_writes`). `linear_sync_spec`, `linear_sync_plan` and `linear_task_state` refuse any other ticket (`OUT_OF_SCOPE`). Outside a Linear session (e.g. Slack) the write tools refuse (`NOT_LINEAR_SESSION`): an approval given anywhere but the ticket thread never authorizes a Linear write.
+**Write scope.** In a Linear session, writes go without asking to the session ticket, its descendants, and tickets the app created from it. A `linear_comment`, `linear_issue_update`, `linear_issue_create` or `linear_attach` aimed elsewhere first answers `APPROVAL_REQUIRED`; the agent's identical re-call asks a human in the thread (see [How it behaves](#how-it-behaves) and `out_of_scope_writes`). `linear_sync_spec`, `linear_sync_plan` and `linear_task_state` refuse any other ticket (`OUT_OF_SCOPE`). Outside a Linear session (e.g. Slack) the write tools refuse (`NOT_LINEAR_SESSION`): an approval given anywhere but the ticket thread never authorizes a Linear write. `linear_attach` with `embed` and `linear_session_link` target no issue, so they have no scope check, but they too need a Linear session (`NOT_LINEAR_SESSION`). Reads (`linear_issue_get`, `linear_search`, `linear_query`) work from any session.
+
+### Attachments
+
+`linear_attach` uploads a file only if Hermes would deliver it as media to any other channel: the path must be absolute, and Hermes's media-delivery policy (`validate_media_delivery_path`) must accept it. Symlinks are judged and read by their target. By default that is any existing regular file outside a denylist: `.env` files anywhere, `~/.ssh`, `~/.aws`, `~/.gnupg` and the other credential dirs, system dirs such as `/etc`, and Hermes's own state and config (`config.yaml`, `auth.json`, `state.db`, `sessions/`, …). Refused paths answer `PATH_DENIED`; there is no approval for them. In strict mode (`gateway.strict: true` or `HERMES_MEDIA_DELIVERY_STRICT=1`) only the Hermes cache dirs, the dirs in `HERMES_MEDIA_ALLOW_DIRS` and freshly produced files pass. Strict mode also closes the default mode's gap: a credential file outside the denylisted dirs (e.g. `~/.netrc`) passes in default mode.
+
+- Files over 50 MB are refused (`FILE_TOO_LARGE`).
+- Attaching the same file again adds a second attachment and a second upload (Linear's API cannot delete uploads). Re-linking a URL doesn't: it answers `ALREADY_LINKED`, and the issue keeps one attachment.
+- On another ticket, a file or URL attach asks for approval first, like any out-of-scope write. If the upload worked but attaching it failed, the error carries `asset_url` so the agent can embed the file instead.
+- A local file named in a final reply (`MEDIA:`) is still shown by its basename and never uploaded; `linear_attach` is the only upload path.
 
 ## Requirements
 
