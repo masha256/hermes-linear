@@ -149,6 +149,7 @@ def test_parse_good(args, want, update):
     {"estimate": True}, {"estimate": False},
     {"due_date": "2026-02-30"}, {"due_date": "2026-13-01"}, {"due_date": "2026-2-3"},
     {"due_date": "20260203"}, {"due_date": "2026-02-03T00:00:00"}, {"due_date": 20260203},
+    {"due_date": "2026-W05-1"},
     {"cycle": True}, {"cycle": 1.0}, {"cycle": ["1"]},
 ])
 @pytest.mark.parametrize("update", [False, True])

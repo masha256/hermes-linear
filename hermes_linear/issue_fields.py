@@ -28,6 +28,7 @@ SELF_DELEGATION_WARNING = (
     "Delegated to this app: no session starts until a human delegates the issue.")
 
 _DIGITS = re.compile(r"[0-9]+")
+_YMD = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")  # fromisoformat alone takes "2026-W05-1"
 
 
 def _refusal(code: str, extra: dict | None = None) -> Exception:
@@ -64,7 +65,7 @@ def _estimate(v: Any) -> int:
 
 
 def _due_date(v: Any) -> str:
-    if not isinstance(v, str) or len(v) != 10:
+    if not isinstance(v, str) or not _YMD.fullmatch(v):
         raise _bad()
     try:
         return datetime.date.fromisoformat(v).isoformat()
