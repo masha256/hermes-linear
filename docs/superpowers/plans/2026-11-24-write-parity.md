@@ -38,7 +38,7 @@ Linear: RET-121
 
 ---
 
-### Task 1: Directory, list client calls, miss refusals with candidates
+### Task 1: Directory, list client calls, miss refusals with candidates — RET-137
 
 **Files:**
 - Create: `hermes_linear/directory.py`
@@ -59,7 +59,7 @@ Linear: RET-121
 - [ ] **Step 4: Run** the full suite — expected: all pass.
 - [ ] **Step 5: Commit** `feat: name directory with TTL cache and candidate-carrying misses (<sub-ticket>)`.
 
-### Task 2: Scalar digest normalization (`FIELD_TYPES`)
+### Task 2: Scalar digest normalization (`FIELD_TYPES`) — RET-138
 
 **Files:**
 - Modify: `hermes_linear/tool_approval.py` (`ARRAY_FIELDS` → `FIELD_TYPES`; `normalize_args` mirrors scalar coercion)
@@ -75,7 +75,7 @@ Linear: RET-121
 - [ ] **Step 4: Run** the full suite — expected: all pass.
 - [ ] **Step 5: Commit** `feat: digest normalization mirrors Hermes scalar coercion (<sub-ticket>)`.
 
-### Task 3: `issue_fields` — parse and resolve the shared fields
+### Task 3: `issue_fields` — parse and resolve the shared fields — RET-139
 
 **Files:**
 - Create: `hermes_linear/issue_fields.py`
@@ -93,7 +93,7 @@ Linear: RET-121
 - [ ] **Step 4: Run** the full suite — expected: all pass.
 - [ ] **Step 5: Commit** `feat: shared issue field parsing and resolution (<sub-ticket>)`.
 
-### Task 4: Create/update field parity, team/project approval targets
+### Task 4: Create/update field parity, team/project approval targets — RET-140
 
 **Files:**
 - Modify: `hermes_linear/agent_tools.py` (`Gate.record_target`; `_parse_create` / `_parse_update` / `_create` / `_update` use `issue_fields`; schemas gain the fields; descriptions updated)
@@ -114,7 +114,7 @@ Linear: RET-121
 - [ ] **Step 5: Run** the full suite + `hermes plugins validate .` — expected: all pass, validate passes.
 - [ ] **Step 6: Commit** `feat: create/update field parity with team and project approval targets (<sub-ticket>)`.
 
-### Task 5: `linear_relation` and `linear_task_state blocked_by`
+### Task 5: `linear_relation` and `linear_task_state blocked_by` — RET-141
 
 **Files:**
 - Create: `hermes_linear/tools_relation.py`
@@ -134,7 +134,7 @@ Linear: RET-121
 - [ ] **Step 3: Run** — expected: FAIL. **Step 4: Implement.** **Step 5: Run** full suite + validate + skill cap test — expected: pass.
 - [ ] **Step 6: Commit** `feat: linear_relation and task_state blocked_by (<sub-ticket>)`.
 
-### Task 6: `linear_comment` `reply_to` and `resolve`
+### Task 6: `linear_comment` `reply_to` and `resolve` — RET-142
 
 **Files:**
 - Modify: `hermes_linear/linear_client.py` (`QUERY_COMMENT_GET`, `MUTATION_COMMENT_RESOLVE`; `comment_get(id)`, `comment_create(issue_id, body, parent_id=None)`, `comment_resolve(id, resolving_id)`)
@@ -152,7 +152,7 @@ Linear: RET-121
 - [ ] **Step 3: Run** — FAIL. **Step 4: Implement.** **Step 5: Run** full suite — pass.
 - [ ] **Step 6: Commit** `feat: linear_comment thread replies and resolve (<sub-ticket>)`.
 
-### Task 7: `linear_lookup`
+### Task 7: `linear_lookup` — RET-143
 
 **Files:**
 - Create: `hermes_linear/tools_lookup.py`
@@ -168,7 +168,7 @@ Linear: RET-121
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement.** **Step 4: Run** full suite + validate — pass.
 - [ ] **Step 5: Commit** `feat: linear_lookup over the cached directory (<sub-ticket>)`.
 
-### Task 8: README, skill text, final checks
+### Task 8: README, skill text, final checks — RET-144
 
 **Files:**
 - Modify: `README.md` (tool table: new args on create/update/comment/task_state, `linear_relation`, `linear_lookup`, new error codes; self-delegation note)
