@@ -39,6 +39,10 @@ Usage::
     ws.add_comment(self_id, "hi", user="human-1")
     adapter = LinearAdapter(..., client=ws)
 
+- uploads / attachments (RET-134): ``file_upload`` stores the bytes under a fake asset URL;
+  ``attachment_create`` / ``attachment_link_url`` / ``attachment_link_github_pr`` store
+  ``{id, issue, url, title, subtitle}`` and return ``{id, url}`` (duplicates not modelled).
+
 Later tasks extend it (relations, documents, …); keep each addition small and listed here.
 """
 
@@ -106,6 +110,8 @@ class FakeWorkspace:
         self.states: dict[str, list[dict]] = {TEAM: [dict(s) for s in DEFAULT_STATES]}
         self.labels: dict[str, list[dict]] = {TEAM: [dict(lb) for lb in DEFAULT_LABELS]}
         self.workspace_labels: list[dict] = [dict(lb) for lb in WORKSPACE_LABELS]
+        self.uploads: dict[str, dict] = {}  # asset URL -> {name, content_type, data}
+        self.attachments: dict[str, dict] = {}  # id -> {id, issue, url, title, subtitle}
         self.calls: list[tuple[str, Any]] = []
         self._ids = itertools.count(1)
         self._numbers = itertools.count(100)
@@ -144,8 +150,9 @@ class FakeWorkspace:
         raise _not_found("Issue")
 
     def writes(self) -> list[tuple[str, Any]]:
-        return [c for c in self.calls if c[0] in {"issue_create", "issue_update",
-                                                  "comment_create", "comment_update"}]
+        return [c for c in self.calls if c[0] in {
+            "issue_create", "issue_update", "comment_create", "comment_update", "file_upload",
+            "attachment_create", "attachment_link_url", "attachment_link_github_pr"}]
 
     def default_state(self, team: str) -> str:
         """The team's first ``backlog``/``unstarted`` state (see the module docstring)."""
@@ -276,3 +283,30 @@ class FakeWorkspace:
     async def team_labels(self, team_id: str) -> list[dict]:
         self.calls.append(("team_labels", team_id))
         return [dict(lb) for lb in [*self.labels.get(team_id, []), *self.workspace_labels]]
+
+    # -- uploads and attachments (RET-134) ------------------------------
+    async def file_upload(self, name: str, content_type: str, data: bytes) -> str:
+        self.calls.append(("file_upload", (name, content_type, data)))
+        url = f"https://uploads.linear.app/fake/{next(self._ids)}/{name}"
+        self.uploads[url] = {"name": name, "content_type": content_type, "data": data}
+        return url
+
+    def _attach(self, issue_id: str, url: str, title: str | None,
+                subtitle: str | None = None) -> dict:
+        aid = f"att-{next(self._ids)}"
+        self.attachments[aid] = {"id": aid, "issue": self.issue(issue_id)["id"], "url": url,
+                                 "title": title, "subtitle": subtitle}
+        return {"id": aid, "url": url}
+
+    async def attachment_create(self, issue_id: str, title: str, subtitle: str | None,
+                                url: str) -> dict:
+        self.calls.append(("attachment_create", (issue_id, title, subtitle, url)))
+        return self._attach(issue_id, url, title, subtitle)
+
+    async def attachment_link_url(self, issue_id: str, url: str, title: str | None) -> dict:
+        self.calls.append(("attachment_link_url", (issue_id, url, title)))
+        return self._attach(issue_id, url, title)
+
+    async def attachment_link_github_pr(self, issue_id: str, url: str) -> dict:
+        self.calls.append(("attachment_link_github_pr", (issue_id, url)))
+        return self._attach(issue_id, url, None)

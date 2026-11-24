@@ -19,7 +19,7 @@ The `linear_*` tools are deferred behind tool search. Load a schema with `tool_d
 (exact names), then call it with `tool_call`, one entry per call:
 `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])` (a batch of
 several plugin tools is rejected). Calling `linear_issue_get(...)` directly fails as an unknown
-tool. Below, `linear_x(...)` is shorthand — always call via `tool_call`. The nine tools:
+tool. Below, `linear_x(...)` is shorthand — always call via `tool_call`. The ten tools:
 
 - `linear_issue_get` (`id`, `comments?` = newest N threads): fields, relations, attachments, children.
 - `linear_search` (`text?`, `team?`, `project?`, `state?`, `assignee?`, `label?`, `parent?`, …):
@@ -31,11 +31,12 @@ tool. Below, `linear_x(...)` is shorthand — always call via `tool_call`. The n
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
 - `linear_task_state` (`id`, `state` = `in_progress|in_review|done|blocked|unblocked`, `summary?`, `question?`).
 - `linear_query` (`query`, `variables?`): read-only GraphQL; a result over 50,000 chars is refused.
+- `linear_attach` (`id` + `path`/`url`, `title?`; or `path` + `embed: true` → `markdown`): file or link.
 
 They act as the Linear app, never raise, fail as `{"ok": false, "error": …}` and are safe to
 re-run. Writes to the session ticket, its descendants and tickets made from it (any turn) just
-run. An out-of-scope `linear_comment`, `linear_issue_update` or `linear_issue_create` returns
-`APPROVAL_REQUIRED`: call it again with identical arguments to ask a human in Linear.
+run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue_create` or
+`linear_attach` returns `APPROVAL_REQUIRED`: call it again with identical arguments to ask a human in Linear.
 
 ## Questions and approvals
 
@@ -146,5 +147,4 @@ ticket to the app (never via other Linear tools or MCP servers; they act as the 
   task is still in the plan is recreated on the next plan sync; ask whether to drop it.
 - `T<n> · <name>` task sub-tickets are never delegated (the plugin declines): all SDD work
   runs in the project ticket's session. Sub-project tickets are top-level and delegated.
-- On resume (crash, restart, new prompt): re-read the ledger and `git log`, re-sync the
-  spec and plan, then continue.
+- On resume (crash, restart, new prompt): re-read the ledger and `git log`, re-sync spec and plan, go on.

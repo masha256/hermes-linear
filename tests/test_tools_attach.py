@@ -7,11 +7,20 @@ control; strict delivery mode is switched off so the default policy is what's ju
 
 from __future__ import annotations
 
-import os
+import asyncio
+import json
+import subprocess
+import sys
 
 import pytest
 
-from hermes_linear import agent_tools, tools_attach
+from conftest import REPO_ROOT
+from test_agent_tools_generic import SELF, adapter, loop, pin_ctx, ws  # noqa: F401 - fixtures
+
+from hermes_linear import agent_tools, plugin, tools_attach
+from hermes_linear.agent_tools import TOOL_HANDLERS, TOOL_SCHEMAS
+from hermes_linear.linear_client import LinearError, UploadError
+from hermes_linear.tool_approval import digest
 from hermes_linear.tools_attach import AttachFile, load_attach_file
 
 
@@ -124,6 +133,332 @@ def test_max_bytes_is_50_mb():
     assert tools_attach.ATTACH_MAX_BYTES == 50 * 1024 * 1024
 
 
-def test_registers_nothing_yet():
-    assert tools_attach.SCHEMAS == {} and tools_attach.HANDLERS == {}
-    assert os.path.basename(tools_attach.__file__) == "tools_attach.py"
+
+
+# --- linear_attach (RET-134; spec §1.3, §2.4) ------------------------------------------------
+#
+# Handlers run against ``FakeWorkspace`` (``ws``: RET-1 = the session issue SELF, RET-2 its
+# child, OTH-9 unrelated with no parent) on a real background loop, as in
+# ``test_agent_tools_generic``; the files are real tmp files the real path policy allows.
+
+linear_attach = TOOL_HANDLERS.get("linear_attach")
+OTHER = "uuid-other"
+PR = "https://github.com/masha256/hermes-linear/pull/12"
+
+
+@pytest.fixture
+def png(work):
+    p = work / "x.png"
+    p.write_bytes(b"\x89PNG-bytes")
+    return p
+
+
+def _calls(ws, *names):
+    return [c for c in ws.calls if c[0] in names]
+
+
+def _uploads(ws):
+    return _calls(ws, "file_upload")
+
+
+def _attaches(ws):
+    return _calls(ws, "attachment_create", "attachment_link_url", "attachment_link_github_pr")
+
+
+def test_file_attach_in_scope(pin_ctx, ws, png):
+    out = linear_attach({"id": "RET-1", "path": str(png)})
+    [(_, (name, ctype, data))] = _uploads(ws)
+    assert (name, ctype, data) == ("x.png", "image/png", b"\x89PNG-bytes")
+    asset = next(iter(ws.uploads))
+    assert _attaches(ws) == [("attachment_create", (SELF, "x.png", None, asset))]
+    att = next(iter(ws.attachments))
+    assert out == {"ok": True, "attachment_id": att, "asset_url": asset, "issue": "RET-1",
+                   "url": asset}
+
+
+def test_file_attach_passes_title_and_subtitle(pin_ctx, ws, png):
+    out = linear_attach({"id": "RET-2", "path": str(png), "title": "Screenshot",
+                         "subtitle": "after the fix"})
+    assert out["ok"] is True and out["issue"] == "RET-2"
+    [(_, args)] = _attaches(ws)
+    assert args[:3] == ("uuid-child", "Screenshot", "after the fix")
+
+
+def test_github_pr_url_uses_link_github_pr(pin_ctx, ws):
+    out = linear_attach({"id": "RET-1", "url": PR, "title": "ignored for a PR"})
+    assert _uploads(ws) == []
+    assert _attaches(ws) == [("attachment_link_github_pr", (SELF, PR))]
+    assert out == {"ok": True, "attachment_id": next(iter(ws.attachments)), "issue": "RET-1",
+                   "url": PR}
+
+
+def test_plain_url_uses_link_url(pin_ctx, ws):
+    url = "https://example.test/build/42"
+    out = linear_attach({"id": "RET-1", "url": url, "title": "Build 42"})
+    assert _uploads(ws) == []
+    assert _attaches(ws) == [("attachment_link_url", (SELF, url, "Build 42"))]
+    assert out["ok"] is True and out["url"] == url and "asset_url" not in out
+    # A PR-looking URL off github.com, or a non-PR GitHub URL, is a plain link.
+    for other in ("https://github.com/a/b/issues/3", "https://gitlab.com/a/b/pull/3"):
+        linear_attach({"id": "RET-1", "url": other})
+    assert [c[0] for c in _attaches(ws)][1:] == ["attachment_link_url"] * 2
+
+
+def test_github_pr_re():
+    ok = [PR, PR + "/files", PR + "?x=1", PR + "#discussion"]
+    bad = ["https://github.com/a/b/pull/x", "http://github.com/a/b/pull/1",
+           "https://github.com/a/b/pull/1x", "https://github.com/a/pull/1"]
+    assert all(tools_attach.GITHUB_PR_RE.match(u) for u in ok)
+    assert not any(tools_attach.GITHUB_PR_RE.match(u) for u in bad)
+
+
+def test_embed_uploads_only(pin_ctx, ws, png, work):
+    out = linear_attach({"path": str(png), "embed": True})
+    asset = next(iter(ws.uploads))
+    assert out == {"ok": True, "asset_url": asset, "markdown": f"![x.png]({asset})"}
+    txt = work / "notes.txt"
+    txt.write_text("hello")
+    out = linear_attach({"path": str(txt), "embed": True})
+    assert out["markdown"] == f"[notes.txt]({out['asset_url']})"
+    assert len(_uploads(ws)) == 2 and _attaches(ws) == []
+
+
+def test_embed_markdown_escapes_name():
+    assert tools_attach.embed_markdown("a]b).png", "image/png", "https://u/1") == "![a\\]b\\).png](https://u/1)"
+    assert tools_attach.embed_markdown("[x](y).txt", "text/plain", "https://u/2") == \
+        "[\\[x\\]\\(y\\).txt](https://u/2)"
+    assert tools_attach.embed_markdown("a\\b\nc.bin", "application/octet-stream", "https://u/3") == \
+        "[a\\\\b c.bin](https://u/3)"
+
+
+BAD_ARGS = [
+    {"id": "RET-1", "path": "/x/y.png", "url": "https://example.test"},  # both
+    {"id": "RET-1"},  # neither
+    {"id": "RET-1", "path": "/x/y.png", "embed": True},  # embed with id
+    {"url": "https://example.test", "embed": True},  # embed with url
+    {"path": "/x/y.png"},  # no id, no embed
+    {"url": "https://example.test"},  # no id
+    {"id": "RET-1", "url": "ftp://x"},
+    {"id": "RET-1", "url": "javascript:alert(1)"},
+    {"id": "RET-1", "url": "https://"},  # no host
+    {"id": "RET-1", "path": 3},
+    {"id": "RET-1", "url": "https://example.test", "title": 5},
+    {"path": "/x/y.png", "embed": "yes"},
+    {"id": "  ", "url": "https://example.test"},
+]
+
+
+@pytest.mark.parametrize("args", BAD_ARGS)
+def test_bad_combinations(pin_ctx, ws, args):
+    assert linear_attach(dict(args)) == {"ok": False, "error": "BAD_ARGS"}
+    assert ws.calls == []
+
+
+def test_file_policy_errors_before_any_call(pin_ctx, ws, work):
+    (work / ".env").write_text("SECRET=1")
+    assert linear_attach({"id": "RET-1", "path": str(work / ".env")})["error"] == "PATH_DENIED"
+    assert linear_attach({"id": "RET-1", "path": "rel.txt"})["error"] == "PATH_DENIED"
+    assert linear_attach({"path": str(work / "nope.png"), "embed": True})["error"] == \
+        "FILE_NOT_FOUND"
+    assert ws.calls == []
+
+
+def test_parse_passes_the_session_key(pin_ctx, ws, png, monkeypatch):
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    seen = []
+    real = tools_attach.load_attach_file
+    monkeypatch.setattr(tools_attach, "load_attach_file",
+                        lambda path, key: seen.append(key) or real(path, key))
+    tokens = set_session_vars(platform="linear", session_key="agent:main:linear:x")
+    try:
+        assert linear_attach({"path": str(png), "embed": True})["ok"] is True
+    finally:
+        clear_session_vars(tokens)
+    assert seen == ["agent:main:linear:x"]
+
+
+def test_embed_needs_linear_session(pin_ctx, ws, png):
+    pin_ctx(linear=False)
+    assert linear_attach({"path": str(png), "embed": True}) == {
+        "ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert ws.calls == []
+
+
+def test_attach_needs_linear_session(pin_ctx, ws, png):
+    pin_ctx(linear=False)
+    assert linear_attach({"id": "RET-1", "path": str(png)})["error"] == "NOT_LINEAR_SESSION"
+    assert ws.writes() == []
+
+
+def test_out_of_scope_first_pass_uploads_nothing(pin_ctx, ws, adapter, png):
+    args = {"id": "OTH-9", "path": str(png)}
+    out = linear_attach(dict(args))
+    assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED"
+    assert "OTH-9" in out["message"] and "linear_attach" in out["message"]
+    assert _uploads(ws) == [] and ws.writes() == []
+    req = adapter._store.request("sk", digest("linear_attach", args))
+    assert req is not None and req.targets == [OTHER] and req.tool == "linear_attach"
+
+
+def test_out_of_scope_url_first_pass_links_nothing(pin_ctx, ws):
+    out = linear_attach({"id": "OTH-9", "url": PR})
+    assert out["error"] == "APPROVAL_REQUIRED" and ws.writes() == []
+
+
+def test_approved_rerun_uploads_and_attaches_once(pin_ctx, ws, adapter, png):
+    args = {"id": "OTH-9", "path": str(png)}
+    assert linear_attach(dict(args))["error"] == "APPROVAL_REQUIRED"
+    dg = digest("linear_attach", args)
+    assert adapter._store.arm_request("sk", dg) is not None
+    out = linear_attach(dict(args))
+    assert out["ok"] is True and out["issue"] == "OTH-9"
+    assert len(_uploads(ws)) == 1
+    assert [(c[0], c[1][0]) for c in _attaches(ws)] == [("attachment_create", OTHER)]
+    assert adapter._store.request("sk", dg) is None  # consumed by the approved pass
+
+
+def test_approved_rerun_with_missing_file(pin_ctx, ws, adapter, png):
+    """Review Focus 4: the digest binds the path, not the bytes; the re-run reads again."""
+    args = {"id": "OTH-9", "path": str(png)}
+    assert linear_attach(dict(args))["error"] == "APPROVAL_REQUIRED"
+    dg = digest("linear_attach", args)
+    adapter._store.arm_request("sk", dg)
+    png.unlink()
+    assert linear_attach(dict(args)) == {"ok": False, "error": "FILE_NOT_FOUND"}
+    assert ws.writes() == []
+    assert adapter._store.take_armed_request("sk", dg) is not None  # not consumed
+
+
+def test_deny_mode_refuses_out_of_scope(pin_ctx, ws, adapter, png):
+    from test_agent_tools_generic import deny_mode
+
+    deny_mode(adapter)
+    assert linear_attach({"id": "OTH-9", "path": str(png)})["error"] == "OUT_OF_SCOPE"
+    assert ws.writes() == []
+
+
+def test_upload_failed(pin_ctx, ws, png):
+    async def boom(name, content_type, data):
+        raise UploadError(403)
+
+    ws.file_upload = boom
+    assert linear_attach({"id": "RET-1", "path": str(png)}) == {
+        "ok": False, "error": "UPLOAD_FAILED", "status": 403}
+    assert _attaches(ws) == []
+    assert linear_attach({"path": str(png), "embed": True})["status"] == 403
+
+
+def test_attach_failure_after_upload_returns_asset_url(pin_ctx, ws, png):
+    async def boom(*a):
+        raise LinearError("Unable to create attachment", code="INPUT_ERROR",
+                          detail="Something else went wrong.")
+
+    ws.attachment_create = boom
+    out = linear_attach({"id": "RET-1", "path": str(png)})
+    asset = next(iter(ws.uploads))
+    assert out == {"ok": False, "error": "LINEAR_ERROR", "message": "Something else went wrong.",
+                   "asset_url": asset}
+
+
+@pytest.mark.parametrize("method,url,message", [
+    ("attachment_link_github_pr", PR, "This URL has already been linked with RET-92."),
+    ("attachment_link_url", "https://example.test/a", "An attachment with the same URL already exists."),
+])
+def test_relink_is_already_linked(pin_ctx, ws, method, url, message):
+    """Ruling R4 (spec §4 item 4): Linear refuses a re-link with INPUT_ERROR."""
+    async def boom(*a):
+        raise LinearError("Unable to create issue attachment", code="INPUT_ERROR",
+                          detail=message)
+
+    setattr(ws, method, boom)
+    assert linear_attach({"id": "RET-1", "url": url}) == {
+        "ok": False, "error": "ALREADY_LINKED", "message": message}
+
+
+def test_relink_matches_the_message_text_case_insensitively(pin_ctx, ws):
+    async def boom(*a):
+        raise LinearError("THIS URL HAS ALREADY BEEN LINKED WITH RET-92.", code="INPUT_ERROR")
+
+    ws.attachment_link_url = boom
+    out = linear_attach({"id": "RET-1", "url": "https://example.test/a"})
+    assert out["error"] == "ALREADY_LINKED"
+    assert out["message"] == "THIS URL HAS ALREADY BEEN LINKED WITH RET-92."
+
+
+@pytest.mark.parametrize("exc", [
+    LinearError("Unable to create issue attachment", code="INPUT_ERROR",
+                detail="Argument Validation Error: url must be a URL."),
+    LinearError("An attachment with the same URL already exists.", code="RATELIMITED"),
+])
+def test_other_url_errors_stay_linear_error(pin_ctx, ws, exc):
+    async def boom(*a):
+        raise exc
+
+    ws.attachment_link_url = boom
+    out = linear_attach({"id": "RET-1", "url": "https://example.test/a"})
+    assert out["ok"] is False and out["error"] == "LINEAR_ERROR"
+    assert out["message"] == (exc.detail or str(exc)) and "asset_url" not in out
+
+
+def test_unknown_issue_is_not_found(pin_ctx, ws, png):
+    assert linear_attach({"id": "NOPE-1", "path": str(png)})["error"] == "NOT_FOUND"
+    assert ws.writes() == []
+
+
+def test_wrong_thread_on_loop(pin_ctx, ws, loop, png):
+    async def on_loop():
+        return linear_attach({"id": "RET-1", "path": str(png)})
+
+    out = asyncio.run_coroutine_threadsafe(on_loop(), loop).result(10)
+    assert out == {"ok": False, "error": "WRONG_THREAD"}
+    assert ws.calls == []
+
+
+def test_never_raises(pin_ctx, ws, png):
+    async def boom(*a):
+        raise RuntimeError("bug")
+
+    ws.attachment_create = boom
+    assert linear_attach({"id": "RET-1", "path": str(png)})["error"] == "INTERNAL_ERROR"
+    assert linear_attach(None) == {"ok": False, "error": "BAD_ARGS"}
+
+
+def test_registry_returns_str(pin_ctx, ws, png):
+    raw = plugin.tool_handler("linear_attach")({"id": "RET-1", "path": str(png)})
+    assert isinstance(raw, str) and json.loads(raw)["ok"] is True
+    raw = plugin.tool_handler("linear_attach")({"id": "RET-1"})
+    assert json.loads(raw) == {"ok": False, "error": "BAD_ARGS"}
+
+
+def test_schema():
+    s = TOOL_SCHEMAS["linear_attach"]
+    assert s["name"] == "linear_attach" and "Linear app" in s["description"]
+    assert agent_tools._GATED_NOTE in s["description"]
+    assert "ALREADY_LINKED" in s["description"]
+    assert ".env" in s["description"] and "media" in s["description"]
+    params = s["parameters"]
+    assert "required" not in params
+    props = params["properties"]
+    assert list(props) == ["id", "path", "url", "title", "subtitle", "embed"]
+    assert props["embed"]["type"] == "boolean"
+    assert all(props[k]["type"] == "string" for k in ("id", "path", "url", "title", "subtitle"))
+    assert all(p.get("description") for p in props.values())
+    assert agent_tools.linear_attach is TOOL_HANDLERS["linear_attach"]
+    assert tools_attach.HANDLERS == {"linear_attach": TOOL_HANDLERS["linear_attach"]}
+    assert "linear_attach" in agent_tools.__all__
+
+
+@pytest.mark.parametrize("imports", [
+    "import hermes_linear.tools_attach; from hermes_linear import agent_tools",
+    "from hermes_linear import agent_tools; import hermes_linear.tools_attach",
+])
+def test_roster_merge_any_import_order(imports):
+    """Ruling R3 for ``tools_attach``: either module may be imported first."""
+    code = (f"{imports}; print(list(agent_tools.TOOL_SCHEMAS)[0], "
+            "'linear_attach' in agent_tools.TOOL_HANDLERS, "
+            "agent_tools.linear_attach is agent_tools.TOOL_HANDLERS['linear_attach'])")
+    proc = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT,
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "linear_issue_get True True"

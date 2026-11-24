@@ -138,6 +138,7 @@ Errors (in addition to A's `NOT_LINEAR_SESSION`, `OUT_OF_SCOPE`, `APPROVAL_REQUI
 | `PATH_DENIED` | the path is not absolute, or `validate_media_delivery_path` returned `None` |
 | `FILE_TOO_LARGE` | the file exceeds `ATTACH_MAX_BYTES` (50 MB; Linear accepts more, §4.2) |
 | `UPLOAD_FAILED` | the PUT answered with a non-2xx status (`status` included) |
+| `ALREADY_LINKED` | URL mode: Linear refused a re-link of a URL the issue already has (`INPUT_ERROR` whose message contains "already been linked" or "already exists", case-insensitive; `message` is Linear's). Any other `INPUT_ERROR` stays `LINEAR_ERROR` (Ruling R4) |
 
 If the attachment step fails after a successful upload, the error also carries
 `asset_url`, so the agent can embed the file instead or retry. The orphaned asset stays,
@@ -233,7 +234,7 @@ The body runs on the adapter loop:
 1. Not a Linear session → `NOT_LINEAR_SESSION`.
 2. With `id`: `_writable(ctx, id)`, then `_check_gate(ctx)`, **before** any write. A
    first pass that needs approval uploads nothing.
-3. For `path`: `client.file_upload(size, name, content_type, data)`:
+3. For `path`: `client.file_upload(name, content_type, data)` (the size is `len(data)`):
    - `fileUpload(size, filename, contentType)` → `uploadFile {uploadUrl, assetUrl, headers}`;
    - an HTTP PUT of the bytes to `uploadUrl` with `Content-Type`,
      `Cache-Control: public, max-age=31536000` and every returned header, on the client's
@@ -328,7 +329,8 @@ Live, as the app, before the plan's tasks rely on these:
    linked with RET-92." for `attachmentLinkURL`, also when a new `title` is passed;
    "Duplicate attachment for duplicate url" / "An attachment with the same URL already
    exists." for `attachmentLinkGitHubPR`). So a repeated `linear_attach` of a URL answers
-   `LINEAR_ERROR` with that `detail`, and the issue keeps one attachment.
+   `ALREADY_LINKED` with Linear's message (§1.3; Ruling R4), and the issue keeps one
+   attachment.
 5. `validate_media_delivery_path(path, session_key=…)` called from a plugin tool thread
    gives the same verdicts as in the gateway. Already probed from the Hermes venv:
    `~/.ssh/id_ed25519`, `state.db`, a repo `.env`, `/etc/hostname` and a relative path

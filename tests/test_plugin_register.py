@@ -51,7 +51,7 @@ SKILL_DESCRIPTION = "Use when a repo has .hermes-linear.yaml or ticket says so."
 SKILL_MD = REPO_ROOT / "hermes_linear" / "skills" / "manage-superpowers" / "SKILL.md"
 TOOL_NAMES = ["linear_issue_get", "linear_issue_create", "linear_issue_update", "linear_comment",
               "linear_sync_spec", "linear_sync_plan", "linear_task_state", "linear_query",
-              "linear_search"]
+              "linear_search", "linear_attach"]
 
 
 class FakeCtx:
