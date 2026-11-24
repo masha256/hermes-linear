@@ -227,11 +227,12 @@ async def test_per_client_isolation():
 
 
 def test_for_client_holds_clients_weakly():
+    import gc
+    gc.collect()  # drop earlier tests' unreachable clients first, so only `c` goes below
     c = StubClient(states=[STATES])
     for_client(c)
     assert len(directory._DIRECTORIES) >= 1
     n = len(directory._DIRECTORIES)
     del c
-    import gc
     gc.collect()
     assert len(directory._DIRECTORIES) == n - 1
