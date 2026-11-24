@@ -278,13 +278,15 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
     def _sweep_live_controls(self) -> None:
         """Restart sweep (spec §8): the Hermes waiters of an earlier process are gone, so every
         ``live`` control becomes a ``pending`` question (answered as the next turn) and its
-        target gets ``Blocked``; nothing is posted. Grants are cleared. Once per process."""
+        target gets ``Blocked``; nothing is posted. Grants and approval requests are
+        cleared. Once per process."""
         if self._profile in _SWEPT_PROFILES:
             return
         _SWEPT_PROFILES.add(self._profile)
         store, client = self._store, self._client
         try:
             store.drop_all_grants()
+            store.drop_all_requests()
             for row in store.live_controls():
                 if not row.question:  # pre-RET-94 row: cannot be framed as an answer
                     log.info("linear: dropping live control %s without question at restart",

@@ -102,6 +102,10 @@ that includes the identifier and URL of each ticket they touch.
 - `linear_comment(id, body, edit_marker?)`: with `edit_marker`, the tool edits the
   app's existing comment that carries the hidden marker `<!-- hermes-linear:<marker> -->`.
   If no such comment exists, it creates one.
+- `linear_query(query, variables?)`: runs a read-only GraphQL document as the app, in
+  any session. A top-level `mutation` or `subscription` is `READ_ONLY`; a result over
+  50,000 chars is `RESPONSE_TOO_LARGE`. Guard, limits and errors:
+  [RET-119 spec §3](2026-11-23-out-of-scope-approval-design.md#3-linear_query).
 
 ### 4.2 Sync
 
@@ -138,9 +142,12 @@ that includes the identifier and URL of each ticket they touch.
 
 ### 4.3 Guardrails
 
-- Writes are limited to the session's own ticket, its descendants, and tickets these
+- The write scope is the session's own ticket, its descendants, and tickets these
   tools created from that ticket (and their descendants). Reads work across the
-  workspace.
+  workspace. Since RET-119, an out-of-scope `linear_comment`, `linear_issue_update` or
+  `linear_issue_create` asks a human in the ticket thread instead of refusing
+  (`out_of_scope_writes`, default `approve`); the sync and task tools still refuse. See
+  [the out-of-scope approval spec](2026-11-23-out-of-scope-approval-design.md) §1–§2.
 - Created tickets are recorded in the plugin store (`created_issues`), keyed by the
   session ticket they were created from. They stay writable from that ticket in every
   later turn and session, across restarts, and from no other ticket (RET-110). This

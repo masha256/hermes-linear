@@ -153,24 +153,32 @@ QUERY_TEAM_LABELS = """query TeamLabels($teamId: ID!, $after: String) {
 
 
 class LinearError(Exception):
-    """A Linear API failure. ``code`` is the GraphQL/OAuth error code if any."""
+    """A Linear API failure. ``code`` is the GraphQL/OAuth error code if any; ``detail`` is
+    Linear's ``extensions.userPresentableMessage`` if any."""
 
-    def __init__(self, message: str = "", *, code: str | None = None, status: int | None = None):
+    def __init__(self, message: str = "", *, code: str | None = None, status: int | None = None,
+                 detail: str | None = None):
         super().__init__(message)
         self.code = code
         self.status = status
+        self.detail = detail
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"LinearError({str(self)!r}, code={self.code!r}, status={self.status!r})"
+        return (f"LinearError({str(self)!r}, code={self.code!r}, status={self.status!r}, "
+                f"detail={self.detail!r})")
 
 
-def _first_error(body: Any) -> tuple[str | None, str]:
+def _first_error(body: Any) -> tuple[str | None, str, str | None]:
+    """``(code, message, detail)`` of the first GraphQL error (``detail``: the
+    ``extensions.userPresentableMessage``)."""
     errors = body.get("errors") if isinstance(body, dict) else None
     if not errors:
-        return None, ""
+        return None, "", None
     err = errors[0] if isinstance(errors[0], dict) else {}
-    code = (err.get("extensions") or {}).get("code")
-    return code, str(err.get("message") or "GraphQL error")
+    ext = err.get("extensions") if isinstance(err.get("extensions"), dict) else {}
+    detail = ext.get("userPresentableMessage")
+    return (ext.get("code"), str(err.get("message") or "GraphQL error"),
+            str(detail) if detail else None)
 
 
 def _retry_after(headers: Any) -> float:
@@ -289,7 +297,7 @@ class LinearClient:
         while True:
             tok = await self.token()
             status, body, headers = await self._post_gql(tok, payload)
-            code, message = _first_error(body)
+            code, message, detail = _first_error(body)
 
             if status == 401 or code in _AUTH_CODES:
                 if renewed:
@@ -309,7 +317,7 @@ class LinearClient:
             if code is not None or message:
                 if message.startswith(_NOT_FOUND_PREFIX):
                     code = "NOT_FOUND"  # Linear's INPUT_ERROR for an unknown entity
-                raise LinearError(message, code=code, status=status)
+                raise LinearError(message, code=code, status=status, detail=detail)
             if status >= 400 or not isinstance(body, dict) or not isinstance(body.get("data"), dict):
                 raise LinearError(f"unexpected GraphQL response (HTTP {status})", status=status)
             return body["data"]

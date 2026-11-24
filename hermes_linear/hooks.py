@@ -26,6 +26,13 @@ wrapped (scope / probe block) is recognised by its ``calls`` entries.
 ``transform_tool_result`` (RET-94 spec §3) is the exception to "no store access here": it must
 answer synchronously, so it reads (and, for a clarify answered elsewhere, drops) control rows
 on the calling thread. ``Store`` is thread-safe; there is still no network I/O or loop hop.
+
+Out-of-scope write approval (RET-119 spec §2.1 steps 3-6, §2.5) reads and writes the store
+the same way: for a gated write with a stored approval request, ``pre_tool_call`` arms it and
+returns Hermes's ``approve`` directive, and ``post_tool_call`` disarms it. A denial or timeout
+leaves Hermes's own block result: Hermes does not run ``transform_tool_result`` for pre-hook
+blocks (Ruling R9). Every failure gives None: without a directive the handler just refuses
+again with ``APPROVAL_REQUIRED``.
 """
 
 from __future__ import annotations
@@ -38,6 +45,7 @@ from typing import Any
 from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
+from . import tool_approval
 from .questions import APPROVAL_PENDING_TEXT, PENDING_NOTICE
 
 log = logging.getLogger(__name__)
@@ -66,6 +74,71 @@ def _silent(tool_name: Any, args: Any) -> bool:
     names = [str(c.get("name") or "").strip() for c in calls if isinstance(c, dict)] \
         if isinstance(calls, list) else []
     return bool(names) and all(n in _SILENT_TOOLS for n in names)
+
+
+def _bridged_call(tool_name: Any, args: Any) -> tuple[Any, Any]:
+    """``(name, args)`` of the real call: a ``tool_call`` bridge wrapping exactly one call
+    (``calls`` parsed as in :func:`_silent`) is unwrapped; a wrapped batch gives
+    ``(None, None)``; anything else is returned as is."""
+    if tool_name != _BRIDGE_TOOL or not isinstance(args, dict):
+        return tool_name, args
+    calls = args.get("calls")
+    if calls is None:
+        calls = [args]
+    elif isinstance(calls, str):
+        try:
+            calls = json.loads(calls)
+        except ValueError:
+            return None, None
+    if isinstance(calls, dict):
+        calls = [calls]
+    if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
+        return None, None
+    inner = calls[0].get("arguments")
+    if isinstance(inner, str):
+        try:
+            inner = json.loads(inner)
+        except ValueError:
+            return None, None
+    return str(calls[0].get("name") or "").strip(), inner if inner is not None else {}
+
+
+def _gated_request(tool_name: Any, args: Any) -> tuple | None:
+    """``(store, session_key, tool, digest, request)`` for a gated tool call in a Linear
+    session whose approval request is stored in some adapter's store, else None."""
+    if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
+        return None
+    session_key = get_session_env("HERMES_SESSION_KEY") or None
+    if not session_key:
+        return None
+    tool, raw = _bridged_call(tool_name, args)
+    if tool not in tool_approval.GATED_TOOLS:
+        return None
+    try:
+        d = tool_approval.digest(tool, raw)
+    except TypeError:  # args that are not JSON: the handler never stored a request
+        return None
+    for ad in list(adapter_mod.ADAPTERS.values()):
+        store = getattr(ad, "_store", None)
+        if store is None:
+            continue
+        req = store.request(session_key, d)
+        if req is not None:
+            return store, session_key, tool, d, req
+    return None
+
+
+def _approve_directive(tool_name: Any, args: Any) -> dict | None:
+    """Arm the stored request and return Hermes's ``approve`` directive (spec §2.1 step 3)."""
+    found = _gated_request(tool_name, args)
+    if found is None:
+        return None
+    store, session_key, tool, d, _req = found
+    req = store.arm_request(session_key, d)
+    if req is None:  # dropped meanwhile
+        return None
+    return {"action": "approve", "message": req.message,
+            "rule_key": tool_approval.rule_key(tool, d)}
 
 
 def _session(kw: dict) -> dict | None:
@@ -124,8 +197,12 @@ def _schedule(phase: str, env: dict, ev: dict) -> None:
             pass
 
 
-def on_pre_tool_call(tool_name: str, args: Any = None, task_id: Any = None, **kw: Any) -> None:
-    """Observer only: always returns None (never blocks or approves a tool)."""
+def on_pre_tool_call(tool_name: str, args: Any = None, task_id: Any = None,
+                     **kw: Any) -> dict | None:
+    """Schedules the start action; for a gated write with a stored approval request, arms
+    it and returns Hermes's ``approve`` directive so a human is asked. Otherwise None.
+    Any failure gives None (fail-open is safe: the handler then refuses again with
+    ``APPROVAL_REQUIRED``)."""
     try:
         env = None if _silent(tool_name, args) else _session(kw)
         if env is not None:
@@ -134,7 +211,11 @@ def on_pre_tool_call(tool_name: str, args: Any = None, task_id: Any = None, **kw
                                      "session_id": env["session_id"]})
     except Exception as exc:  # noqa: BLE001 - a hook must never break a tool call
         log.debug("linear: pre_tool_call hook failed: %s", type(exc).__name__)
-    return None
+    try:
+        return _approve_directive(tool_name, args)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("linear: pre_tool_call approval lookup failed: %s", type(exc).__name__)
+        return None
 
 
 def on_post_tool_call(tool_name: str, args: Any = None, result: Any = None, task_id: Any = None,
@@ -150,6 +231,13 @@ def on_post_tool_call(tool_name: str, args: Any = None, result: Any = None, task
                 "session_id": env["session_id"]})
     except Exception as exc:  # noqa: BLE001
         log.debug("linear: post_tool_call hook failed: %s", type(exc).__name__)
+    try:
+        found = _gated_request(tool_name, args)
+        if found is not None:  # spec §2.1 step 6: a later hook-less call can't use it
+            store, session_key, _tool, d, _req = found
+            store.disarm_request(session_key, d)
+    except Exception as exc:  # noqa: BLE001
+        log.debug("linear: post_tool_call disarm failed: %s", type(exc).__name__)
     return None
 
 

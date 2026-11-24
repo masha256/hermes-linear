@@ -20,17 +20,19 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import dataclasses
+import json
 import logging
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
 from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
-from . import sync
+from . import graphql_guard, sync, tool_approval
 from .constants import TOOL_TIMEOUT_S
 from .linear_client import LinearError
 
@@ -48,6 +50,39 @@ query IssueParent($id: String!) {
 """
 
 
+class _NeedsApproval(Exception):
+    """Raised by ``Gate.check`` inside a gated body: out-of-scope targets, nothing written."""
+
+    def __init__(self, targets: list[dict]) -> None:
+        super().__init__("approval needed")
+        self.targets = targets
+
+
+@dataclass
+class Gate:
+    """One pass of a gated tool (RET-119 spec §2.1).
+
+    ``approved`` empty: a first pass. ``_writable`` records each out-of-scope target
+    (``{"id", "identifier", "title"}``) instead of refusing it, and ``check`` (called right
+    before the body's first write) raises ``_NeedsApproval`` if anything was recorded.
+    ``approved`` set (the UUIDs of a taken armed request, or mode ``allow``): those issues
+    are writable; any other out-of-scope target is refused ``OUT_OF_SCOPE``.
+    """
+
+    approved: frozenset[str] = frozenset()
+    targets: list[dict] = field(default_factory=list)
+
+    def record(self, issue: dict) -> None:
+        if any(t["id"] == issue["id"] for t in self.targets):
+            return
+        self.targets.append({"id": issue["id"], "identifier": issue.get("identifier"),
+                             "title": issue.get("title")})
+
+    def check(self) -> None:
+        if self.targets:
+            raise _NeedsApproval(list(self.targets))
+
+
 @dataclass
 class ToolContext:
     adapter: Any  # LinearAdapter | None
@@ -55,6 +90,7 @@ class ToolContext:
     session_issue_id: str | None
     session_key: str | None
     is_linear: bool
+    gate: Gate | None = None  # set only for a gated tool's pass (``_tool(gated=...)``)
 
 
 def _err(code: str) -> dict:
@@ -387,9 +423,13 @@ def _on_any_loop() -> bool:
     return False
 
 
+_NEEDS_APPROVAL = "_NEEDS_APPROVAL"  # run()'s sentinel error: never returned to a caller
+
+
 def _tool(parse: Callable[[dict], dict],
           body: Callable[[ToolContext, dict], Coroutine[Any, Any, dict]], *,
-          blocking_parse: bool = False, timeout_s: float = TOOL_TIMEOUT_S,
+          gated: str | None = None, blocking_parse: bool = False,
+          timeout_s: float = TOOL_TIMEOUT_S,
           finish: Callable[[dict, dict], dict] | None = None) -> Callable[..., dict]:
     """Wrap ``parse`` (sync arg validation) and ``body`` (loop coroutine) into a handler.
 
@@ -398,8 +438,12 @@ def _tool(parse: Callable[[dict], dict],
     before ``parse`` runs, so no blocking I/O ever runs on the gateway loop. ``finish``
     (``(parsed, result) -> result``) runs in the tool thread after a successful ``body``,
     e.g. to write a file; it is only allowed together with ``blocking_parse``.
+
+    ``gated`` (the tool name) makes out-of-scope targets ask for approval instead of being
+    refused (``_gated``; RET-119 spec §2.1).
     """
     assert finish is None or blocking_parse, "finish does I/O: needs the on-loop guard"
+    assert finish is None or gated is None, "a gated tool has no finish step"
 
     def handler(args: Any = None, **kw: Any) -> dict:
         try:
@@ -415,12 +459,19 @@ def _tool(parse: Callable[[dict], dict],
             if ctx.client is None:
                 return _err("NOT_CONNECTED")
 
-            async def run() -> dict:
-                try:
-                    return await body(ctx, parsed)
-                except _Refusal as r:
-                    return _err(r.code)
-            result = run_on_adapter(ctx, run, timeout_s=timeout_s)
+            def execute(c: ToolContext) -> dict:
+                async def run() -> dict:
+                    try:
+                        return await body(c, parsed)
+                    except _Refusal as r:
+                        return _err(r.code)
+                    except _NeedsApproval as n:
+                        return {"ok": False, "error": _NEEDS_APPROVAL, "targets": n.targets}
+                return run_on_adapter(c, run, timeout_s=timeout_s)
+
+            if gated is not None:
+                return _gated(gated, args, ctx, execute)
+            result = execute(ctx)
             if finish is not None and result.get("ok"):
                 result = finish(parsed, result)
             return result
@@ -429,15 +480,80 @@ def _tool(parse: Callable[[dict], dict],
     return handler
 
 
+def _gated(tool: str, args: dict, ctx: ToolContext,
+           execute: Callable[[ToolContext], dict]) -> dict:
+    """In the tool thread: run a gated tool's body (RET-119 spec §2.1 steps 1, 2 and 5).
+
+    An armed request for this call (``(session key, digest of the normalized args)``) is
+    taken first: its stored target UUIDs are the only out-of-scope issues the pass may write.
+    Without one, a first pass records out-of-scope targets; then the mode decides: ``deny``
+    refuses, ``allow`` runs again with those targets approved, ``approve`` stores a request
+    and answers ``APPROVAL_REQUIRED``. Fail-closed: no digest or no store refuses
+    ``OUT_OF_SCOPE``, and the run sentinel never reaches the caller.
+    """
+    store = getattr(ctx.adapter, "_store", None)
+    try:
+        dg: str | None = tool_approval.digest(tool, args)
+    except (TypeError, ValueError):  # args that are not JSON: no request can match
+        dg = None
+    can_request = (ctx.is_linear and bool(ctx.session_key) and store is not None
+                   and dg is not None)
+    if can_request:
+        req = store.take_armed_request(ctx.session_key, dg)
+        if req is not None:
+            return _sealed(execute(dataclasses.replace(
+                ctx, gate=Gate(approved=frozenset(req.targets)))))
+    result = execute(dataclasses.replace(ctx, gate=Gate()))
+    if result.get("error") != _NEEDS_APPROVAL:
+        return result
+    targets: list[dict] = result.get("targets") or []
+    settings = getattr(ctx.adapter, "_settings", None)
+    mode = getattr(settings, "out_of_scope_writes", None) or "approve"
+    if mode == "allow":
+        approved = frozenset(t["id"] for t in targets)
+        return _sealed(execute(dataclasses.replace(ctx, gate=Gate(approved=approved))))
+    if mode == "deny" or not can_request or not targets:
+        return _err("OUT_OF_SCOPE")
+    store.put_request(ctx.session_key, dg, tool, [t["id"] for t in targets],
+                      tool_approval.approval_message(tool, targets, args, dg))
+    names = ", ".join(str(t.get("identifier") or t["id"]) for t in targets)
+    return {"ok": False, "error": "APPROVAL_REQUIRED",
+            "message": tool_approval.REQUIRED_TEXT.format(tool=tool, targets=names)}
+
+
+def _sealed(result: dict) -> dict:
+    """An approved pass's result; a target recorded there anyway is ``OUT_OF_SCOPE``."""
+    return _err("OUT_OF_SCOPE") if result.get("error") == _NEEDS_APPROVAL else result
+
+
 async def _writable(ctx: ToolContext, ref: str) -> dict:
-    """``issue_get(ref)`` if the session may write it (by its UUID), else ``_Refusal``."""
+    """``issue_get(ref)`` if the session may write it (by its UUID), else ``_Refusal``.
+
+    For a gated tool (``ctx.gate``): an issue in ``gate.approved`` is writable; on a first
+    pass (nothing approved) a plain ``OUT_OF_SCOPE`` verdict is recorded on the gate and the
+    issue returned, so the body must call ``gate.check()`` before writing. Any other code,
+    or ``OUT_OF_SCOPE`` on an approved pass, is refused.
+    """
     if not ctx.is_linear or not ctx.session_issue_id:
         raise _Refusal("NOT_LINEAR_SESSION")
     issue = await ctx.client.issue_get(ref)
+    gate = ctx.gate
+    if gate is not None and issue["id"] in gate.approved:
+        return issue
     code = await check_write_scope(ctx, issue["id"])
+    if code == "OUT_OF_SCOPE" and gate is not None and not gate.approved:
+        gate.record(issue)
+        return issue
     if code is not None:
         raise _Refusal(code)
     return issue
+
+
+def _check_gate(ctx: ToolContext) -> None:
+    """Right before a gated body's first write: ``_NeedsApproval`` if a target is out of
+    scope. Every scope check (``_writable``) of the body must come before this."""
+    if ctx.gate is not None:
+        ctx.gate.check()
 
 
 async def _state_id(ctx: ToolContext, team_id: str, name: str) -> str:
@@ -518,6 +634,7 @@ async def _create(ctx: ToolContext, a: dict) -> dict:
     labels, _ = await _label_ids(ctx, team, a["labels"])
     if labels:
         inp["labelIds"] = labels
+    _check_gate(ctx)
     issue = await ctx.client.issue_create(inp)
     _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
     return {"ok": True, "issue": issue}
@@ -576,6 +693,7 @@ async def _update(ctx: ToolContext, a: dict) -> dict:
         inp["removedLabelIds"] = removed
     if not inp:  # only no-op removals: never send an empty issueUpdate (Task 2 minor N1)
         return {"ok": True, "issue": _summary(issue)}
+    _check_gate(ctx)  # after both ends' scope checks and the cycle check
     return {"ok": True, "issue": await ctx.client.issue_update(issue["id"], inp)}
 
 
@@ -625,6 +743,7 @@ def _with_marker(body: str, marker: str) -> str:
 
 async def _comment(ctx: ToolContext, a: dict) -> dict:
     issue = await _writable(ctx, a["id"])
+    _check_gate(ctx)
     body, marker = a["body"], a["edit_marker"]
 
     def done(comment_id: str, edited: bool) -> dict:
@@ -987,17 +1106,66 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
     return out
 
 
+# -- linear_query (RET-119 spec §3)
+
+QUERY_MAX_RESULT_CHARS = 50_000
+QUERY_ERROR_MESSAGE_CHARS = 1_000
+#: ``LinearError`` codes ``linear_query`` answers as-is (plus ``message``).
+_QUERY_KEPT_CODES = {"RATELIMITED", "NOT_FOUND", "UNAUTHENTICATED", "AUTHENTICATION_ERROR",
+                     "FORBIDDEN", "NETWORK"}
+_TOO_COMPLEX_PREFIX = "Query too complex"  # live probe: INPUT_ERROR with a presentable detail
+
+
+def _parse_query(args: dict) -> dict:
+    """The read-only guard: runs on the tool thread, before any Linear call."""
+    query = args.get("query")
+    code = graphql_guard.check(query)
+    if code is not None:
+        raise _Refusal(code)
+    variables = args.get("variables")
+    if variables is not None and not isinstance(variables, dict):
+        raise _Refusal("BAD_ARGS")
+    return {"query": query, "variables": variables}
+
+
+def _query_error(exc: LinearError) -> dict:
+    message = str(exc)
+    if message.startswith(_TOO_COMPLEX_PREFIX):
+        return {"ok": False, "error": "QUERY_TOO_COMPLEX",
+                "message": f"{exc.detail or message} Lower first: or the nesting depth."}
+    if exc.code in _QUERY_KEPT_CODES:
+        return {"ok": False, "error": exc.code, "message": message}
+    return {"ok": False, "error": "GRAPHQL_ERROR",
+            "message": message[:QUERY_ERROR_MESSAGE_CHARS]}
+
+
+async def _query(ctx: ToolContext, a: dict) -> dict:
+    try:
+        data = await ctx.client.gql(a["query"], a["variables"])
+    except LinearError as exc:
+        return _query_error(exc)
+    size = len(json.dumps(data, ensure_ascii=False, default=str))
+    if size > QUERY_MAX_RESULT_CHARS:
+        return {"ok": False, "error": "RESPONSE_TOO_LARGE", "size": size,
+                "limit": QUERY_MAX_RESULT_CHARS,
+                "message": "Paginate (first:/after:) or select fewer fields."}
+    return {"ok": True, "data": data}
+
+
 linear_issue_get = _tool(_parse_get, _get)
-linear_issue_create = _tool(_parse_create, _create)
-linear_issue_update = _tool(_parse_update, _update)
-linear_comment = _tool(_parse_comment, _comment)
+linear_issue_create = _tool(_parse_create, _create, gated="linear_issue_create")
+linear_issue_update = _tool(_parse_update, _update, gated="linear_issue_update")
+linear_comment = _tool(_parse_comment, _comment, gated="linear_comment")
 linear_sync_spec = _tool(_parse_sync_spec, _sync_spec, blocking_parse=True)
 linear_sync_plan = _tool(_parse_sync_plan, lambda ctx, a: _sync_plan(ctx, a),  # late-bound
                          blocking_parse=True, timeout_s=PLAN_SYNC_TIMEOUT_S,
                          finish=_finish_sync_plan)
 linear_task_state = _tool(_parse_task_state, _task_state)
+linear_query = _tool(_parse_query, _query)
 
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
+_GATED_NOTE = ("Outside the session issue's tree (issues you did not create) the first call "
+               "returns APPROVAL_REQUIRED; call again with identical arguments to ask a human.")
 
 TOOL_SCHEMAS: dict[str, dict] = {
     "linear_issue_get": {
@@ -1011,8 +1179,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_issue_create": {
         "name": "linear_issue_create",
         "description": ("Create a Linear issue as the Linear app, in the session issue's team "
-                        "and project. Set parent to make it a sub-issue (parent must be the "
-                        "session issue, a descendant, or an issue you created)."),
+                        "and project. Set parent to make it a sub-issue. " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "title": {"type": "string"},
             "description": {"type": "string", "description": "Markdown."},
@@ -1026,8 +1193,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_issue_update": {
         "name": "linear_issue_update",
         "description": ("Update a Linear issue as the Linear app: title, description, state, "
-                        "labels, parent. Only the session issue, its descendants, or issues "
-                        "you created; a new parent must be one of those too."),
+                        "labels, parent. " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "title": {"type": "string"},
@@ -1049,7 +1215,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "name": "linear_comment",
         "description": ("Comment on a Linear issue as the Linear app. With edit_marker, edit "
                         "the app's earlier comment carrying that marker instead of adding a "
-                        "new one."),
+                        "new one. " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "body": {"type": "string", "description": "Markdown."},
@@ -1105,6 +1271,18 @@ TOOL_SCHEMAS: dict[str, dict] = {
                          "description": "Required with blocked: what you need answered."},
         }, "required": ["id", "state"]},
     },
+    "linear_query": {
+        "name": "linear_query",
+        "description": ("Run a read-only GraphQL query against Linear's API as the Linear app "
+                        "(no mutations or subscriptions). Results over 50,000 chars are "
+                        "refused: paginate with first:/after: or select fewer fields."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string",
+                      "description": "A GraphQL query document (query/fragment only)."},
+            "variables": {"type": "object",
+                          "description": "Values for the query's variables."},
+        }, "required": ["query"]},
+    },
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
@@ -1115,10 +1293,11 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_sync_spec": linear_sync_spec,
     "linear_sync_plan": linear_sync_plan,
     "linear_task_state": linear_task_state,
+    "linear_query": linear_query,
 }
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_comment", "linear_issue_create", "linear_issue_get", "linear_issue_update",
-           "linear_sync_plan", "linear_sync_spec", "linear_task_state",
+           "linear_query", "linear_sync_plan", "linear_sync_spec", "linear_task_state",
            "resolve_context", "resolve_state", "run_on_adapter"]

@@ -597,3 +597,30 @@ async def test_client_paging_stops_at_cap(fake, client):
                                  lambda d: d.get("issueLabels"), cap=3)
     assert [lb["id"] for lb in labels] == ["l0", "l1", "l2"]
     assert len(fake.gql_calls("TeamLabels")) == 2
+
+
+# -- error detail (RET-119) ----------------------------------------------
+
+#: Live-probe shape of Linear's complexity refusal.
+COMPLEX_BODY = {"errors": [{"message": "Query too complex", "extensions": {
+    "type": "invalid input", "code": "INPUT_ERROR", "statusCode": 400, "userError": True,
+    "userPresentableMessage": "The query is too complex. Complexity: 18937750. "
+                              "Maximum allowed complexity: 10000."}}]}
+
+
+def test_first_error_reads_user_presentable_message():
+    from hermes_linear.linear_client import _first_error
+
+    assert _first_error(COMPLEX_BODY) == (
+        "INPUT_ERROR", "Query too complex",
+        "The query is too complex. Complexity: 18937750. Maximum allowed complexity: 10000.")
+    assert _first_error({"errors": [{"message": "boom"}]}) == (None, "boom", None)
+    assert _first_error({"data": {}}) == (None, "", None)
+
+
+async def test_graphql_error_carries_detail(fake, client):
+    fake.on("Viewer", Resp(400, COMPLEX_BODY))
+    with pytest.raises(LinearError) as ei:
+        await client.viewer_id()
+    assert ei.value.code == "INPUT_ERROR"
+    assert ei.value.detail.startswith("The query is too complex.")
