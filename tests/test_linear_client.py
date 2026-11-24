@@ -401,6 +401,57 @@ async def test_client_issue_get_shape(fake, client):
     assert i["parent"] == {"id": "uuid-0", "identifier": "RET-0"}
 
 
+DETAILS_NODE = {
+    "assignee": {"id": "u1", "name": "Mike"}, "delegate": None, "priority": 2,
+    "priorityLabel": "High", "estimate": 3, "dueDate": "2026-12-01",
+    "cycle": {"id": "c4", "number": 4, "name": "C4"}, "projectMilestone": None,
+    "relations": {"nodes": []}, "inverseRelations": {"nodes": []},
+    "attachments": {"nodes": [{"id": "a1", "title": "PR", "subtitle": None,
+                               "url": "https://e.test/a", "sourceType": "github"}]},
+}
+
+
+async def test_issue_details_query(fake, client):
+    fake.on("IssueDetails", {"data": {"issue": DETAILS_NODE}})
+    assert await client.issue_details("uuid-1") == DETAILS_NODE
+    (call,) = fake.gql_calls("IssueDetails")
+    assert call.variables == {"id": "uuid-1"}
+    q = call.json["query"]
+    for field in ("delegate { id name }", "priorityLabel", "projectMilestone { id name }",
+                  "relations(first: 50)", "inverseRelations(first: 50)",
+                  "attachments(first: 50)", "sourceType"):
+        assert field in q
+
+
+async def test_issue_details_null_is_not_found(fake, client):
+    fake.on("IssueDetails", {"data": {"issue": None}})
+    with pytest.raises(LinearError) as ei:
+        await client.issue_details("uuid-404")
+    assert ei.value.code == "NOT_FOUND"
+
+
+async def test_issue_threads_query(fake, client):
+    threads = [{"id": "c1", "url": "u", "body": "b", "createdAt": "2026-11-01T00:00:00Z",
+                "resolvedAt": None, "user": {"id": "u1", "name": "Mike"},
+                "children": {"nodes": [{"id": "c2", "body": "r", "createdAt": "x",
+                                        "resolvedAt": None, "user": None}]}}]
+    fake.on("IssueThreads", {"data": {"issue": {"comments": {"nodes": threads}}}})
+    assert await client.issue_threads("uuid-1", 7) == threads
+    (call,) = fake.gql_calls("IssueThreads")
+    assert call.variables == {"id": "uuid-1", "first": 7}
+    q = " ".join(call.json["query"].split())
+    assert ("comments(first: $first, orderBy: createdAt, filter: { parent: { null: true } })"
+            in q)
+    assert "children(first: 50, orderBy: createdAt)" in q
+
+
+async def test_issue_threads_null_issue_is_not_found(fake, client):
+    fake.on("IssueThreads", {"data": {"issue": None}})
+    with pytest.raises(LinearError) as ei:
+        await client.issue_threads("uuid-404", 1)
+    assert ei.value.code == "NOT_FOUND"
+
+
 async def test_client_issue_get_null_is_not_found(fake, client):
     fake.on("IssueGet", {"data": {"issue": None}})
     with pytest.raises(LinearError) as ei:

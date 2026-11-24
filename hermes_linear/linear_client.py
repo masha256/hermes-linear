@@ -107,6 +107,33 @@ QUERY_ISSUE_CHILDREN = """query IssueChildren($id: String!, $after: String) {
   }
 }"""
 
+# ``linear_issue_get``'s extra fields (RET-120 §2.2 step 2); ``issue_get`` stays as it is.
+QUERY_ISSUE_DETAILS = """query IssueDetails($id: String!) {
+  issue(id: $id) {
+    assignee { id name } delegate { id name }
+    priority priorityLabel estimate dueDate
+    cycle { id number name } projectMilestone { id name }
+    relations(first: 50) { nodes { type relatedIssue { identifier title state { name } } } }
+    inverseRelations(first: 50) { nodes { type issue { identifier title state { name } } } }
+    attachments(first: 50) { nodes { id title subtitle url sourceType } }
+  }
+}"""
+
+# Top-level comments with up to 50 replies each (RET-120 §2.2 step 3). Linear's createdAt
+# order is newest first (live probe), so ``first`` takes the newest threads (Ruling R1).
+QUERY_ISSUE_THREADS = """query IssueThreads($id: String!, $first: Int!) {
+  issue(id: $id) {
+    comments(first: $first, orderBy: createdAt, filter: { parent: { null: true } }) {
+      nodes {
+        id url body createdAt resolvedAt user { id name }
+        children(first: 50, orderBy: createdAt) {
+          nodes { id body createdAt resolvedAt user { id name } }
+        }
+      }
+    }
+  }
+}"""
+
 MUTATION_ISSUE_CREATE = """mutation IssueCreate($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier title url } }
 }"""
@@ -495,6 +522,23 @@ class LinearClient:
             out["project"] = {**i["project"],
                               "externalLinks": self._nodes(i["project"].get("externalLinks"))}
         return out
+
+    async def _issue_node(self, query: str, variables: dict) -> dict:
+        data = await self.gql(query, variables)
+        i = data.get("issue")
+        if not isinstance(i, dict):
+            raise LinearError("issue not found", code="NOT_FOUND")
+        return i
+
+    async def issue_details(self, issue_id: str) -> dict:
+        """The raw ``issue`` node of ``QUERY_ISSUE_DETAILS``. Null issue: ``NOT_FOUND``."""
+        return await self._issue_node(QUERY_ISSUE_DETAILS, {"id": issue_id})
+
+    async def issue_threads(self, issue_id: str, first: int) -> list[dict]:
+        """The raw top-level comment nodes (each with ``children.nodes``), at most ``first``,
+        in Linear's order. Null issue: ``NOT_FOUND``."""
+        i = await self._issue_node(QUERY_ISSUE_THREADS, {"id": issue_id, "first": first})
+        return self._nodes(i.get("comments"))
 
     async def issue_create(self, input: dict) -> dict:  # noqa: A002 - SDL argument name
         """``issueCreate``; returns ``{id, identifier, title, url}`` of the new issue."""

@@ -21,7 +21,7 @@ The `linear_*` tools are deferred behind tool search. Load a schema with `tool_d
 several plugin tools is rejected). Calling `linear_issue_get(...)` directly fails as an unknown
 tool. Below, `linear_x(...)` is shorthand — always call via `tool_call`. The eight tools:
 
-- `linear_issue_get` (`id`): state, labels, project and its links, parent, children.
+- `linear_issue_get` (`id`, `comments?` = newest N threads): fields, relations, attachments, children.
 - `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`): in
   the session ticket's team and project.
 - `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`,

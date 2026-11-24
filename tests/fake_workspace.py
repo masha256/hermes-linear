@@ -195,6 +195,15 @@ class FakeWorkspace:
                 for c in children],
         }
 
+    async def issue_details(self, issue_id: str) -> dict:
+        """``LinearClient.issue_details`` for an issue with none of those fields set."""
+        self.calls.append(("issue_details", issue_id))
+        self.issue(issue_id)
+        return {"assignee": None, "delegate": None, "priority": 0,
+                "priorityLabel": "No priority", "estimate": None, "dueDate": None,
+                "cycle": None, "projectMilestone": None, "relations": {"nodes": []},
+                "inverseRelations": {"nodes": []}, "attachments": {"nodes": []}}
+
     def _desc(self, text: str) -> str:
         return normalize_markdown(text) if self.normalize else text
 
