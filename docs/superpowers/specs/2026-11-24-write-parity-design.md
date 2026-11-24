@@ -77,8 +77,8 @@ Facts from the brainstorm that shape these:
     `warnings: ["Delegated to this app: no session starts until a human delegates the issue."]`.
 - `priority`: `none|urgent|high|medium|low` (case-insensitive) or `0`–`4` (Linear's
   numbers: 0 none, 1 urgent, 2 high, 3 medium, 4 low). Anything else: `BAD_ARGS`.
-- `estimate`: an integer ≥ 0. A team that doesn't use estimates answers with Linear's own
-  error code and message (see §4).
+- `estimate`: an integer ≥ 0. Linear stores it even when the team doesn't use estimates
+  (live probe, RET-140); the tool does the same and its description says so.
 - `due_date`: `YYYY-MM-DD`, a real calendar date (else `BAD_ARGS`).
 - `cycle`: a UUID, a number, a name (case-insensitive), `current` or `next`, in the issue's
   team. No match: `CYCLE_NOT_FOUND` with `candidates` (`[{id, number, name}]`).
@@ -117,12 +117,13 @@ New args: `project`, `assignee`, `delegate`, `priority`, `estimate`, `due_date`,
 `milestone` (no `team`).
 
 - The issue itself is `_writable`, as today.
-- A `project` change to the session ticket's project, or to the issue's parent's project
-  (after a `parent` change in the same call, the new parent's), runs with no prompt. Any
+- A `project` change to the session ticket's project, to the issue's parent's project
+  (after a `parent` change in the same call, the new parent's), or to the issue's current
+  project (no change) runs with no prompt. Any
   other project (`null` / `""` clears it, which counts as no prompt) is an approval target.
 - `milestone` resolves in the resulting project. A `project` change without `milestone`
-  sends no `projectMilestoneId`; what Linear then does with the old milestone is probed
-  in §4 and documented in the tool description.
+  sends no `projectMilestoneId`; Linear then clears the old milestone (live probe, RET-140),
+  and the tool description says so.
 - At least one field must be given (as today, `BAD_ARGS` otherwise).
 
 ### 1.4 `linear_relation(id, type, other)`
