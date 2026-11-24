@@ -98,6 +98,10 @@ class ToolContext:
     session_key: str | None
     is_linear: bool
     gate: Gate | None = None  # set only for a gated tool's pass (``_tool(gated=...)``)
+    #: The call comes from a non-Linear session (Slack, cron, …; RET-148 spec §2): no
+    #: session issue, ``session_key`` is the caller's own. Gated writes then go through
+    #: ``outside_session_writes``. A Linear call without its ticket is NOT outside.
+    outside: bool = False
 
 
 def _err(code: str) -> dict:
@@ -180,7 +184,9 @@ def resolve_context(session_id: str | None = None) -> ToolContext:
     ``HERMES_SESSION_KEY``, else the one whose store has the message id, else the chat (the
     ``hooks._route`` order). Outside Linear, or when no turn is found, reads still work on the
     adapter of the session's profile (``HERMES_SESSION_PROFILE``), else the first in
-    ``ADAPTERS``, with no session issue (writes are refused). Any unexpected failure yields a
+    ``ADAPTERS``, with no session issue. Outside Linear the context is ``outside`` and keeps
+    the caller's session key: gated writes ask for approval there (RET-148); a Linear call
+    with no turn found refuses writes. Any unexpected failure yields a
     context with no adapter: ``run_on_adapter`` answers ``NOT_CONNECTED``, writes are refused.
     """
     try:
@@ -201,10 +207,12 @@ def _resolve(session_id: str | None) -> ToolContext:
               session_id, env["session_key"], is_linear)
 
     def ctx(ad: Any, issue: str | None) -> ToolContext:
+        # Outside Linear the caller's own session key is kept: the gate stores and arms
+        # approval requests under it (RET-148 spec §2).
         return ToolContext(adapter=ad, client=getattr(ad, "client", None) if ad else None,
                            session_issue_id=issue if is_linear else None,
-                           session_key=env["session_key"] if is_linear else None,
-                           is_linear=is_linear)
+                           session_key=env["session_key"],
+                           is_linear=is_linear, outside=not is_linear)
 
     if not is_linear:
         return ctx(fallback, None)
@@ -503,14 +511,24 @@ def _gated(tool: str, args: dict, ctx: ToolContext,
     refuses, ``allow`` runs again with those targets approved, ``approve`` stores a request
     and answers ``APPROVAL_REQUIRED``. Fail-closed: no digest or no store refuses
     ``OUT_OF_SCOPE``, and the run sentinel never reaches the caller.
+
+    Outside a Linear session (``ctx.outside``; RET-148 spec §2) the mode is
+    ``outside_session_writes``, ``deny`` answers ``NOT_LINEAR_SESSION`` before anything
+    runs, and the request and its texts use the outside wording.
     """
     store = getattr(ctx.adapter, "_store", None)
+    settings = getattr(ctx.adapter, "_settings", None)
+    # Outside a Linear session the off-Linear knob decides (RET-148 spec §2 item 3).
+    knob = "outside_session_writes" if ctx.outside else "out_of_scope_writes"
+    mode = getattr(settings, knob, None) or "approve"
+    if ctx.outside and mode == "deny":
+        return _err("NOT_LINEAR_SESSION")  # today's behaviour: nothing fetched or stored
     try:
         dg: str | None = tool_approval.digest(tool, args)
     except (TypeError, ValueError):  # args that are not JSON: no request can match
         dg = None
-    can_request = (ctx.is_linear and bool(ctx.session_key) and store is not None
-                   and dg is not None)
+    can_request = ((ctx.is_linear or ctx.outside) and bool(ctx.session_key)
+                   and store is not None and dg is not None)
     if can_request:
         req = store.take_armed_request(ctx.session_key, dg)
         if req is not None:
@@ -520,18 +538,18 @@ def _gated(tool: str, args: dict, ctx: ToolContext,
     if result.get("error") != _NEEDS_APPROVAL:
         return result
     targets: list[dict] = result.get("targets") or []
-    settings = getattr(ctx.adapter, "_settings", None)
-    mode = getattr(settings, "out_of_scope_writes", None) or "approve"
     if mode == "allow":
         approved = frozenset(t["id"] for t in targets)
         return _sealed(execute(dataclasses.replace(ctx, gate=Gate(approved=approved))))
     if mode == "deny" or not can_request or not targets:
         return _err("OUT_OF_SCOPE")
     store.put_request(ctx.session_key, dg, tool, [t["id"] for t in targets],
-                      tool_approval.approval_message(tool, targets, args, dg))
+                      tool_approval.approval_message(tool, targets, args, dg,
+                                                     outside=ctx.outside))
     names = ", ".join(str(t.get("identifier") or t["id"]) for t in targets)
+    text = tool_approval.REQUIRED_TEXT_OUTSIDE if ctx.outside else tool_approval.REQUIRED_TEXT
     return {"ok": False, "error": "APPROVAL_REQUIRED",
-            "message": tool_approval.REQUIRED_TEXT.format(tool=tool, targets=names)}
+            "message": text.format(tool=tool, targets=names)}
 
 
 def _sealed(result: dict) -> dict:
@@ -546,7 +564,23 @@ async def _writable(ctx: ToolContext, ref: str) -> dict:
     pass (nothing approved) a plain ``OUT_OF_SCOPE`` verdict is recorded on the gate and the
     issue returned, so the body must call ``gate.check()`` before writing. Any other code,
     or ``OUT_OF_SCOPE`` on an approved pass, is refused.
+
+    Outside a Linear session (``ctx.outside``; RET-148 spec §2 item 1) there is no tree:
+    every issue is out of scope, so a gated first pass records it without a scope walk and
+    an approved pass writes only its approved issues. A caller without a gate is refused
+    ``NOT_LINEAR_SESSION`` before anything is fetched.
     """
+    if ctx.outside:
+        gate = ctx.gate
+        if gate is None:
+            raise _Refusal("NOT_LINEAR_SESSION")
+        issue = await ctx.client.issue_get(ref)
+        if issue["id"] in gate.approved:
+            return issue
+        if not gate.approved:
+            gate.record(issue)
+            return issue
+        raise _Refusal("OUT_OF_SCOPE")
     if not ctx.is_linear or not ctx.session_issue_id:
         raise _Refusal("NOT_LINEAR_SESSION")
     issue = await ctx.client.issue_get(ref)

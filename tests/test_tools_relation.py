@@ -208,8 +208,19 @@ def test_unknown_issue_is_linear_code(pin_ctx, ws):
     assert ws.writes() == []
 
 
-def test_needs_linear_session(pin_ctx, ws):
-    pin_ctx(linear=False)
+def test_needs_linear_session_or_outside_gate(pin_ctx, ws, adapter):
+    """RET-148: outside a Linear session the relation is a gated write like
+    comment/update: ``outside_session_writes`` decides (deny refuses, approve asks)."""
+    import dataclasses
+
+    pin_ctx(linear=False, outside=False)  # no platform context at all: refused
+    out = linear_relation({"id": "RET-2", "type": "blocks", "other": "RET-3"})
+    assert out == {"ok": False, "error": "NOT_LINEAR_SESSION"} and ws.writes() == []
+    pin_ctx(linear=False)  # outside (Slack, CLI, cron)
+    out = linear_relation({"id": "RET-2", "type": "blocks", "other": "RET-3"})
+    assert out["error"] == "APPROVAL_REQUIRED" and "RET-2, RET-3" in out["message"]
+    assert ws.writes() == []
+    adapter._settings = dataclasses.replace(adapter._settings, outside_session_writes="deny")
     out = linear_relation({"id": "RET-2", "type": "blocks", "other": "RET-3"})
     assert out == {"ok": False, "error": "NOT_LINEAR_SESSION"} and ws.writes() == []
 

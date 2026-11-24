@@ -354,10 +354,15 @@ def test_embed_needs_linear_session(pin_ctx, ws, png):
     assert ws.calls == []
 
 
-def test_attach_needs_linear_session(pin_ctx, ws, png):
-    pin_ctx(linear=False)
-    assert linear_attach({"id": "RET-1", "path": str(png)})["error"] == "NOT_LINEAR_SESSION"
-    assert ws.writes() == []
+def test_outside_attach_url_is_gated(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)  # RET-148: the id path goes through the outside gate
+    args = {"id": "RET-1", "url": "https://example.com/x"}
+    out = linear_attach(dict(args))
+    assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED"
+    assert "outside a Linear session" in out["message"]
+    assert _uploads(ws) == [] and ws.writes() == []
+    req = adapter._store.request("sk", digest("linear_attach", args))
+    assert req is not None and req.targets == [SELF] and req.tool == "linear_attach"
 
 
 def test_out_of_scope_first_pass_uploads_nothing(pin_ctx, ws, adapter, png):

@@ -24,6 +24,7 @@ ALLOWED_USERS_ENV = "LINEAR_ALLOWED_USERS"
 ALLOW_ALL_USERS_ENV = "LINEAR_ALLOW_ALL_USERS"
 
 OUT_OF_SCOPE_MODES = ("approve", "deny", "allow")
+OUTSIDE_MODES = OUT_OF_SCOPE_MODES  # outside_session_writes (RET-148)
 
 _TRUE = frozenset({"true", "1", "yes"})
 _FALSE = frozenset({"false", "0", "no", "off", ""})
@@ -45,6 +46,9 @@ class Settings:
     listener_host: str
     listener_port: int
     out_of_scope_writes: str = "approve"
+    outside_session_writes: str = "approve"
+    default_team: str = ""
+    default_project: str = ""
 
 
 def _norm_entry(entry: object) -> str:
@@ -144,6 +148,13 @@ def load_settings(
             f"invalid value for setting 'out_of_scope_writes': {raw_mode!r} "
             f"(expected one of {', '.join(OUT_OF_SCOPE_MODES)})"
         )
+    raw_outside = get_config("outside_session_writes", "approve")
+    outside_session_writes = _as_str(raw_outside).lower()
+    if outside_session_writes not in OUTSIDE_MODES:
+        raise SettingsError(
+            f"invalid value for setting 'outside_session_writes': {raw_outside!r} "
+            f"(expected one of {', '.join(OUTSIDE_MODES)})"
+        )
 
     return Settings(
         client_id=client_id,
@@ -157,6 +168,9 @@ def load_settings(
         or DEFAULT_LISTENER_HOST,
         listener_port=listener_port,
         out_of_scope_writes=out_of_scope_writes,
+        outside_session_writes=outside_session_writes,
+        default_team=_as_str(get_config("default_team", "")),
+        default_project=_as_str(get_config("default_project", "")),
     )
 
 

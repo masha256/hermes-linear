@@ -104,10 +104,12 @@ def _bridged_call(tool_name: Any, args: Any) -> tuple[Any, Any]:
 
 
 def _gated_request(tool_name: Any, args: Any) -> tuple | None:
-    """``(store, session_key, tool, digest, request)`` for a gated tool call in a Linear
-    session whose approval request is stored in some adapter's store, else None."""
-    if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
-        return None
+    """``(store, session_key, tool, digest, request)`` for a gated tool call whose approval
+    request is stored in some adapter's store under the bound session key, else None.
+
+    Any platform (RET-148 spec §2 item 5): a request is found only by ``(session key,
+    digest)``, and Hermes session keys of different platforms never collide, so a Slack
+    request can't be armed from a Linear session or the reverse."""
     session_key = get_session_env("HERMES_SESSION_KEY") or None
     if not session_key:
         return None

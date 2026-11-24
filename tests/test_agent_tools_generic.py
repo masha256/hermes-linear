@@ -56,11 +56,16 @@ def adapter(loop, ws):
 
 @pytest.fixture
 def pin_ctx(monkeypatch, adapter):
-    """Resolve every tool call to ``adapter`` in Linear session ``SELF`` (key ``sk``)."""
-    def pin(*, linear=True, issue=SELF, key="sk", ad=adapter):
+    """Resolve every tool call to ``adapter`` in Linear session ``SELF`` (key ``sk``).
+
+    ``linear=False`` is a call from another platform (``outside``, RET-148): no session
+    issue, but the caller's session key stays bound (``outside=False`` drops it too)."""
+    def pin(*, linear=True, outside=None, issue=SELF, key="sk", ad=adapter):
+        outside = (not linear) if outside is None else outside
         ctx = agent_tools.ToolContext(adapter=ad, client=getattr(ad, "client", None),
                                       session_issue_id=issue if linear else None,
-                                      session_key=key if linear else None, is_linear=linear)
+                                      session_key=key if (linear or outside) else None,
+                                      is_linear=linear, outside=outside)
         monkeypatch.setattr(agent_tools, "resolve_context", lambda session_id=None: ctx)
         return ctx
     pin()

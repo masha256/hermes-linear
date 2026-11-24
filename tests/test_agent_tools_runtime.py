@@ -124,6 +124,7 @@ async def test_writes_refused_outside_linear_session(session, registry, linear):
     ctx = agent_tools.resolve_context()
     assert ctx.is_linear is False and ctx.adapter is a  # reads use the first adapter
     assert ctx.session_issue_id is None
+    assert ctx.outside is True and ctx.session_key == "agent:main:slack:dm:x"  # RET-148
     assert await agent_tools.check_write_scope(ctx, "ISSUE-SELF") == "NOT_LINEAR_SESSION"
 
 
@@ -323,6 +324,7 @@ def test_resolve_context_unknown_linear_turn_has_no_ticket(bg_loop, registry, se
     session(platform="linear", key="agent:gone")
     ctx = agent_tools.resolve_context()
     assert ctx.adapter is a and ctx.is_linear is True and ctx.session_issue_id is None
+    assert ctx.outside is False  # RET-148: a Linear call without its ticket is not outside
 
 
 # ------------------------------------------------- created-issue scope lifecycle (RET-110)

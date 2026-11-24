@@ -93,6 +93,31 @@ def test_out_of_scope_writes_invalid_raises():
         load_settings(get_config, get_secret, {})
 
 
+def test_outside_session_writes_default_and_values():
+    get_config, get_secret = _getters()
+    assert load_settings(get_config, get_secret, {}).outside_session_writes == "approve"
+    for raw, want in (("ALLOW", "allow"), ("deny", "deny"), (" Approve ", "approve")):
+        get_config, get_secret = _getters({**REQUIRED_CONFIG, "outside_session_writes": raw})
+        assert load_settings(get_config, get_secret, {}).outside_session_writes == want
+
+
+def test_outside_session_writes_invalid_raises():
+    get_config, get_secret = _getters({**REQUIRED_CONFIG, "outside_session_writes": "maybe"})
+    with pytest.raises(SettingsError, match="'outside_session_writes'"):
+        load_settings(get_config, get_secret, {})
+
+
+def test_default_team_and_project_stripped_default_empty():
+    get_config, get_secret = _getters()
+    s = load_settings(get_config, get_secret, {})
+    assert s.default_team == "" and s.default_project == ""
+    get_config, get_secret = _getters({**REQUIRED_CONFIG, "default_team": " RET ",
+                                       "default_project": "hermes linear test project"})
+    s = load_settings(get_config, get_secret, {})
+    assert s.default_team == "RET"
+    assert s.default_project == "hermes linear test project"
+
+
 def test_load_settings_explicit_values():
     get_config, get_secret = _getters(
         config={

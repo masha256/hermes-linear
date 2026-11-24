@@ -120,10 +120,10 @@ def _message(exc: LinearError) -> str:
 
 
 async def _attach(ctx: agent_tools.ToolContext, a: dict) -> dict:
-    if not ctx.is_linear or not ctx.session_issue_id:
-        raise _Refusal("NOT_LINEAR_SESSION")  # an embed belongs to a ticket thread too
+    if a["id"] is None and (not ctx.is_linear or not ctx.session_issue_id):
+        raise _Refusal("NOT_LINEAR_SESSION")  # an embed belongs to a ticket thread
     issue = None
-    if a["id"] is not None:
+    if a["id"] is not None:  # inside or outside a session: _writable decides (RET-148)
         issue = await agent_tools._writable(ctx, a["id"])
         agent_tools._check_gate(ctx)  # before the upload: a first pass writes nothing
     client, f = ctx.client, a["file"]
@@ -186,7 +186,10 @@ async def _session_link(ctx: agent_tools.ToolContext, a: dict) -> dict:
     external URL is not an activity, so its order doesn't matter. Linear de-duplicates a
     re-added URL (spec §4 item 3)."""
     turns = getattr(ctx.adapter, "turns", None)
-    found = turns.turn_for_session_key(ctx.session_key) if turns is not None else None
+    # Off Linear the context now carries the caller's own session key (RET-148): never
+    # look a Linear turn up by it.
+    found = (turns.turn_for_session_key(ctx.session_key)
+             if turns is not None and ctx.is_linear else None)
     if found is None:
         raise _Refusal("NOT_LINEAR_SESSION")  # Slack, cron, a subagent, another session
     sid = found[1].decision.agent_session_id

@@ -195,9 +195,109 @@ def test_undigestable_args_refused_without_request(pin_ctx, ws, adapter):
     assert ws.writes() == [] and _requests(adapter) == 0
 
 
-def test_not_linear_session_never_gated(pin_ctx, ws, adapter):
+# ----------------------------------------------------- outside a Linear session (RET-148)
+
+
+def _outside(adapter, mode):
+    adapter._settings = dataclasses.replace(adapter._settings, outside_session_writes=mode)
+
+
+IN_TREE = {"id": "RET-2", "body": "hi"}  # in scope inside RET-1's session
+
+
+def test_outside_comment_first_call_requires_approval(pin_ctx, ws, adapter):
     pin_ctx(linear=False)
-    assert linear_comment(dict(COMMENT)) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    out = linear_comment(dict(IN_TREE))  # outside, every target is out of scope
+    assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED"
+    assert "outside a Linear session" in out["message"] and "RET-2" in out["message"]
+    assert "linear_comment" in out["message"]
+    assert ws.writes() == [] and _requests(adapter) == 1
+    req = adapter._store.request("sk", digest("linear_comment", IN_TREE))
+    assert req.targets == ["uuid-child"] and req.tool == "linear_comment"
+    assert req.message.splitlines()[0] == (
+        "Approve `linear_comment` from outside a Linear session?")
+
+
+def test_outside_armed_request_writes_once(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    dg = digest("linear_comment", IN_TREE)
+    assert linear_comment(dict(IN_TREE))["error"] == "APPROVAL_REQUIRED"
+    assert adapter._store.arm_request("sk", dg) is not None
+    out = linear_comment(dict(IN_TREE))
+    assert out["ok"] is True and out["issue"] == "RET-2"
+    assert [c["body"] for c in _comments_on(ws, "uuid-child")] == ["hi"]
+    assert adapter._store.request("sk", dg) is None  # consumed
+    assert linear_comment(dict(IN_TREE))["error"] == "APPROVAL_REQUIRED"
+    assert len(_comments_on(ws, "uuid-child")) == 1
+
+
+def test_outside_deny_refuses_not_linear_session(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    _outside(adapter, "deny")
+    assert linear_comment(dict(IN_TREE)) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert linear_issue_update({"id": "RET-2", "title": "x"}) == {
+        "ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_outside_allow_writes_without_request(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    _outside(adapter, "allow")
+    out = linear_comment(dict(IN_TREE))
+    assert out["ok"] is True
+    assert [c["body"] for c in _comments_on(ws, "uuid-child")] == ["hi"]
+    assert _requests(adapter) == 0
+
+
+def test_outside_no_session_key_refused(pin_ctx, ws, adapter):
+    pin_ctx(linear=False, key=None)  # approve mode, but nobody can be asked
+    assert linear_comment(dict(IN_TREE)) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_knobs_are_independent(pin_ctx, ws, adapter):
+    _mode(adapter, "allow")
+    _outside(adapter, "deny")
+    pin_ctx(linear=False)
+    assert linear_comment(dict(IN_TREE)) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    pin_ctx()
+    assert linear_comment(dict(COMMENT))["ok"] is True  # inside OTH-9: written
+    assert len(_comments_on(ws, "uuid-other")) == 1
+    _mode(adapter, "deny")
+    _outside(adapter, "allow")
+    pin_ctx(linear=False)
+    assert linear_comment(dict(IN_TREE))["ok"] is True
+    pin_ctx()
+    assert linear_comment(dict(COMMENT)) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert len(_comments_on(ws, "uuid-other")) == 1 and _requests(adapter) == 0
+
+
+def test_outside_update_both_ends_are_targets(pin_ctx, ws, adapter):
+    ws.add_issue("RET-3", title="Sibling", uuid="uuid-sib", parent=SELF)
+    pin_ctx(linear=False)
+    args = {"id": "RET-2", "parent": "RET-3"}
+    out = linear_issue_update(dict(args))
+    assert out["error"] == "APPROVAL_REQUIRED"
+    assert "RET-2" in out["message"] and "RET-3" in out["message"]
+    assert ws.writes() == [] and _requests(adapter) == 1
+    req = adapter._store.request("sk", digest("linear_issue_update", args))
+    assert set(req.targets) == {"uuid-child", "uuid-sib"}
+    adapter._store.arm_request("sk", req.digest)
+    assert linear_issue_update(dict(args))["ok"] is True
+    assert ws.issues["uuid-child"]["parent"] == "uuid-sib"
+
+
+def test_linear_platform_without_ticket_still_refused(pin_ctx, ws, adapter):
+    pin_ctx(linear=True, issue=None)  # a Linear call whose turn can't be found: not outside
+    assert linear_comment(dict(IN_TREE)) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_session_only_tools_refuse_outside(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)  # the session key is bound this time
+    assert linear_task_state({"id": "RET-2", "state": "in_progress"}) == {
+        "ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert linear_issue_create({"title": "x"}) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
     assert ws.writes() == [] and _requests(adapter) == 0
 
 

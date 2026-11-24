@@ -67,8 +67,9 @@ async def _until(pred, what, timeout=WAIT_S):
 class Hermes:
     """The Hermes side of one Linear turn: agent-loop dispatch and the gateway notify."""
 
-    def __init__(self, a, loop, mid):
+    def __init__(self, a, loop, mid, *, platform="linear", sk=SK, chat=D_CHAT):
         self.a, self.loop, self.mid = a, loop, mid
+        self.platform, self.sk, self.chat = platform, sk, chat
         self.notified: list[dict] = []
         self.sent: list = []
 
@@ -101,9 +102,10 @@ class Hermes:
         from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
         from tools.approval_context import reset_current_session_key, set_current_session_key
 
-        tokens = set_session_vars(platform="linear", session_key=SK, chat_id=D_CHAT,
-                                  chat_type="dm", user_id=HUMAN, message_id=self.mid)
-        token = set_current_session_key(SK)
+        tokens = set_session_vars(platform=self.platform, session_key=self.sk,
+                                  chat_id=self.chat, chat_type="dm", user_id=HUMAN,
+                                  message_id=self.mid)
+        token = set_current_session_key(self.sk)
         try:
             block, modified = _dispatch_pre_tool_call_hooks(
                 tool, args, task_id="task-1", session_id="sess-1", tool_call_id=cid)
@@ -427,3 +429,110 @@ async def test_e2e_relation_out_of_scope(e2e):
                    "other": "OTH-9", "type": "blocks"}, out
     assert ws.writes() == [("relation_create", (SELF, OTHER, "blocks"))]
     assert len(h.notified) == 1 and store.request(SK, d) is None
+
+
+# ------------------------------------------- outside a Linear session (RET-148, Task 1)
+
+SLACK_SK = "agent:main:slack:dm:C0E2E:1700000000.0001"
+SLACK_CHAT = "C0E2E"
+OUT_ARGS = {"id": "RET-1", "body": "hello from Slack"}  # the Linear session's own ticket
+
+
+class SlackHermes(Hermes):
+    """The Hermes side of one Slack turn. ``notify`` stands in for the gateway rendering
+    Slack's approval buttons and a human clicking one: it answers the request it was called
+    for with Hermes's public ``resolve_gateway_approval`` (the typed ``/approve`` path)."""
+
+    def __init__(self, a, loop, choice: str):
+        super().__init__(a, loop, "slack-m1", platform="slack", sk=SLACK_SK, chat=SLACK_CHAT)
+        self.choice = choice
+
+    def notify(self, data: dict) -> None:
+        from tools.approval import resolve_gateway_approval
+
+        self.notified.append(data)
+        self.sent.append(resolve_gateway_approval(SLACK_SK, self.choice,
+                                                  request_id=data["request_id"]))
+
+
+@pytest.fixture
+async def e2e_outside(env, monkeypatch):  # noqa: F811
+    """Like ``e2e``, for a call from a Slack session (``HERMES_SESSION_PLATFORM="slack"``).
+
+    What stands in for Hermes, besides ``e2e``'s seams (``invoke_hook`` patched to this
+    plugin's ``pre_tool_call`` only; ``Hermes.call`` as the agent loop's dispatch): the
+    Slack adapter's button card and the human's click (``SlackHermes.notify``), and the tool
+    context, pinned to the outside shape ``resolve_context`` gives off Linear (no session
+    issue, the Slack session key bound, ``outside=True``). The approval wait, directive
+    parsing and the plugin's hooks, handler and store are real.
+    """
+    from tools import approval
+
+    a, client, gw, store, order = env
+    ws = FakeWorkspace()
+    ws.add_issue("RET-1", title="Session issue", uuid=SELF)
+    ctx = agent_tools.ToolContext(adapter=a, client=ws, session_issue_id=None,
+                                  session_key=SLACK_SK, is_linear=False, outside=True)
+    monkeypatch.setattr(agent_tools, "resolve_context", lambda session_id=None: ctx)
+    config = {"mode": "manual", "timeout": 30, "approvers": []}
+
+    def make(choice: str) -> SlackHermes:
+        h = SlackHermes(a, asyncio.get_running_loop(), choice)
+        approval.register_gateway_notify(SLACK_SK, h.notify)
+        return h
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("hermes_cli.lifecycle.invoke_hook", _lifecycle))
+        stack.enter_context(patch.object(approval, "_YOLO_MODE_FROZEN", False))
+        stack.enter_context(patch("tools.approval_context._get_approval_mode",
+                                  return_value="manual"))
+        stack.enter_context(patch("tools.approval_context._get_approval_config",
+                                  return_value=config))
+        try:
+            yield make, client, store, ws
+        finally:
+            approval.unregister_gateway_notify(SLACK_SK)
+
+
+async def _outside_first(h, store):
+    first = await h.run(args=OUT_ARGS, cid="c-first")
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert "outside a Linear session" in first["message"]
+    assert "ask in this chat" in first["message"]
+    d = tool_approval.digest(TOOL, OUT_ARGS)
+    req = store.request(SLACK_SK, d)
+    assert req is not None and req.targets == [SELF]
+    return d
+
+
+async def test_e2e_outside_comment_approve_writes(e2e_outside):
+    make, client, store, ws = e2e_outside
+    h = make("once")
+    n_acts = len(client.activities)
+    d = await _outside_first(h, store)
+    assert _comments(ws, SELF) == []
+    out = await h.run(args=OUT_ARGS, cid="c-again")
+    assert out["ok"] is True and out["issue"] == "RET-1", out
+    assert _comments(ws, SELF) == [OUT_ARGS["body"]]  # exactly one
+    assert len(h.notified) == 1 and h.sent == [1]
+    data = h.notified[0]
+    assert data["command"] == RULE and data["description"].endswith(f"digest: {d}")
+    assert data["description"].splitlines()[0] == (
+        f"Approve `{TOOL}` from outside a Linear session?")
+    assert store.request(SLACK_SK, d) is None  # consumed
+    assert len(client.activities) == n_acts  # nothing posted to a Linear agent session
+
+
+async def test_e2e_outside_comment_deny_never_writes(e2e_outside):
+    make, client, store, ws = e2e_outside
+    h = make("deny")
+    d = await _outside_first(h, store)
+    out = await h.run(args=OUT_ARGS, cid="c-again")
+    assert set(out) == {"error"} and out["error"].startswith("BLOCKED:"), out
+    assert len(h.notified) == 1
+    assert _comments(ws, SELF) == [] and ws.writes() == []
+    req = store.request(SLACK_SK, d)
+    assert req is not None and req.armed is False  # post_tool_call disarmed the block
+    raw = json.loads(await asyncio.to_thread(plugin.tool_handler(TOOL), dict(OUT_ARGS),
+                                             session_id="sess-1"))
+    assert raw["error"] == "APPROVAL_REQUIRED" and ws.writes() == []
