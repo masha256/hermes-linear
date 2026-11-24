@@ -325,6 +325,20 @@ def test_skill_body_is_a_short_overlay_naming_every_tool():
         assert f"superpowers:{stage}" in text, stage
 
 
+def test_skill_has_a_fallback_when_superpowers_is_missing():
+    """RET-130: superpowers is optional. When a stage skill isn't found the overlay must say
+    what to do (tell the thread, skip the spec/plan/SDD stages, work with the tools) instead
+    of leaving the agent to improvise."""
+    text = SKILL_MD.read_text()
+    _, marker, rest = text.partition("**Without superpowers**")
+    assert marker, "no **Without superpowers** paragraph"
+    para = rest.split("\n\n", 1)[0]
+    assert "not found" in para
+    assert "Setup" in para and "Per-stage" in para
+    assert "Questions and approvals" in para
+    assert text.index("**Without superpowers**") < text.index("## Calling the tools")
+
+
 def test_skill_finish_links_pr():
     text = SKILL_MD.read_text()
     _, _, rest = text.partition("**Finish.**")

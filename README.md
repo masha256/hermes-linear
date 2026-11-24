@@ -19,6 +19,7 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 - [How it behaves](#how-it-behaves)
 - [Agent tools](#agent-tools)
 - [Requirements](#requirements)
+- [Without superpowers](#without-superpowers)
 - [Install](#install)
 - [Create the Linear OAuth app](#create-the-linear-oauth-app)
 - [Expose the webhook](#expose-the-webhook)
@@ -84,6 +85,16 @@ The plugin gives the agent these tools. They act as the Linear app (every write 
 - Hermes Agent with the gateway running (`hermes gateway run` or the systemd service).
 - A Linear workspace where you can create an OAuth application (workspace admin).
 - A way for Linear to reach your machine over HTTPS: Tailscale Funnel, Cloudflare Tunnel, ngrok, or a reverse proxy on a public host. See [Expose the webhook](#expose-the-webhook).
+
+## Without superpowers
+
+The [superpowers](https://github.com/obra/superpowers) plugin is optional. Without it you lose the managed workflow; everything else works the same.
+
+**Works without it:** delegation and @mention sessions, the "Since your last turn" context digest, progress in the agent panel, questions and approvals as pick-lists, Stop, and every `linear_*` tool. The tools are deferred behind tool search (load with `tool_describe`, call with `tool_call`), and the agent can use them on any ticket it works.
+
+**Needs it:** the *manage with hermes-linear* flow, which runs brainstorm → spec → plan → subagent-driven development inside the ticket, with automatic `T<n> · <name>` task sub-tickets, their status updates, and large-project decomposition into sub-project tickets. When a ticket asks for that flow and superpowers isn't installed, the agent says so in the thread and works the ticket directly instead.
+
+`linear_sync_spec`, `linear_sync_plan` and `linear_task_state` don't need superpowers either. They read the markdown format: a `Linear: <ID>` header line and `### Task N: <name>` headings. A hand-written spec or plan in that shape syncs the same way.
 
 ## Install
 

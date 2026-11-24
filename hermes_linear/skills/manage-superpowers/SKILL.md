@@ -12,6 +12,10 @@ overlay: at each stage, load `superpowers:<stage>` and follow it, then apply the
 below. Never restate or edit superpowers itself. Git is the source of truth; Linear holds
 rendered copies that link back to the committed files.
 
+**Without superpowers** (`superpowers:<stage>` not found): say once in the thread that it isn't
+installed (install it for the full flow): no spec → plan → SDD, no task sub-tickets. Skip Setup and
+Per-stage differences; work the ticket directly with the tools, per Questions and approvals.
+
 ## Calling the tools
 
 The `linear_*` tools are deferred behind tool search: load a schema with `tool_describe` (exact
@@ -85,9 +89,8 @@ just run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue
 
 ## Per-stage differences
 
-**Brainstorm.** Load `superpowers:brainstorming`. Each question is a turn in the ticket
-thread; multiple-choice questions and design-section approvals are selects. Do not
-offer the visual companion; it cannot work in a Linear ticket.
+**Brainstorm.** Load `superpowers:brainstorming`. Each question is a turn in the ticket thread;
+choices and design-section approvals are selects. No visual companion (it can't work in Linear).
 
 **Spec.** Put a whole line `Linear: <session ticket ID>` in the spec's header (before
 the first `## ` heading). Commit, then `linear_sync_spec` with the spec's absolute
@@ -97,10 +100,9 @@ path. The spec review gate is a select. Each requested change: edit → commit �
 heading form `### Task N: <name>`. Commit, then `linear_sync_plan` (absolute path). It
 writes the plan comment (header and task list) and one `T<n> · <name>` sub-ticket per
 task (description: the whole task section), and writes the IDs back into the headings
-(`### Task N: <name> — <ID>`). Humans' and Done tickets are untouched. By result:
-- `file_changed: true`: commit the plan (the IDs are now in the headings);
-- `file_conflict: true`: the file changed during the sync; re-read and sync again;
-- `file_error`: the IDs were not written; fix the cause and sync again.
+(`### Task N: <name> — <ID>`). Humans' and Done tickets are untouched. By result: `file_changed:
+true` → commit the plan (the IDs are now in the headings); `file_conflict: true` → the file
+changed during the sync, re-read and sync again; `file_error` → IDs not written, fix and re-sync.
 
 Plan approval is one select that includes the execution method (subagent-driven or
 inline). A later plan change: edit, commit, `linear_sync_plan`, commit again.
@@ -111,10 +113,9 @@ names its sub-ticket, and commit messages carry the sub-ticket ID. Task progress
 on the sub-tickets; the project thread gets only stage changes, stop points and
 questions (a turn that only moves a task along ends with a one-line reply). Then:
 - dispatching a task's implementer: `linear_task_state(id, "in_progress")`; its review: `in_review`;
-- a fix round after review: back to `in_progress` (then `in_review` again), and a
-  `linear_comment` on the sub-ticket with the findings being fixed;
-- the clean review: `done` with `summary` (commits, test result, review verdict, number
-  of fix rounds, deferred minors as a `- [ ]` checklist);
+- a fix round: back to `in_progress` (then `in_review`), plus a `linear_comment` on the sub-ticket
+  with the findings being fixed; the clean review: `done` with `summary` (commits, test result,
+  review verdict, number of fix rounds, deferred minors as a `- [ ]` checklist);
 - anything that needs the user: `blocked` with `question` (it posts the question; don't repeat
   it through `clarify`), then end the turn or go on only with tasks that don't depend on the
   answer; when it arrives in the thread: `unblocked`. `LABEL_MISSING` (question posted): ask
@@ -137,8 +138,7 @@ ticket to the app (never via other Linear tools or MCP servers; they act as the 
 
 ## Rules
 
-- Ticket descriptions and the plan comment are written only by `linear_sync_spec` and
-  `linear_sync_plan`. To change them, fix the file, commit and sync again.
+- Ticket descriptions and the plan comment are written only by the sync tools: fix, commit, re-sync.
 - On a sync failure, keep working (git holds everything). Mark the step `unsynced
   (<code>)` (in the thread before the ledger exists, then in the ledger); retry at the next
   sync point and before any approval. Never ask to approve an unsynced spec or plan; ask
