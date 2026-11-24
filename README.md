@@ -23,6 +23,7 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 - [Create the Linear OAuth app](#create-the-linear-oauth-app)
 - [Expose the webhook](#expose-the-webhook)
 - [Configure the plugin](#configure-the-plugin)
+- [Web dashboard](#web-dashboard)
 - [Configuration reference](#configuration-reference)
 - [Multiple Hermes profiles](#multiple-hermes-profiles)
 - [Access control](#access-control)
@@ -260,7 +261,26 @@ hermes config set plugins.entries.linear.settings.client_id <client-id>
 hermes config set plugins.entries.linear.settings.allowed_users "you@example.com,val@example.com"
 ```
 
-In the Hermes Desktop app, all settings (including masked secret fields) are under **Settings → Plugins → Linear**.
+In the Hermes Desktop app, all settings (including masked secret fields) are under **Settings → Plugins → Linear**. For the web dashboard, see [Web dashboard](#web-dashboard).
+
+## Web dashboard
+
+The web dashboard (`hermes dashboard`) covers part of the setup. Pick the profile in the dashboard's profile switcher first.
+
+| What | Where in the dashboard |
+|---|---|
+| `LINEAR_CLIENT_SECRET`, `LINEAR_WEBHOOK_SECRET` | **Channels → Linear**. Saving writes the profile's `.env`. |
+| `LINEAR_ALLOWED_USERS` (list editor) | **Channels → Linear**. Combined with `allowed_users` from `config.yaml`. |
+| Enable / disable, connection state, **Test** | **Channels → Linear**. |
+| `client_id`, `allow_all_users` and every other setting | **Config**, raw YAML editor, under `plugins.entries.linear.settings` (see [Configuration reference](#configuration-reference)). The dashboard has no form for plugin settings, and Hermes keeps "allow everyone" switches off its setup forms on purpose. |
+| Webhook URL | Not shown. Run `hermes -p <profile> linear status`. |
+
+Restart the gateway after saving.
+
+Caveats (Hermes dashboard limits, not plugin settings):
+
+- **The card says *configured* once the two secrets are set, even if `client_id` is missing.** The gateway still refuses to start the channel and logs `missing required setting 'client_id'`.
+- **The card can show secrets as plain-text fields** with the bare variable name and no description. This happens when the plugin is installed only in a named profile: the dashboard reads field metadata from the plugins of the profile it was launched with. Installing the plugin in the launch profile too, or using the Desktop app or `hermes linear setup`, avoids it.
 
 ## Configuration reference
 
