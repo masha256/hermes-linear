@@ -202,7 +202,7 @@ def _resolve(session_id: str | None) -> ToolContext:
     registry = dict(adapter_mod.ADAPTERS)
     adapters = list(registry.values())
     fallback = _fallback(registry, env["profile"])
-    is_linear = env["platform"] == PLATFORM
+    is_linear = tool_approval.is_linear_platform(env["platform"])
     log.debug("linear: tool context (session_id=%s, key=%s, linear=%s)",
               session_id, env["session_key"], is_linear)
 
@@ -726,7 +726,7 @@ async def _team(ctx: ToolContext, ref: str) -> dict:
     teams share names none). ``TEAM_NOT_FOUND`` otherwise."""
     teams = await ctx.client.teams()
     want = ref.casefold()
-    for match in (lambda t: t.get("id") == ref,
+    for match in (lambda t: (t.get("id") or "").casefold() == want,
                   lambda t: (t.get("key") or "").casefold() == want):
         found = [t for t in teams if match(t)]
         if found:

@@ -520,6 +520,8 @@ async def test_e2e_outside_comment_approve_writes(e2e_outside):
     assert len(h.notified) == 1 and h.sent == [1]
     data = h.notified[0]
     assert data["command"] == RULE and data["description"].endswith(f"digest: {d}")
+    assert data["pattern_key"] == (
+        f"plugin_rule:{tool_approval.rule_key(TOOL, d, outside=True)}")
     assert data["description"].splitlines()[0] == (
         f"Approve `{TOOL}` from outside a Linear session?")
     assert store.request(SLACK_SK, d) is None  # consumed
@@ -576,3 +578,79 @@ async def test_e2e_outside_create_approve_writes_once(e2e_outside):
     assert desc.splitlines()[0] == f"Approve `{tool}` from outside a Linear session?"
     assert '- RET "new issue in RET"' in desc and desc.endswith(f"digest: {d}")
     assert store.request(SLACK_SK, d) is None
+
+
+# ------------------------- permanent grants never cross the Linear boundary (final review)
+
+
+@pytest.fixture
+def grants():
+    """Hermes's real allowlist state, emptied for one test. Stand-in: the config write
+    (``save_permanent_allowlist``) is a no-op so no ``command_allowlist`` lands on disk;
+    ``_persist_choice`` / ``approve_permanent`` / ``is_approved`` are real."""
+    from tools import approval
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(approval, "_permanent_approved", set()))
+        stack.enter_context(patch.object(approval, "_session_approved", {}))
+        stack.enter_context(patch.object(approval, "save_permanent_allowlist",
+                                         lambda patterns: None))
+        yield approval
+
+
+def _outside_ctx(a, ws):
+    return agent_tools.ToolContext(adapter=a, client=ws, session_issue_id=None,
+                                   session_key=SLACK_SK, is_linear=False, outside=True)
+
+
+async def test_e2e_permanent_outside_grant_still_asks_in_linear(e2e, grants, monkeypatch):
+    """A Slack "always" for a call persists a permanent rule through Hermes's own
+    ``_persist_choice``. It pre-approves the next identical Slack call, but the identical
+    call from a Linear session still asks in the ticket thread with once/deny."""
+    approval = grants
+    h, a, client, gw, store, ws, config = e2e
+    linear_ctx = agent_tools.resolve_context()
+    monkeypatch.setattr(agent_tools, "resolve_context",
+                        lambda session_id=None: _outside_ctx(a, ws))
+    slack = SlackHermes(a, asyncio.get_running_loop(), "always")
+    approval.register_gateway_notify(SLACK_SK, slack.notify)
+    d = tool_approval.digest(TOOL, ARGS)
+    try:
+        assert (await slack.run(cid="s1"))["error"] == "APPROVAL_REQUIRED"
+        assert (await slack.run(cid="s2"))["ok"] is True
+        key = slack.notified[0]["pattern_key"]
+        assert key in approval._permanent_approved  # persisted by Hermes's 'always' path
+        # the permanent rule covers the next identical outside call: no new prompt
+        assert (await slack.run(cid="s3"))["error"] == "APPROVAL_REQUIRED"
+        assert (await slack.run(cid="s4"))["ok"] is True
+        assert len(slack.notified) == 1
+    finally:
+        approval.unregister_gateway_notify(SLACK_SK)
+    written = _comments(ws)
+    assert len(written) == 2
+
+    monkeypatch.setattr(agent_tools, "resolve_context", lambda session_id=None: linear_ctx)
+    task, d_linear = await _asked(h, client, store)  # asks in Linear with once/deny
+    assert d_linear == d
+    await deliver(a, prompted(D_SID, D_ISSUE, "Deny", "act-ans"))
+    out = await task
+    assert set(out) == {"error"} and out["error"].startswith("BLOCKED:"), out
+    assert _comments(ws) == written  # nothing more written
+    assert key == f"plugin_rule:{tool_approval.rule_key(TOOL, d, outside=True)}"
+    assert h.notified[-1]["pattern_key"] == f"plugin_rule:{tool_approval.rule_key(TOOL, d)}"
+
+
+async def test_e2e_permanent_inside_rule_does_not_approve_outside(e2e_outside, grants):
+    """The reverse: a permanent rule on the in-Linear key leaves an outside call asking."""
+    approval = grants
+    make, client, store, ws = e2e_outside
+    d = tool_approval.digest(TOOL, OUT_ARGS)
+    approval.approve_permanent(f"plugin_rule:{tool_approval.rule_key(TOOL, d)}")
+    h = make("deny")
+    await _outside_first(h, store)
+    out = await h.run(args=OUT_ARGS, cid="c-again")
+    assert set(out) == {"error"} and out["error"].startswith("BLOCKED:"), out
+    assert len(h.notified) == 1
+    assert h.notified[0]["pattern_key"] == (
+        f"plugin_rule:{tool_approval.rule_key(TOOL, d, outside=True)}")
+    assert _comments(ws, SELF) == [] and ws.writes() == []

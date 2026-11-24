@@ -309,6 +309,19 @@ def test_outside_create_team_by_key_name_or_uuid(pin_ctx, ws, adapter, origin):
         "ok": False, "error": "TEAM_NOT_FOUND"}
 
 
+def test_outside_create_team_uuid_case_insensitive(pin_ctx, ws, adapter, origin):
+    """Final review minor 4: a team UUID matches whatever its letter case."""
+    tuid = "5c1e2f3a-4b5d-4e6f-8a7b-9c0d1e2f3a4b"
+    ws.teams_rows += [{"id": tuid, "key": "UID", "name": "By uuid"}]
+    ws.states[tuid] = [dict(s) for s in ws.states[TEAM]]
+    ws.labels[tuid] = [dict(lb) for lb in ws.labels[TEAM]]
+    pin_ctx(linear=False)
+    outside(adapter)
+    out = linear_issue_create({"title": "x", "team": tuid.upper()})
+    assert out["ok"] is True, out
+    assert ws.issues[out["issue"]["id"]]["team"] == tuid
+
+
 def test_outside_create_team_arg_beats_default(pin_ctx, ws, adapter, origin):
     pin_ctx(linear=False)
     outside(adapter, default_team="RET", default_project=PROJECT["name"])

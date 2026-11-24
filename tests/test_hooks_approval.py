@@ -124,9 +124,26 @@ def test_outside_request_armed_by_slack_key(store, session):
     store.put_request(SLACK_SK, D, TOOL, ["uuid-y"], MESSAGE)
     _slack(session)
     out = hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1", tool_call_id="c1")
+    # Final review: an outside grain, so a permanent Slack grant never applies in Linear.
     assert out == {"action": "approve", "message": MESSAGE,
-                   "rule_key": f"{TOOL}:{D}"}
+                   "rule_key": f"{TOOL}:outside:{D}"}
     assert store.take_armed_request(SLACK_SK, D) is not None
+
+
+def test_inside_rule_key_unchanged(store, session):
+    """In a Linear session the key stays ``<tool>:<digest>`` (existing grants keep working)."""
+    _request(store)
+    out = hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1", tool_call_id="c1")
+    assert out is not None and out["rule_key"] == f"{TOOL}:{D}"
+
+
+def test_unbound_platform_counts_as_outside(store, session):
+    """No bound ``HERMES_SESSION_PLATFORM`` (a script, a thread without session vars) is
+    outside a Linear session, the same predicate ``agent_tools._resolve`` uses."""
+    store.put_request("script-key", D, TOOL, ["uuid-y"], MESSAGE)
+    session(HERMES_SESSION_KEY="script-key")
+    out = hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1", tool_call_id="c1")
+    assert out is not None and out["rule_key"] == f"{TOOL}:outside:{D}"
 
 
 def test_slack_request_not_armed_from_linear_key(store, session):

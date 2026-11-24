@@ -15,6 +15,7 @@ from hermes_linear.tool_approval import (
     approval_message,
     digest,
     grant_command,
+    is_linear_platform,
     parse_rule,
     rule_key,
     split_grant_command,
@@ -90,6 +91,39 @@ def test_rule_key():
     assert rule_key("linear_comment", "0123456789abcdef") == (
         "linear_comment:0123456789abcdef"
     )
+    assert rule_key("linear_comment", "0123456789abcdef", outside=False) == (
+        "linear_comment:0123456789abcdef"
+    )
+
+
+def test_rule_key_outside_is_its_own_grain():
+    """RET-148 final review: an off-Linear grant must never match the in-Linear key."""
+    assert rule_key("linear_comment", "0123456789abcdef", outside=True) == (
+        "linear_comment:outside:0123456789abcdef"
+    )
+    assert rule_key("linear_comment", "0123456789abcdef", outside=True) != rule_key(
+        "linear_comment", "0123456789abcdef")
+
+
+@pytest.mark.parametrize("platform,linear", [
+    ("linear", True), ("slack", False), ("telegram", False), ("cli", False),
+    ("", False), (None, False), ("Linear", False),
+])
+def test_is_linear_platform(platform, linear):
+    assert is_linear_platform(platform) is linear
+
+
+def test_parsers_unaffected_by_outside_rule_key():
+    """The command and description never carry the rule key: parsers read the same
+    ``<tool> (plugin approval rule)`` command for both forms, and never take a rule key
+    for a grant command."""
+    d = "0123456789abcdef"
+    m = approval_message("linear_comment", [{"identifier": "RET-2", "title": "t"}], {}, d,
+                         outside=True)
+    assert parse_rule(CMD, m) == ("linear_comment", d)
+    assert split_grant_command(grant_command(CMD, d)) == ("linear_comment", d)
+    assert split_grant_command(rule_key("linear_comment", d, outside=True)) is None
+    assert parse_rule(rule_key("linear_comment", d, outside=True), m) is None
 
 
 def test_outside_message_first_line_and_digest_last():
