@@ -204,3 +204,102 @@ def test_gated_schemas_describe_approval(name):
     desc = TOOL_SCHEMAS[name]["description"]
     assert "APPROVAL_REQUIRED" in desc and "identical arguments" in desc
     assert "Only the session issue" not in desc
+
+
+# ------------------------------------- team / project approval targets (RET-121 T4)
+
+ORION = "proj-orion"
+
+
+def _creates(ws):
+    return [c[1] for c in ws.calls if c[0] == "issue_create"]
+
+
+def test_create_other_project_needs_approval(pin_ctx, ws, adapter):
+    ws.add_project(ORION, "orion")
+    args = {"title": "Elsewhere", "project": "orion"}
+    out = linear_issue_create(dict(args))
+    assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED"
+    assert "orion" in out["message"] and "linear_issue_create" in out["message"]
+    assert _creates(ws) == [] and ws.writes() == []
+    req = adapter._store.request("sk", digest("linear_issue_create", args))
+    assert req.targets == [ORION]
+    assert '\n- project "orion"\n' in req.message
+    _mode(adapter, "deny")
+    assert linear_issue_create(dict(args)) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert ws.writes() == []
+
+
+def test_create_other_team_needs_approval(pin_ctx, ws, adapter):
+    ws.add_team("team-2", "OPS", "Operations")
+    args = {"title": "Ops work", "team": "operations", "state": "Todo", "labels": ["bug"]}
+    out = linear_issue_create(dict(args))
+    assert out["error"] == "APPROVAL_REQUIRED" and "OPS" in out["message"]
+    assert ws.writes() == []
+    req = adapter._store.request("sk", digest("linear_issue_create", args))
+    assert req.targets == ["team-2"] and '\n- team "OPS"\n' in req.message
+    # state and labels resolved in the resulting team
+    assert ("team_states", "team-2") in ws.calls and ("team_labels", "team-2") in ws.calls
+    adapter._store.arm_request("sk", req.digest)
+    out = linear_issue_create(dict(args))
+    assert out["ok"] is True
+    assert ws.issues[out["issue"]["id"]]["team"] == "team-2"
+
+
+def test_create_approved_writes_only_approved_target(pin_ctx, ws, adapter):
+    ws.add_project(ORION, "orion")
+    ws.add_team("team-2", "OPS")
+    args = {"title": "Elsewhere", "project": "orion"}
+    linear_issue_create(dict(args))
+    adapter._store.arm_request("sk", digest("linear_issue_create", args))
+    out = linear_issue_create(dict(args))
+    assert out["ok"] is True
+    [inp] = _creates(ws)
+    assert inp["projectId"] == ORION and inp["teamId"] == "team-1"
+    assert adapter._store.created_by("uuid-self") == {out["issue"]["id"]}
+    # an armed request holding only the project does not cover a team in the same call
+    both = {"title": "Both", "project": "orion", "team": "OPS"}
+    dg = digest("linear_issue_create", both)
+    adapter._store.put_request("sk", dg, "linear_issue_create", [ORION], "msg\ndigest: x")
+    adapter._store.arm_request("sk", dg)
+    assert linear_issue_create(dict(both)) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert len(_creates(ws)) == 1
+    # the name now resolving to another project: the approved UUID does not cover it
+    ws.projects_rows = [p for p in ws.projects_rows if p["id"] != ORION]
+    ws.add_project("proj-orion-2", "orion")
+    from hermes_linear import directory
+    directory._DIRECTORIES.pop(ws, None)  # fresh directory: the rename is visible at once
+    linear_issue_create(dict(args))  # first pass again: a new request
+    dg = digest("linear_issue_create", args)
+    adapter._store.put_request("sk", dg, "linear_issue_create", [ORION], "msg\ndigest: x")
+    adapter._store.arm_request("sk", dg)
+    assert linear_issue_create(dict(args)) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert len(_creates(ws)) == 1
+
+
+def test_update_other_project_needs_approval(pin_ctx, ws, adapter):
+    ws.add_project(ORION, "orion")
+    args = {"id": "RET-2", "project": "orion"}
+    out = linear_issue_update(dict(args))
+    assert out["error"] == "APPROVAL_REQUIRED" and "orion" in out["message"]
+    assert ws.writes() == []
+    req = adapter._store.request("sk", digest("linear_issue_update", args))
+    assert req.targets == [ORION] and '\n- project "orion"\n' in req.message
+    adapter._store.arm_request("sk", req.digest)
+    assert linear_issue_update(dict(args))["ok"] is True
+    assert ws.issues["uuid-child"]["project"] == {"id": ORION, "name": "orion"}
+    # an out-of-scope issue and another project: both are targets, issue first
+    both = {"id": "OTH-9", "project": "orion"}
+    out = linear_issue_update(dict(both))
+    assert out["error"] == "APPROVAL_REQUIRED"
+    req = adapter._store.request("sk", digest("linear_issue_update", both))
+    assert req.targets == ["uuid-other", ORION]
+    assert '- OTH-9 "Unrelated"\n- project "orion"\n' in req.message
+
+
+def test_mode_allow_approves_project_target(pin_ctx, ws, adapter):
+    ws.add_project(ORION, "orion")
+    _mode(adapter, "allow")
+    out = linear_issue_create({"title": "Elsewhere", "project": "orion"})
+    assert out["ok"] is True and _creates(ws)[0]["projectId"] == ORION
+    assert _requests(adapter) == 0

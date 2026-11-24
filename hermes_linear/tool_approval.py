@@ -38,10 +38,17 @@ FIELD_TYPES: dict[str, dict[str, str]] = {
                       "subtitle": "string", "embed": "boolean"},
     "linear_comment": {"id": "string", "body": "string", "edit_marker": "string"},
     "linear_issue_create": {"title": "string", "description": "string", "parent": "string",
-                            "labels": "array", "state": "string"},
+                            "labels": "array", "state": "string", "team": "string",
+                            "project": "string", "assignee": "string", "delegate": "string",
+                            "priority": "string", "estimate": "integer",
+                            "due_date": "string", "cycle": "string", "milestone": "string"},
     "linear_issue_update": {"id": "string", "title": "string", "description": "string",
                             "state": "string", "add_labels": "array",
-                            "remove_labels": "array", "parent": "string"},
+                            "remove_labels": "array", "parent": "string",
+                            "project": "string|null", "assignee": "string|null",
+                            "delegate": "string|null", "priority": "string|null",
+                            "estimate": "integer|null", "due_date": "string|null",
+                            "cycle": "string|null", "milestone": "string|null"},
 }
 
 
@@ -144,10 +151,16 @@ def _one_line(value: object) -> str:
 
 
 def approval_message(tool: str, targets: list[dict], args: dict, digest: str) -> str:
-    """Human-facing approval description; its last line carries the digest."""
+    """Human-facing approval description; its last line carries the digest.
+
+    An issue target is ``- RET-n "title"``; a team or project target (one with ``kind``)
+    is ``- project "<name>"`` / ``- team "<key>"``, its name in ``identifier``."""
     lines = [f"Approve `{tool}` outside this session's tickets?"]
     for target in targets:
         identifier = _one_line(target.get("identifier", ""))
+        if target.get("kind"):
+            lines.append(f'- {_one_line(target["kind"])} "{identifier}"')
+            continue
         lines.append(f'- {identifier} "{_one_line(target.get("title", ""))}"')
     lines.append("Arguments:")
     lines.append(

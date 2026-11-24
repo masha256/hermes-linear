@@ -131,6 +131,22 @@ def test_message_flattens_newlines_in_identifier_and_title():
     assert parse_rule(CMD, msg) == ("linear_comment", d)
 
 
+def test_message_renders_kind_targets():
+    d = "0123456789abcdef"
+    msg = approval_message(
+        "linear_issue_create",
+        [{"id": "u1", "identifier": "OTH-9", "title": "Fix it"},
+         {"id": "p1", "kind": "project", "identifier": "orion\r\nX", "title": ""},
+         {"id": "t1", "kind": "team", "identifier": "OPS", "title": ""}],
+        {"title": "x"}, d)
+    lines = msg.split("\n")
+    assert lines[1:4] == ['- OTH-9 "Fix it"', '- project "orion  X"', '- team "OPS"']
+    assert lines[4] == "Arguments:" and lines[-1] == f"digest: {d}"
+    assert "\r" not in msg
+    assert parse_rule("<linear_issue_create> (plugin approval rule)", msg) == (
+        "linear_issue_create", d)
+
+
 def test_message_tolerates_non_json_values():
     args = {"when": object()}
     msg = approval_message("linear_comment", [], args, "0123456789abcdef")

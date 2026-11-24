@@ -32,7 +32,7 @@ from typing import Any, Callable, Coroutine
 from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
-from . import directory, graphql_guard, sync, tool_approval
+from . import directory, graphql_guard, issue_fields, sync, tool_approval
 from .constants import PLAN_SYNC_TIMEOUT_S, TOOL_TIMEOUT_S
 from .linear_client import LinearError
 
@@ -77,6 +77,13 @@ class Gate:
             return
         self.targets.append({"id": issue["id"], "identifier": issue.get("identifier"),
                              "title": issue.get("title")})
+
+    def record_target(self, id: str, kind: str, name: str) -> None:  # noqa: A002
+        """A team or project target (``kind`` ``team`` / ``project``; RET-121 spec §2.4),
+        shown on the card as ``- <kind> "<name>"``."""
+        if any(t["id"] == id for t in self.targets):
+            return
+        self.targets.append({"id": id, "kind": kind, "identifier": name, "title": ""})
 
     def check(self) -> None:
         if self.targets:
@@ -561,6 +568,23 @@ def _check_gate(ctx: ToolContext) -> None:
         ctx.gate.check()
 
 
+def _target_ok(ctx: ToolContext, id: str) -> bool:  # noqa: A002
+    """True on a pass whose approved targets hold ``id`` (a team or project UUID)."""
+    return ctx.gate is not None and id in ctx.gate.approved
+
+
+def _scope_target(ctx: ToolContext, row: dict, kind: str) -> None:
+    """``row`` (a resolved team or project) is outside the session's scope: approved on
+    this pass, recorded on a first pass (the body's ``_check_gate`` then asks), else
+    ``OUT_OF_SCOPE`` (RET-121 spec §2.4)."""
+    if _target_ok(ctx, row["id"]):
+        return
+    if ctx.gate is None or ctx.gate.approved:
+        raise _Refusal("OUT_OF_SCOPE")
+    ctx.gate.record_target(row["id"], kind, row.get("key" if kind == "team" else "name")
+                           or row["id"])
+
+
 def _state_row(states: list[dict], ref: str) -> dict | None:
     """``resolve_state``'s pick as a row: a directory ``match``."""
     sid = resolve_state(states, ref)
@@ -629,36 +653,63 @@ def _team_of(issue: dict) -> str:
     return team
 
 
+def _project_of(issue: dict | None) -> str | None:
+    return ((issue or {}).get("project") or {}).get("id")
+
+
+def _with_fields(out: dict, r: issue_fields.Resolved) -> dict:
+    """A write's result plus self-delegation's ``starts_session`` / ``warnings``."""
+    if r.starts_session is not None:
+        out["starts_session"] = r.starts_session
+    if r.warnings:
+        out["warnings"] = list(r.warnings)
+    return out
+
+
 # -- linear_issue_create
 
 
 def _parse_create(args: dict) -> dict:
     return {"title": _req_str(args, "title"), "description": _opt_str(args, "description"),
             "parent": _opt_str(args, "parent"), "labels": _opt_names(args, "labels"),
-            "state": _opt_str(args, "state")}
+            "state": _opt_str(args, "state"),
+            "fields": issue_fields.parse(args, update=False)}
 
 
 async def _create(ctx: ToolContext, a: dict) -> dict:
+    """Base team and project (RET-121 spec §1.2): the parent's with ``parent``, else the
+    session ticket's. An explicit team / project other than the base is a target."""
     if not ctx.is_linear or not ctx.session_issue_id:
         raise _Refusal("NOT_LINEAR_SESSION")
-    home = await ctx.client.issue_get(ctx.session_issue_id)
-    team = _team_of(home)
+    parent = None
+    if a["parent"] and a["parent"].strip():
+        parent = await _writable(ctx, a["parent"].strip())
+    base = parent if parent is not None else await ctx.client.issue_get(ctx.session_issue_id)
+    base_team, base_project = _team_of(base), _project_of(base)
+    r = await issue_fields.resolve(ctx, a["fields"], team_id=base_team,
+                                   project_id=base_project)
+    if r.team is not None and r.team["id"] != base_team:
+        _scope_target(ctx, r.team, "team")
+    if r.project is not None and r.project["id"] != base_project:
+        _scope_target(ctx, r.project, "project")
+    team = r.team_id
     inp: dict[str, Any] = {"teamId": team, "title": a["title"]}
-    if (home.get("project") or {}).get("id"):
-        inp["projectId"] = home["project"]["id"]
+    if r.project_id:
+        inp["projectId"] = r.project_id
     if a["description"] is not None:
         inp["description"] = a["description"]
-    if a["parent"] and a["parent"].strip():
-        inp["parentId"] = (await _writable(ctx, a["parent"].strip()))["id"]
+    if parent is not None:
+        inp["parentId"] = parent["id"]
     if a["state"] is not None:
         inp["stateId"] = await _state_id(ctx, team, a["state"])
     labels, _ = await _label_ids(ctx, team, a["labels"])
     if labels:
         inp["labelIds"] = labels
+    inp.update({k: v for k, v in r.input.items() if k not in ("teamId", "projectId")})
     _check_gate(ctx)
     issue = await ctx.client.issue_create(inp)
     _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
-    return {"ok": True, "issue": issue}
+    return _with_fields({"ok": True, "issue": issue}, r)
 
 
 # -- linear_issue_update
@@ -668,11 +719,13 @@ def _parse_update(args: dict) -> dict:
     a = {"id": _req_str(args, "id"), "title": _opt_str(args, "title"),
          "description": _opt_str(args, "description"), "state": _opt_str(args, "state"),
          "add_labels": _opt_names(args, "add_labels"),
-         "remove_labels": _opt_names(args, "remove_labels"), "parent": _parse_parent(args)}
+         "remove_labels": _opt_names(args, "remove_labels"), "parent": _parse_parent(args),
+         "fields": issue_fields.parse(args, update=True)}  # ``team``: BAD_ARGS
     if a["title"] is not None and not a["title"].strip():
         raise _Refusal("BAD_ARGS")
     if not (a["title"] is not None or a["description"] is not None or a["state"] is not None
-            or a["add_labels"] or a["remove_labels"] or a["parent"] is not None):
+            or a["add_labels"] or a["remove_labels"] or a["parent"] is not None
+            or a["fields"]):
         raise _Refusal("BAD_ARGS")
     return a
 
@@ -699,12 +752,19 @@ async def _update(ctx: ToolContext, a: dict) -> dict:
             inp[key] = a[key]
     if a["state"] is not None:
         inp["stateId"] = await _state_id(ctx, team, a["state"])
+    parent: dict | None = None
     if a["parent"] == "":
         inp["parentId"] = None  # detach: top-level
     elif a["parent"] is not None:
         parent = await _writable(ctx, a["parent"])  # both ends in scope (RET-110)
         await _refuse_cycle(ctx, issue["id"], parent)
         inp["parentId"] = parent["id"]
+    r = await issue_fields.resolve(ctx, a["fields"], team_id=team,
+                                   project_id=_project_of(issue))
+    if r.project is not None and not await _project_in_scope(ctx, issue, a["parent"], parent,
+                                                             r.project["id"]):
+        _scope_target(ctx, r.project, "project")
+    inp.update(r.input)
     added, removed = await _label_ids(ctx, team, a["add_labels"], a["remove_labels"])
     carried = _carried(issue)
     removed = [lid for lid in removed if lid in carried]  # removing an absent label: no-op
@@ -714,8 +774,25 @@ async def _update(ctx: ToolContext, a: dict) -> dict:
         inp["removedLabelIds"] = removed
     if not inp:  # only no-op removals: never send an empty issueUpdate (Task 2 minor N1)
         return {"ok": True, "issue": _summary(issue)}
-    _check_gate(ctx)  # after both ends' scope checks and the cycle check
-    return {"ok": True, "issue": await ctx.client.issue_update(issue["id"], inp)}
+    _check_gate(ctx)  # after both ends' scope checks, the cycle check and the project check
+    return _with_fields({"ok": True, "issue": await ctx.client.issue_update(issue["id"], inp)},
+                        r)
+
+
+async def _project_in_scope(ctx: ToolContext, issue: dict, parent_arg: str | None,
+                            new_parent: dict | None, project_id: str) -> bool:
+    """True if moving ``issue`` to ``project_id`` needs no approval (RET-121 spec §1.3):
+    its current project (no change), the session ticket's, or its parent's project, the
+    parent being ``new_parent`` when the call sets one (none when it detaches), else the
+    issue's current parent. Reads only as far as needed."""
+    if project_id == _project_of(issue):
+        return True
+    if project_id == _project_of(await ctx.client.issue_get(ctx.session_issue_id or "")):
+        return True
+    if parent_arg is not None:  # the parent changes in this call
+        return new_parent is not None and project_id == _project_of(new_parent)
+    current = (issue.get("parent") or {}).get("id")
+    return bool(current) and project_id == _project_of(await ctx.client.issue_get(current))
 
 
 async def _refuse_cycle(ctx: ToolContext, issue_id: str, parent: dict) -> None:
@@ -1187,13 +1264,38 @@ linear_query = _tool(_parse_query, _query)
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
 _GATED_NOTE = ("Outside the session issue's tree (issues you did not create) the first call "
                "returns APPROVAL_REQUIRED; call again with identical arguments to ask a human.")
+_USER_REF = "User UUID, name, display name or email; me is this app."
+_PRIORITY = ("none, urgent, high, medium or low, or Linear's number 0-4 "
+             "(0 none, 1 urgent, 2 high, 3 medium, 4 low).")
+
+
+def _field_props(nullable: bool) -> dict[str, dict]:
+    """The shared issue fields (RET-121 spec §1.1); on update ``null`` (or "") clears."""
+    s: Any = ["string", "null"] if nullable else "string"
+    i: Any = ["integer", "null"] if nullable else "integer"
+    return {
+        "assignee": {"type": s, "description": _USER_REF},
+        "delegate": {"type": s, "description": (
+            "An agent (app) user: UUID, name, display name or email; me is this app, "
+            "which starts no session (starts_session: false).")},
+        "priority": {"type": s, "description": _PRIORITY},
+        "estimate": {"type": i, "description": "Estimate points, an integer >= 0."},
+        "due_date": {"type": s, "description": "YYYY-MM-DD."},
+        "cycle": {"type": s, "description": ("Cycle UUID, number, name, current or next, in "
+                                             "the issue's team.")},
+        "milestone": {"type": s, "description": ("Project milestone UUID or name, in the "
+                                                 "issue's resulting project.")},
+    }
+
 
 TOOL_SCHEMAS: dict[str, dict] = {
     "linear_issue_get": {},  # first slot; tools_read registers its schema here (Ruling R3)
     "linear_issue_create": {
         "name": "linear_issue_create",
-        "description": ("Create a Linear issue as the Linear app, in the session issue's team "
-                        "and project. Set parent to make it a sub-issue. " + _GATED_NOTE),
+        "description": ("Create a Linear issue as the Linear app, in the parent's team and "
+                        "project (with parent: a sub-issue), else the session issue's. A "
+                        "team or project other than that needs a human's approval. "
+                        "Delegating to this app starts no session. " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "title": {"type": "string"},
             "description": {"type": "string", "description": "Markdown."},
@@ -1202,12 +1304,20 @@ TOOL_SCHEMAS: dict[str, dict] = {
                        "description": "Existing label names."},
             "state": {"type": "string",
                       "description": "Workflow state name, or a type such as started."},
+            "team": {"type": "string", "description": "Team UUID, key (e.g. RET) or name."},
+            "project": {"type": "string",
+                        "description": ("Project UUID or name; omitted or null: the parent's "
+                                        "(else the session issue's).")},
+            **_field_props(nullable=False),
         }, "required": ["title"]},
     },
     "linear_issue_update": {
         "name": "linear_issue_update",
         "description": ("Update a Linear issue as the Linear app: title, description, state, "
-                        "labels, parent. " + _GATED_NOTE),
+                        "labels, parent, project, assignee, delegate, priority, estimate, "
+                        "due date, cycle, milestone (null clears a field). Another project "
+                        "than the session issue's or the parent's needs a human's approval. "
+                        + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "title": {"type": "string"},
@@ -1223,6 +1333,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                        "string detaches the issue (top-level). Refused "
                                        "(PARENT_CYCLE) if it is the issue or a descendant. A "
                                        "detached issue you did not create leaves your scope.")},
+            "project": {"type": ["string", "null"],
+                        "description": ("Project UUID or name; null removes the project. "
+                                        "Moving to another project clears the milestone "
+                                        "unless milestone is given too.")},
+            **_field_props(nullable=True),
         }, "required": ["id"]},
     },
     "linear_comment": {

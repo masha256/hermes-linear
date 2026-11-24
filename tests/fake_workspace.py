@@ -43,6 +43,11 @@ Usage::
   ``attachment_create`` / ``attachment_link_url`` / ``attachment_link_github_pr`` store
   ``{id, issue, url, title, subtitle}`` and return ``{id, url}`` (duplicates not modelled).
 
+- directory lists and issue fields (RET-121): ``teams`` / ``users`` / ``projects`` /
+  ``cycles`` / ``milestones`` answer from ``*_rows`` (``add_team`` / ``add_project`` seed
+  more); ``issue_create`` / ``issue_update`` store a known ``projectId`` as the issue's
+  ``project`` and the other new input keys as given under ``issues[id]["fields"]``.
+
 Later tasks extend it (relations, documents, …); keep each addition small and listed here.
 """
 
@@ -76,11 +81,26 @@ DEFAULT_LABELS = [
 ]
 WORKSPACE_LABELS = [{"id": "lb-ws-blocked", "name": "Blocked"}]
 
+#: The directory lists (RET-121): ``teams`` / ``users`` / ``projects`` rows as the client
+#: returns them; ``cycles`` per team and ``milestones`` per project (empty by default).
+DEFAULT_TEAMS = [{"id": TEAM, "key": "RET", "name": "Retail"}]
+DEFAULT_USERS = [
+    {"id": VIEWER, "name": "Neo", "displayName": "neo", "email": "neo@app.linear",
+     "app": True, "active": True},
+    {"id": HUMAN, "name": "Mike Smith", "displayName": "mike", "email": "mike@example.com",
+     "app": False, "active": True},
+]
+DEFAULT_PROJECTS = [{"id": PROJECT["id"], "name": PROJECT["name"], "state": "started"}]
+
+#: Issue fields (RET-121) the fake stores as given under ``issues[id]["fields"]``.
+_FIELD_KEYS = ("assigneeId", "delegateId", "priority", "estimate", "dueDate", "cycleId",
+               "projectMilestoneId")
+
 # SDL input field names (schema.graphql): IssueCreateInput / IssueUpdateInput subsets we use.
 CREATE_FIELDS = {"title", "description", "teamId", "projectId", "parentId", "labelIds",
-                 "stateId", "subIssueSortOrder"}
+                 "stateId", "subIssueSortOrder", *_FIELD_KEYS}
 UPDATE_FIELDS = {"title", "description", "stateId", "addedLabelIds", "removedLabelIds",
-                 "labelIds", "parentId", "projectId", "subIssueSortOrder"}
+                 "labelIds", "parentId", "projectId", "subIssueSortOrder", *_FIELD_KEYS}
 
 
 _BULLET_RE = re.compile(r"^(\s*)- ", re.MULTILINE)
@@ -110,6 +130,11 @@ class FakeWorkspace:
         self.states: dict[str, list[dict]] = {TEAM: [dict(s) for s in DEFAULT_STATES]}
         self.labels: dict[str, list[dict]] = {TEAM: [dict(lb) for lb in DEFAULT_LABELS]}
         self.workspace_labels: list[dict] = [dict(lb) for lb in WORKSPACE_LABELS]
+        self.teams_rows: list[dict] = [dict(t) for t in DEFAULT_TEAMS]
+        self.users_rows: list[dict] = [dict(u) for u in DEFAULT_USERS]
+        self.projects_rows: list[dict] = [dict(p) for p in DEFAULT_PROJECTS]
+        self.cycles_rows: dict[str, list[dict]] = {}
+        self.milestones_rows: dict[str, list[dict]] = {}
         self.uploads: dict[str, dict] = {}  # asset URL -> {name, content_type, data}
         self.attachments: dict[str, dict] = {}  # id -> {id, issue, url, title, subtitle}
         self.calls: list[tuple[str, Any]] = []
@@ -129,9 +154,30 @@ class FakeWorkspace:
             "title": title, "description": description, "team": team,
             "project": copy.deepcopy(project),
             "parent": parent, "labels": list(labels), "state": state,
-            "subIssueSortOrder": sort_order, "creator": creator,
+            "subIssueSortOrder": sort_order, "creator": creator, "fields": {},
         }
         return iid
+
+    def add_team(self, team_id: str, key: str, name: str = "") -> None:
+        """Another team, with the default states and labels."""
+        self.teams_rows.append({"id": team_id, "key": key, "name": name or key})
+        self.states[team_id] = [dict(s) for s in DEFAULT_STATES]
+        self.labels[team_id] = [dict(lb) for lb in DEFAULT_LABELS]
+
+    def add_project(self, project_id: str, name: str) -> dict:
+        """Another project; returns the ``{id, name}`` an issue's ``project`` holds."""
+        self.projects_rows.append({"id": project_id, "name": name, "state": "planned"})
+        return {"id": project_id, "name": name}
+
+    def _project(self, project_id: str | None) -> dict | None:
+        if not project_id:
+            return None
+        if project_id == PROJECT["id"]:
+            return copy.deepcopy(PROJECT)
+        row = next((p for p in self.projects_rows if p["id"] == project_id), None)
+        if row is None:
+            raise _not_found("Project")
+        return {"id": row["id"], "name": row["name"]}
 
     def add_comment(self, issue_id: str, body: str, *, user: str = VIEWER) -> str:
         cid = f"comment-{next(self._ids)}"
@@ -226,7 +272,7 @@ class FakeWorkspace:
             self.issue(inp["parentId"])
         for lid in inp.get("labelIds") or []:
             self._label(team, lid)
-        project = PROJECT if inp.get("projectId") == PROJECT["id"] else None
+        project = self._project(inp.get("projectId"))
         state = inp.get("stateId") or self.default_state(team)
         self._state(team, state)
         iid = self.add_issue(title=inp.get("title") or "",
@@ -234,6 +280,7 @@ class FakeWorkspace:
                              team=team, project=project, parent=inp.get("parentId"),
                              labels=tuple(inp.get("labelIds") or ()), state=state,
                              sort_order=inp.get("subIssueSortOrder") or 0.0, creator=VIEWER)
+        self.issues[iid]["fields"] = {k: inp[k] for k in _FIELD_KEYS if k in inp}
         return self._summary(self.issues[iid])
 
     async def issue_update(self, issue_id: str, inp: dict) -> dict:
@@ -258,6 +305,9 @@ class FakeWorkspace:
             i["subIssueSortOrder"] = inp["subIssueSortOrder"]
         if "parentId" in inp:
             i["parent"] = self.issue(inp["parentId"])["id"] if inp["parentId"] else None
+        if "projectId" in inp:
+            i["project"] = self._project(inp["projectId"])
+        i["fields"].update({k: inp[k] for k in _FIELD_KEYS if k in inp})
         return self._summary(i)
 
     async def comment_create(self, issue_id: str, body: str) -> str:
@@ -283,6 +333,27 @@ class FakeWorkspace:
     async def team_labels(self, team_id: str) -> list[dict]:
         self.calls.append(("team_labels", team_id))
         return [dict(lb) for lb in [*self.labels.get(team_id, []), *self.workspace_labels]]
+
+    # -- directory lists (RET-121) ---------------------------------------
+    async def teams(self) -> list[dict]:
+        self.calls.append(("teams", None))
+        return [dict(t) for t in self.teams_rows]
+
+    async def users(self) -> list[dict]:
+        self.calls.append(("users", None))
+        return [dict(u) for u in self.users_rows]
+
+    async def projects(self) -> list[dict]:
+        self.calls.append(("projects", None))
+        return [dict(p) for p in self.projects_rows]
+
+    async def cycles(self, team_id: str) -> list[dict]:
+        self.calls.append(("cycles", team_id))
+        return [dict(c) for c in self.cycles_rows.get(team_id, [])]
+
+    async def milestones(self, project_id: str) -> list[dict]:
+        self.calls.append(("milestones", project_id))
+        return [dict(m) for m in self.milestones_rows.get(project_id, [])]
 
     # -- uploads and attachments (RET-134) ------------------------------
     async def file_upload(self, name: str, content_type: str, data: bytes) -> str:

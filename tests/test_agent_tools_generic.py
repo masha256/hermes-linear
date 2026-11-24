@@ -14,7 +14,7 @@ import threading
 import pytest
 
 from test_agent_tools_runtime import new_adapter
-from fake_workspace import PROJECT, TEAM, VIEWER, FakeWorkspace
+from fake_workspace import HUMAN, PROJECT, TEAM, VIEWER, FakeWorkspace
 
 from hermes_linear.linear_client import LinearError
 
@@ -546,3 +546,202 @@ def test_comment_marker_must_be_simple(pin_ctx, ws):
     assert linear_comment({"id": SELF, "body": "b", "edit_marker": "a -->x"}) == {
         "ok": False, "error": "BAD_ARGS"}
     assert ws.writes() == []
+
+
+# ------------------------------------------- create / update field parity (RET-121 T4)
+
+ORION = "proj-orion"
+
+
+def _created_inputs(ws) -> list[dict]:
+    return [c[1] for c in ws.calls if c[0] == "issue_create"]
+
+
+def _updates(ws) -> list[tuple[str, dict]]:
+    return [c[1] for c in ws.calls if c[0] == "issue_update"]
+
+
+def _orion(ws) -> dict:
+    return ws.add_project(ORION, "orion")
+
+
+def _requests(adapter) -> int:
+    return adapter._store.conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+
+
+def test_create_fields_input(pin_ctx, ws, adapter):
+    ws.cycles_rows[TEAM] = [{"id": "cy-1", "number": 1, "name": "Sprint 1", "current": True}]
+    ws.milestones_rows[PROJECT["id"]] = [{"id": "ms-1", "name": "Alpha"}]
+    out = linear_issue_create({
+        "title": "Full", "description": "d", "parent": "RET-1", "labels": ["bug"],
+        "state": "In Progress", "team": "ret", "project": "Hermes", "assignee": "mike",
+        "priority": "high", "estimate": 3, "due_date": "2026-12-01", "cycle": "current",
+        "milestone": "alpha"})
+    assert out["ok"] is True and set(out) == {"ok", "issue"}, out
+    assert _created_inputs(ws) == [{
+        "teamId": TEAM, "title": "Full", "projectId": PROJECT["id"], "description": "d",
+        "parentId": SELF, "stateId": "st-progress", "labelIds": ["lb-bug"],
+        "assigneeId": HUMAN, "priority": 2, "estimate": 3, "dueDate": "2026-12-01",
+        "cycleId": "cy-1", "projectMilestoneId": "ms-1"}]
+    assert _requests(adapter) == 0  # team and project equal to the base: no target
+
+
+def test_create_null_fields_are_absent(pin_ctx, ws):
+    out = linear_issue_create({"title": "x", "project": None, "assignee": "", "priority": None,
+                               "estimate": None, "milestone": "  "})
+    assert out["ok"] is True
+    assert _created_inputs(ws) == [{"teamId": TEAM, "title": "x",
+                                     "projectId": PROJECT["id"]}]  # null project: the base
+
+
+def test_create_follows_parent_project_no_target(pin_ctx, ws, adapter):
+    orion = _orion(ws)
+    ws.add_issue("RET-5", uuid="uuid-p5", parent=SELF, project=orion)  # in scope, in orion
+    out = linear_issue_create({"title": "Kid", "parent": "RET-5"})
+    assert out["ok"] is True
+    assert ws.issues[out["issue"]["id"]]["project"] == orion
+    out = linear_issue_create({"title": "Kid 2", "parent": "RET-5", "project": "orion"})
+    assert out["ok"] is True  # explicit project equal to the parent's: no target
+    ws.add_issue("RET-6", uuid="uuid-p6", parent=SELF, project=None)
+    assert linear_issue_create({"title": "Kid 3", "parent": "RET-6"})["ok"] is True
+    assert "projectId" not in _created_inputs(ws)[-1]  # a parent without a project
+    assert _requests(adapter) == 0
+    # Review Focus 2: an approved out-of-scope parent in another project is the only target;
+    # the child follows that parent's project with no prompt of its own.
+    ws.add_issue("OTH-7", uuid="uuid-o7", project=orion)
+    args = {"title": "Under approved", "parent": "OTH-7"}
+    assert needs_approval(linear_issue_create(dict(args)))
+    from hermes_linear.tool_approval import digest
+    dg = digest("linear_issue_create", args)
+    assert adapter._store.request("sk", dg).targets == ["uuid-o7"]
+    adapter._store.arm_request("sk", dg)
+    out = linear_issue_create(dict(args))
+    assert out["ok"] is True and ws.issues[out["issue"]["id"]]["project"] == orion
+
+
+def test_update_fields_input(pin_ctx, ws):
+    ws.cycles_rows[TEAM] = [{"id": "cy-7", "number": 7, "name": "Sprint 7"}]
+    ws.milestones_rows[PROJECT["id"]] = [{"id": "ms-1", "name": "Alpha"}]
+    out = linear_issue_update({"id": "RET-2", "assignee": "me", "priority": "4",
+                               "estimate": 0, "due_date": "2027-01-31", "cycle": "7",
+                               "milestone": "Alpha"})
+    assert out["ok"] is True and set(out) == {"ok", "issue"}
+    assert _updates(ws) == [("uuid-child", {
+        "assigneeId": VIEWER, "priority": 4, "estimate": 0, "dueDate": "2027-01-31",
+        "cycleId": "cy-7", "projectMilestoneId": "ms-1"})]
+
+
+def test_update_clear_fields(pin_ctx, ws):
+    out = linear_issue_update({"id": "RET-2", "assignee": None, "delegate": "",
+                               "priority": None, "estimate": None, "due_date": None,
+                               "cycle": None, "milestone": None})
+    assert out["ok"] is True
+    assert _updates(ws) == [("uuid-child", {
+        "assigneeId": None, "delegateId": None, "priority": 0, "estimate": None,
+        "dueDate": None, "cycleId": None, "projectMilestoneId": None})]
+    assert linear_issue_update({"id": "RET-2", "priority": "low"})["ok"] is True  # R2
+
+
+def test_update_milestone_in_resulting_project(pin_ctx, ws):
+    orion = _orion(ws)
+    ws.add_issue("RET-5", uuid="uuid-p5", parent=SELF, project=orion)
+    ws.milestones_rows[ORION] = [{"id": "ms-o", "name": "Launch"}]
+    out = linear_issue_update({"id": "RET-2", "project": "orion", "milestone": "launch",
+                               "parent": "RET-5"})
+    assert out["ok"] is True
+    assert _updates(ws)[-1][1] == {"parentId": "uuid-p5", "projectId": ORION,
+                                   "projectMilestoneId": "ms-o"}
+    out = linear_issue_update({"id": "RET-2", "project": None, "milestone": "launch"})
+    assert out == {"ok": False, "error": "MILESTONE_NOT_FOUND", "candidates": []}
+
+
+def test_self_delegation_result(pin_ctx, ws):
+    from hermes_linear.issue_fields import SELF_DELEGATION_WARNING
+    out = linear_issue_create({"title": "x", "delegate": "me"})
+    assert out["ok"] is True and out["starts_session"] is False
+    assert out["warnings"] == [SELF_DELEGATION_WARNING]
+    assert _created_inputs(ws)[-1]["delegateId"] == VIEWER
+    out = linear_issue_update({"id": "RET-2", "delegate": "Neo"})
+    assert out["ok"] is True and out["starts_session"] is False
+    assert out["warnings"] == [SELF_DELEGATION_WARNING]
+    n = len(ws.writes())
+    assert linear_issue_update({"id": "RET-2", "delegate": "mike"}) == {
+        "ok": False, "error": "DELEGATE_NOT_AGENT"}
+    assert len(ws.writes()) == n
+
+
+def test_update_team_bad_args(pin_ctx, ws):
+    for args in ({"id": "RET-2", "team": "RET"}, {"id": "RET-2", "team": None},
+                 {"id": "RET-2", "title": "T", "team": "RET"}):
+        assert linear_issue_update(args) == {"ok": False, "error": "BAD_ARGS"}, args
+    assert ws.writes() == []
+
+
+def test_field_misses_carry_candidates(pin_ctx, ws):
+    out = linear_issue_create({"title": "x", "assignee": "nobody"})
+    assert out["error"] == "USER_NOT_FOUND" and out["candidates"]
+    out = linear_issue_create({"title": "x", "project": "nope"})
+    assert out["error"] == "PROJECT_NOT_FOUND" and out["candidates"]
+    out = linear_issue_create({"title": "x", "team": "NOPE"})
+    assert out["error"] == "TEAM_NOT_FOUND" and out["candidates"]
+    out = linear_issue_update({"id": "RET-2", "cycle": "current"})
+    assert out == {"ok": False, "error": "CYCLE_NOT_FOUND", "candidates": []}
+    for bad in ({"priority": "huge"}, {"estimate": -1}, {"due_date": "2026-02-30"}):
+        assert linear_issue_update({"id": "RET-2", **bad}) == {
+            "ok": False, "error": "BAD_ARGS"}, bad
+    assert ws.writes() == []
+
+
+def test_update_project_session_or_parent_no_prompt(pin_ctx, ws, adapter):
+    orion = _orion(ws)
+    ws.add_issue("RET-5", uuid="uuid-p5", parent=SELF, project=orion)
+    ws.add_issue("RET-6", uuid="uuid-k6", parent="uuid-p5", project=None)
+    # the parent's project
+    assert linear_issue_update({"id": "RET-6", "project": "orion"})["ok"] is True
+    assert ws.issues["uuid-k6"]["project"] == orion
+    # the session ticket's project
+    assert linear_issue_update({"id": "RET-6", "project": "Hermes"})["ok"] is True
+    assert ws.issues["uuid-k6"]["project"]["id"] == PROJECT["id"]
+    # clearing is no target
+    for clear in (None, ""):
+        assert linear_issue_update({"id": "RET-5", "project": clear})["ok"] is True
+        assert ws.issues["uuid-p5"]["project"] is None
+    assert _requests(adapter) == 0
+
+
+def test_update_project_new_parent_same_call(pin_ctx, ws, adapter):
+    orion = _orion(ws)
+    ws.add_issue("RET-5", uuid="uuid-p5", parent=SELF, project=orion)
+    ws.add_issue("RET-6", uuid="uuid-k6", parent=SELF, project=None)
+    out = linear_issue_update({"id": "RET-6", "parent": "RET-5", "project": "orion"})
+    assert out["ok"] is True and _requests(adapter) == 0
+    assert ws.issues["uuid-k6"]["parent"] == "uuid-p5"
+    assert ws.issues["uuid-k6"]["project"] == orion
+    ws.issues["uuid-k6"]["project"] = None
+    # the NEW parent (RET-1, project Hermes) counts, not the current one (orion)
+    assert needs_approval(linear_issue_update({"id": "RET-6", "parent": "RET-1",
+                                               "project": "orion"}))
+    # detaching leaves only the session ticket's project
+    assert needs_approval(linear_issue_update({"id": "RET-6", "parent": None,
+                                               "project": "orion"}))
+    assert ws.issues["uuid-k6"]["parent"] == "uuid-p5"
+    assert len(_updates(ws)) == 1
+
+
+def test_issue_field_schemas():
+    from hermes_linear.issue_fields import FIELDS
+    create = TOOL_SCHEMAS["linear_issue_create"]["parameters"]["properties"]
+    update = TOOL_SCHEMAS["linear_issue_update"]["parameters"]["properties"]
+    for name in (*FIELDS, "team"):
+        want = "integer" if name == "estimate" else "string"
+        assert create[name]["type"] == want, name
+        if name != "team":
+            assert update[name]["type"] == [want, "null"], name
+    assert "team" not in update
+    for props in (create, update):
+        assert all(w in props["priority"]["description"]
+                   for w in ("none", "urgent", "high", "medium", "low", "0", "4"))
+    assert "clears the milestone" in update["project"]["description"]
+    for key in ("labels",):
+        assert create[key]["type"] == "array"
+    assert update["add_labels"]["type"] == update["remove_labels"]["type"] == "array"
