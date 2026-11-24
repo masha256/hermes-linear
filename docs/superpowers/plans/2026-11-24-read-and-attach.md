@@ -35,7 +35,7 @@ Linear: RET-120
 
 ---
 
-### Task 1: `linear_issue_get` fields + comment threads
+### Task 1: `linear_issue_get` fields + comment threads — RET-131
 
 **Files:**
 - Create: `hermes_linear/tools_read.py`
@@ -80,12 +80,12 @@ Expected: all pass, and the private-imports list is unchanged.
 
 ```bash
 git add hermes_linear/tools_read.py hermes_linear/linear_client.py hermes_linear/agent_tools.py hermes_linear/skills/manage-superpowers/SKILL.md tests/test_tools_read.py tests/test_linear_client.py
-git commit -m "feat: linear_issue_get fields, relations, attachments and comment threads (<T1 ID>)"
+git commit -m "feat: linear_issue_get fields, relations, attachments and comment threads (RET-131)"
 ```
 
 ---
 
-### Task 2: `linear_search`
+### Task 2: `linear_search` — RET-132
 
 **Files:**
 - Modify: `hermes_linear/tools_read.py` (add `build_issue_filter`, the `linear_search` handler and schema)
@@ -124,12 +124,12 @@ Expected: all pass (the roster, manifest and skill tests include `linear_search`
 
 ```bash
 git add hermes_linear/tools_read.py hermes_linear/linear_client.py hermes_linear/agent_tools.py plugin.yaml hermes_linear/skills/manage-superpowers/SKILL.md tests/test_tools_read.py tests/test_linear_client.py tests/test_plugin_register.py
-git commit -m "feat: linear_search with typed filters (<T2 ID>)"
+git commit -m "feat: linear_search with typed filters (RET-132)"
 ```
 
 ---
 
-### Task 3: Path policy, upload and attachment client calls
+### Task 3: Path policy, upload and attachment client calls — RET-133
 
 **Files:**
 - Create: `hermes_linear/tools_attach.py` (the path policy only in this task, plus empty `SCHEMAS`/`HANDLERS`)
@@ -181,12 +181,12 @@ Expected: all pass; no new private imports (`gateway.platforms.base` is a public
 - [ ] **Step 5: Commit**
 
 ```bash
-git commit -m "feat: attach path policy, file upload and attachment client calls (<T3 ID>)"
+git commit -m "feat: attach path policy, file upload and attachment client calls (RET-133)"
 ```
 
 ---
 
-### Task 4: `linear_attach` tool
+### Task 4: `linear_attach` tool — RET-134
 
 **Files:**
 - Modify: `hermes_linear/tools_attach.py` (the `linear_attach` parse, body, schema and handler)
@@ -232,12 +232,12 @@ Expected: all pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git commit -m "feat: linear_attach (file, URL, embed) behind the scope gate (<T4 ID>)"
+git commit -m "feat: linear_attach (file, URL, embed) behind the scope gate (RET-134)"
 ```
 
 ---
 
-### Task 5: `linear_session_link`
+### Task 5: `linear_session_link` — RET-135
 
 **Files:**
 - Modify: `hermes_linear/tools_attach.py` (the handler and schema)
@@ -272,12 +272,12 @@ Expected: all pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git commit -m "feat: linear_session_link adds a URL to the agent session (<T5 ID>)"
+git commit -m "feat: linear_session_link adds a URL to the agent session (RET-135)"
 ```
 
 ---
 
-### Task 6: README, skill Finish step, final checks
+### Task 6: README, skill Finish step, final checks — RET-136
 
 **Files:**
 - Modify: `README.md` (rows in the Agent tools table for `linear_search`, `linear_attach` and `linear_session_link`; the updated `linear_issue_get` row; one "How it behaves" row on attaching; and a short "Attachments" note on the path policy and `gateway.strict` / `HERMES_MEDIA_DELIVERY_STRICT`)
@@ -295,5 +295,5 @@ Expected: all pass; ≤ 150 lines; the private-imports list matches `main`'s.
 - [ ] **Step 4: Commit**
 
 ```bash
-git commit -m "docs: README and skill for read & attach tools; Finish links the PR (<T6 ID>)"
+git commit -m "docs: README and skill for read & attach tools; Finish links the PR (RET-136)"
 ```
