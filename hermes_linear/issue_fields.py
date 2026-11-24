@@ -173,9 +173,10 @@ async def _user(ctx: Any, d: directory.Directory, ref: str) -> tuple[str, bool]:
 
 async def resolve(ctx: Any, parsed: dict, *, team_id: str, project_id: str | None) -> Resolved:
     """``parsed`` (from ``parse``) as Linear input. ``team_id`` / ``project_id`` are the
-    issue's base; an explicit ``team`` / ``project`` replaces them, and the cycle resolves
-    in the resulting team, the milestone in the resulting project (none:
-    ``MILESTONE_NOT_FOUND`` with no candidates). Misses refuse through the directory."""
+    issue's base; an explicit ``team`` / ``project`` replaces them (another team without a
+    ``project``: no project, Ruling R8), and the cycle resolves in the resulting team, the
+    milestone in the resulting project (none: ``MILESTONE_NOT_FOUND`` with no candidates).
+    Misses refuse through the directory."""
     d = directory.for_client(ctx.client)
     out = Resolved(input={}, team_id=team_id, project_id=project_id)
     inp = out.input
@@ -183,6 +184,8 @@ async def resolve(ctx: Any, parsed: dict, *, team_id: str, project_id: str | Non
     if parsed.get("team") is not None:
         out.team = await d.resolve("teams", "", parsed["team"], _by_team)
         out.team_id = inp["teamId"] = out.team["id"]
+        if out.team_id != team_id and "project" not in parsed:
+            out.project_id = None  # R8: the base project belongs to the base team
     if "project" in parsed:
         if parsed["project"] is None:
             out.project_id = inp["projectId"] = None

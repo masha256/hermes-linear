@@ -623,7 +623,8 @@ def test_linear_error_passthrough(pin_ctx, adapter, ws):
 
     ws.update_session = limited
     put_turn(adapter, "sk", SELF)
-    assert linear_session_link({"url": PR}) == {"ok": False, "error": "RATELIMITED"}
+    assert linear_session_link({"url": PR}) == {"ok": False, "error": "RATELIMITED",
+                                                "message": "slow down"}
 
 
 def test_session_link_registry_returns_str(pin_ctx, adapter, sessions):

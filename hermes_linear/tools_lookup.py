@@ -33,6 +33,9 @@ _ROW_KEYS: dict[str, tuple[str, ...]] = {
     "milestones": ("id", "name"),
 }
 
+#: A cycle row's flags, emitted (``True``) only on the row the directory marks.
+_CYCLE_FLAGS = ("current", "next")
+
 #: Row keys ``query`` is matched on (email although rows don't return it).
 _QUERY_KEYS = ("name", "key", "displayName", "email")
 
@@ -58,9 +61,10 @@ async def _session_ticket(ctx: agent_tools.ToolContext) -> dict:
 
 
 async def _scope(ctx: agent_tools.ToolContext, d: directory.Directory,
-                 a: dict) -> str | None:
-    """The team or project UUID ``a["kind"]`` is listed in ("" for workspace-wide kinds;
-    ``None`` for milestones of a session ticket without a project)."""
+                 a: dict) -> str:
+    """The team or project UUID ``a["kind"]`` is listed in ("" for workspace-wide kinds).
+    Milestones with no ``project`` of a session ticket without one: ``PROJECT_NOT_FOUND``
+    with the projects as candidates (Ruling R15)."""
     kind = a["kind"]
     if kind in _TEAM_KINDS:
         if a["team"] is not None:
@@ -69,7 +73,10 @@ async def _scope(ctx: agent_tools.ToolContext, d: directory.Directory,
     if kind == "milestones":
         if a["project"] is not None:
             return (await d.resolve("projects", "", a["project"], issue_fields._by_name))["id"]
-        return agent_tools._project_of(await _session_ticket(ctx))
+        project = agent_tools._project_of(await _session_ticket(ctx))
+        if project is None:
+            raise directory.miss("projects", await d.rows("projects"), "")
+        return project
     return ""
 
 
@@ -77,21 +84,28 @@ def _hit(row: dict, want: str) -> bool:
     return any(want in str(row.get(k) or "").casefold() for k in _QUERY_KEYS)
 
 
+def _row(kind: str, r: dict) -> dict:
+    """A row's ``_ROW_KEYS``, plus a cycle's ``current`` / ``next`` only where marked
+    (Ruling R13)."""
+    out = {k: r.get(k) for k in _ROW_KEYS[kind]}
+    if kind == "cycles":
+        out.update({k: True for k in _CYCLE_FLAGS if r.get(k) is True})
+    return out
+
+
 async def _lookup(ctx: agent_tools.ToolContext, a: dict) -> dict:
     kind = a["kind"]
     d = directory.for_client(ctx.client)
     try:
-        scope = await _scope(ctx, d, a)
-        rows = [] if scope is None else await d.rows(kind, scope)
+        rows = await d.rows(kind, await _scope(ctx, d, a))
     except LinearError as exc:
         return {"ok": False, "error": exc.code or "LINEAR_ERROR",
                 "message": exc.detail or str(exc)}
     if a["query"] is not None:
         want = a["query"].casefold()
         rows = [r for r in rows if _hit(r, want)]
-    keys = _ROW_KEYS[kind]
     out: dict = {"ok": True, "kind": kind,
-                 "rows": [{k: r.get(k) for k in keys} for r in rows[:LOOKUP_MAX_ROWS]]}
+                 "rows": [_row(kind, r) for r in rows[:LOOKUP_MAX_ROWS]]}
     if len(rows) > LOOKUP_MAX_ROWS:
         out["truncated"] = True
     return out
@@ -111,10 +125,12 @@ SCHEMAS: dict[str, dict] = {
             "List what the Linear write tools accept, as the Linear app: teams (id, name, "
             "key), states (id, name, type), labels (the team's and the workspace's), users "
             "(id, name, displayName, app, active), cycles (id, name, number, startsAt, "
-            "endsAt), projects (id, name, state) or milestones. states, labels and cycles "
+            "endsAt; current: true / next: true on those cycles), projects (id, name, "
+            "state) or milestones (id, name). states, labels and cycles "
             "are per team (default: the session ticket's), milestones per project (default: "
-            "the session ticket's); outside a Linear session these need team / project, "
-            "else NOT_LINEAR_SESSION. Unknown team or project: TEAM_NOT_FOUND / "
+            "the session ticket's; a session ticket with no project: PROJECT_NOT_FOUND with "
+            "candidates, so pass project); outside a Linear session these need team / "
+            "project, else NOT_LINEAR_SESSION. Unknown team or project: TEAM_NOT_FOUND / "
             "PROJECT_NOT_FOUND with candidates. At most 250 rows (truncated: true past "
             "that; narrow with query). Cached for up to 5 minutes."),
         "parameters": {"type": "object", "properties": {

@@ -168,7 +168,8 @@ def test_issue_get_not_connected(pin_ctx, ws):
 
 
 def test_issue_get_unknown_is_linear_code(pin_ctx):
-    assert linear_issue_get({"id": "NOPE-1"}) == {"ok": False, "error": "NOT_FOUND"}
+    assert linear_issue_get({"id": "NOPE-1"}) == {"ok": False, "error": "NOT_FOUND",
+                                                   "message": "Entity not found: Issue"}
 
 
 async def test_fake_not_found_matches_client(ws):
@@ -319,6 +320,19 @@ def test_remove_unknown_label_is_noop(pin_ctx, ws):
     assert ws.writes()[-1][1][1] == {"title": "T"}
 
 
+def test_remove_label_newer_than_the_cache(pin_ctx, ws):
+    """A label a human created and applied after the directory cached the team's labels
+    is still removed: removals match the issue's own labels, not the cache."""
+    assert linear_issue_update({"id": "RET-2", "add_labels": ["bug"]})["ok"] is True
+    ws.labels[TEAM].append({"id": "lb-fresh", "name": "Fresh"})  # cache now stale
+    ws.issues["uuid-child"]["labels"].append("lb-fresh")
+    n_label_fetches = sum(c[0] == "team_labels" for c in ws.calls)
+    out = linear_issue_update({"id": "RET-2", "remove_labels": ["FRESH"]})
+    assert out["ok"] is True and ws.issues["uuid-child"]["labels"] == ["lb-bug"]
+    assert ws.writes()[-1][1][1] == {"removedLabelIds": ["lb-fresh"]}
+    assert sum(c[0] == "team_labels" for c in ws.calls) == n_label_fetches  # no refetch
+
+
 def test_unknown_label_is_label_missing(pin_ctx, ws):
     out = linear_issue_update({"id": "RET-2", "add_labels": ["bug", "no-such-label"]})
     assert out == {"ok": False, "error": "LABEL_MISSING", "available": LABELS_AVAILABLE}
@@ -400,7 +414,7 @@ def test_reparent_out_of_scope_target(pin_ctx, ws, adapter):
 
 def test_reparent_unknown_target(pin_ctx, ws):
     assert linear_issue_update({"id": "RET-2", "parent": "NOPE-1"}) == {
-        "ok": False, "error": "NOT_FOUND"}
+        "ok": False, "error": "NOT_FOUND", "message": "Entity not found: Issue"}
     assert ws.writes() == []
 
 
@@ -602,6 +616,35 @@ def test_resolve_posts_then_resolves(pin_ctx, ws):
     assert ws.writes() == [("comment_create", ("uuid-child", "done", top)),
                            ("comment_resolve", (top, new))]
     assert ws.comments[top]["resolved_at"] is not None
+
+
+def test_resolve_failure_after_post_keeps_the_reply(pin_ctx, ws):
+    """R12: the reply is posted, then commentResolve fails: the result names the reply."""
+    top, _ = _thread(ws)
+
+    async def refuse(comment_id, resolving_comment_id):
+        ws.calls.append(("comment_resolve", (comment_id, resolving_comment_id)))
+        raise LinearError("forbidden", code="FORBIDDEN", detail="Not allowed to resolve")
+
+    ws.comment_resolve = refuse
+    out = linear_comment({"id": "RET-2", "body": "done", "reply_to": top, "resolve": True})
+    new = next(c for c in ws.comments if ws.comments[c]["body"] == "done")
+    assert out == {"ok": False, "error": "FORBIDDEN", "message": "Not allowed to resolve",
+                   "comment_id": new, "thread_id": top, "posted": True}
+    assert ws.comments[top]["resolved_at"] is None
+
+    async def refuse_bare(comment_id, resolving_comment_id):
+        raise LinearError("boom")
+
+    ws.comment_resolve = refuse_bare
+    out = linear_comment({"id": "RET-2", "body": "again", "reply_to": top, "resolve": True})
+    assert out["error"] == "LINEAR_ERROR" and out["message"] == "boom"
+    assert out["posted"] is True
+
+
+def test_comment_description_says_posted_means_do_not_rerun():
+    desc = TOOL_SCHEMAS["linear_comment"]["description"]
+    assert "posted: true" in desc and "re-run" in desc
 
 
 def test_resolve_already_resolved(pin_ctx, ws):

@@ -204,7 +204,8 @@ def test_unknown_type_bad_args(pin_ctx, ws, type_):
 
 def test_unknown_issue_is_linear_code(pin_ctx, ws):
     out = linear_relation({"id": "RET-2", "type": "blocks", "other": "NOPE-1"})
-    assert out == {"ok": False, "error": "NOT_FOUND"} and ws.writes() == []
+    assert out == {"ok": False, "error": "NOT_FOUND", "message": "Entity not found: Issue"}
+    assert ws.writes() == []
 
 
 def test_needs_linear_session(pin_ctx, ws):

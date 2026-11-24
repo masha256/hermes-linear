@@ -379,7 +379,8 @@ def test_refused_outside_linear_session(pin_ctx, ws, tmp_path):
 def test_unknown_header_ticket(pin_ctx, ws, tmp_path):
     f = tmp_path / "s.md"
     f.write_text("Linear: NOPE-1\n", encoding="utf-8")
-    assert linear_sync_spec({"path": str(f)}) == {"ok": False, "error": "NOT_FOUND"}
+    assert linear_sync_spec({"path": str(f)}) == {"ok": False, "error": "NOT_FOUND",
+                                                  "message": "Entity not found: Issue"}
 
 
 def test_file_io_happens_off_the_loop(pin_ctx, ws, tmp_path, monkeypatch, loop):

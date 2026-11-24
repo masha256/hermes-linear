@@ -441,7 +441,8 @@ def test_blocked_by_out_of_tree_refused_before_writes(pin_ctx, ws, adapter):
 
 def test_blocked_by_unknown_issue_before_writes(pin_ctx, ws):
     out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "NOPE-1"})
-    assert out == {"ok": False, "error": "NOT_FOUND"} and ws.writes() == []
+    assert out == {"ok": False, "error": "NOT_FOUND", "message": "Entity not found: Issue"}
+    assert ws.writes() == []
 
 
 def test_blocked_by_self_bad_args(pin_ctx, ws):

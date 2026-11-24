@@ -261,6 +261,29 @@ def test_create_other_team_needs_approval(pin_ctx, ws, adapter):
     out = linear_issue_create(dict(args))
     assert out["ok"] is True
     assert ws.issues[out["issue"]["id"]]["team"] == "team-2"
+    # R8: another team without a project creates the issue with no project
+    [inp] = _creates(ws)
+    assert "projectId" not in inp and ws.issues[out["issue"]["id"]]["project"] is None
+
+
+def test_create_other_team_milestone_needs_its_project(pin_ctx, ws, adapter):
+    """R8: a milestone resolves in the resulting project; another team without a project
+    has none, so the base project's milestone is refused, before any approval."""
+    ws.add_team("team-2", "OPS", "Operations")
+    ws.milestones_rows["proj-1"] = [{"id": "ms-1", "name": "Alpha"}]
+    out = linear_issue_create({"title": "x", "team": "OPS", "milestone": "alpha"})
+    assert out == {"ok": False, "error": "MILESTONE_NOT_FOUND", "candidates": []}
+    assert ws.writes() == [] and _requests(adapter) == 0
+    # with an explicit project the milestone resolves there
+    ws.add_project(ORION, "orion")
+    ws.milestones_rows[ORION] = [{"id": "ms-o", "name": "Alpha"}]
+    args = {"title": "x", "team": "OPS", "project": "orion", "milestone": "alpha"}
+    assert linear_issue_create(dict(args))["error"] == "APPROVAL_REQUIRED"
+    adapter._store.arm_request("sk", digest("linear_issue_create", args))
+    assert linear_issue_create(dict(args))["ok"] is True
+    [inp] = _creates(ws)
+    assert (inp["teamId"], inp["projectId"], inp["projectMilestoneId"]) == (
+        "team-2", ORION, "ms-o")
 
 
 def test_create_approved_writes_only_approved_target(pin_ctx, ws, adapter):

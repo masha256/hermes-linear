@@ -259,8 +259,9 @@ def run_on_adapter(ctx: ToolContext, coro_factory: Callable[[], Coroutine[Any, A
     except (TimeoutError, concurrent.futures.TimeoutError):
         fut.cancel()
         return _err("TIMEOUT")
-    except LinearError as exc:
-        return _err(exc.code or "LINEAR_ERROR")
+    except LinearError as exc:  # spec §2.5: the code plus Linear's message
+        return {"ok": False, "error": exc.code or "LINEAR_ERROR",
+                "message": exc.detail or str(exc)}
     except concurrent.futures.CancelledError:
         return _err("NOT_CONNECTED")  # task cancelled on the loop: the adapter disconnected
     except Exception as exc:  # noqa: BLE001
@@ -620,30 +621,28 @@ async def _cancel_state(ctx: ToolContext, team_id: str) -> str:
         raise _Refusal("BAD_ARGS") from None
 
 
-async def _label_ids(ctx: ToolContext, team_id: str, add: list[str],
-                     remove: list[str] = ()) -> tuple[list[str], list[str]]:
-    """Label ids for names to ``add`` and ``remove`` (case-insensitive).
-
-    An unknown name to add is ``LABEL_MISSING`` with ``available`` (probe P3: the app
-    cannot create labels), after one refetch of the cached labels; an unknown name to
-    remove is skipped, since no issue can carry it (Ruling S13).
+async def _label_ids(ctx: ToolContext, team_id: str, add: list[str]) -> list[str]:
+    """Label ids for names to ``add`` (case-insensitive). An unknown name is
+    ``LABEL_MISSING`` with ``available`` (probe P3: the app cannot create labels), after one
+    refetch of the cached labels.
     """
-    if not add and not remove:
-        return [], []
+    if not add:
+        return []
     names = directory.for_client(ctx.client)
-    if add:  # one resolve: a miss refetches once (unless just fetched), then LABEL_MISSING
-        labels = (await names.resolve("labels", team_id, add, _labels_all_named))["rows"]
-    else:
-        labels = await names.rows("labels", team_id)
-    out: list[list[str]] = []
-    for group in (add, remove):
-        ids: list[str] = []
-        for n in group:
-            row = _label_row(labels, n)
-            if row is not None and row["id"] not in ids:
-                ids.append(row["id"])
-        out.append(ids)
-    return out[0], out[1]
+    # one resolve: a miss refetches once (unless just fetched), then LABEL_MISSING
+    labels = (await names.resolve("labels", team_id, add, _labels_all_named))["rows"]
+    return _ids_named(labels, add)
+
+
+def _ids_named(labels: list[dict], names: list[str]) -> list[str]:
+    """The ids of the ``labels`` rows ``names`` name (case-insensitive, deduplicated, in
+    ``names`` order); a name no row has is skipped."""
+    ids: list[str] = []
+    for n in names:
+        row = _label_row(labels, n)
+        if row is not None and row["id"] not in ids:
+            ids.append(row["id"])
+    return ids
 
 
 def _team_of(issue: dict) -> str:
@@ -702,7 +701,7 @@ async def _create(ctx: ToolContext, a: dict) -> dict:
         inp["parentId"] = parent["id"]
     if a["state"] is not None:
         inp["stateId"] = await _state_id(ctx, team, a["state"])
-    labels, _ = await _label_ids(ctx, team, a["labels"])
+    labels = await _label_ids(ctx, team, a["labels"])
     if labels:
         inp["labelIds"] = labels
     inp.update({k: v for k, v in r.input.items() if k not in ("teamId", "projectId")})
@@ -765,9 +764,11 @@ async def _update(ctx: ToolContext, a: dict) -> dict:
                                                              r.project["id"]):
         _scope_target(ctx, r.project, "project")
     inp.update(r.input)
-    added, removed = await _label_ids(ctx, team, a["add_labels"], a["remove_labels"])
-    carried = _carried(issue)
-    removed = [lid for lid in removed if lid in carried]  # removing an absent label: no-op
+    added = await _label_ids(ctx, team, a["add_labels"])
+    # Removals match the issue's own labels, never the cache: a label created and applied
+    # after the directory was filled is still removed; a name it doesn't carry is a no-op
+    # (Ruling S13).
+    removed = _ids_named(issue.get("labels") or [], a["remove_labels"])
     if added:
         inp["addedLabelIds"] = added
     if removed:
@@ -878,7 +879,12 @@ async def _comment(ctx: ToolContext, a: dict) -> dict:
         if a["resolve"] and thread["resolved_at"]:
             out["already_resolved"] = True  # Linear would re-stamp it: no resolve call
         elif a["resolve"]:
-            await ctx.client.comment_resolve(thread["id"], out["comment_id"])
+            try:
+                await ctx.client.comment_resolve(thread["id"], out["comment_id"])
+            except LinearError as exc:  # R12: the reply is posted; say so, don't lose it
+                return {"ok": False, "error": exc.code or "LINEAR_ERROR",
+                        "message": exc.detail or str(exc), "comment_id": out["comment_id"],
+                        "thread_id": thread["id"], "posted": True}
             out["resolved"] = True
         return out
     if marker is None:
@@ -1362,7 +1368,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "team": {"type": "string", "description": "Team UUID, key (e.g. RET) or name."},
             "project": {"type": "string",
                         "description": ("Project UUID or name; omitted or null: the parent's "
-                                        "(else the session issue's).")},
+                                        "(else the session issue's); with another team: "
+                                        "no project.")},
             **_field_props(nullable=False),
         }, "required": ["title"]},
     },
@@ -1406,7 +1413,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "also resolves the thread (needs reply_to; not with edit_marker). "
                         "With reply_to, the result's thread_id is the thread and resolved "
                         "its current state; with resolve: true on a thread resolved "
-                        "before, also already_resolved: true. " + _GATED_NOTE),
+                        "before, also already_resolved: true. If resolving fails after the "
+                        "reply was posted, the error carries posted: true with comment_id "
+                        "and thread_id: the reply exists, so don't re-run the call. "
+                        + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "body": {"type": "string", "description": "Markdown."},

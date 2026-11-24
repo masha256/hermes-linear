@@ -109,10 +109,17 @@ def test_cycles_rows(pin_ctx, ws):
     out = lookup({"kind": "cycles"})
     assert out["rows"] == [
         {"id": "cy-1", "name": "Sprint 1", "number": 1, "startsAt": "2026-11-01T00:00:00.000Z",
-         "endsAt": "2026-11-15T00:00:00.000Z"},
+         "endsAt": "2026-11-15T00:00:00.000Z", "current": True},
         {"id": "cy-2", "name": "", "number": 2, "startsAt": "2026-11-15T00:00:00.000Z",
-         "endsAt": "2026-11-29T00:00:00.000Z"}]
+         "endsAt": "2026-11-29T00:00:00.000Z", "next": True}]
     assert _fetches(ws, "cycles") == [TEAM]
+    # R13: the flags only on the marked rows, never as None keys
+    ws.cycles_rows[OTHER_TEAM] = [{"id": "cy-9", "number": 9, "name": "Old",
+                                   "startsAt": "s", "endsAt": "e", "current": False}]
+    assert lookup({"kind": "cycles", "team": "OTH"})["rows"] == [
+        {"id": "cy-9", "name": "Old", "number": 9, "startsAt": "s", "endsAt": "e"}]
+    desc = TOOL_SCHEMAS["linear_lookup"]["description"]
+    assert "current" in desc and "next" in desc
 
 
 def test_projects_rows(pin_ctx):
@@ -150,10 +157,15 @@ def test_blank_team_is_the_default(pin_ctx, ws):
     assert _fetches(ws, "team_labels") == [TEAM]
 
 
-def test_session_ticket_without_project_has_no_milestones(pin_ctx, ws):
+def test_session_ticket_without_project_milestones_need_project(pin_ctx, ws):
+    """R15: no project arg and a session ticket without a project: PROJECT_NOT_FOUND
+    with the projects to pick from, not an empty ok."""
     ws.issues[SELF]["project"] = None
-    assert lookup({"kind": "milestones"}) == {"ok": True, "kind": "milestones", "rows": []}
+    out = lookup({"kind": "milestones"})
+    assert out == {"ok": False, "error": "PROJECT_NOT_FOUND", "candidates": [
+        {"id": PROJECT["id"], "name": "Hermes"}, {"id": OTHER_PROJECT, "name": "Other"}]}
     assert _fetches(ws, "milestones") == []
+    assert "no project" in TOOL_SCHEMAS["linear_lookup"]["description"]
 
 
 def test_unknown_team(pin_ctx):

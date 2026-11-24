@@ -383,7 +383,8 @@ def test_unknown_parent_is_not_found(pin_ctx, stub):
         raise LinearError("Entity not found", code="NOT_FOUND")
 
     stub.issue_get = missing
-    assert linear_search({"parent": "NOPE-1"}) == {"ok": False, "error": "NOT_FOUND"}
+    assert linear_search({"parent": "NOPE-1"}) == {"ok": False, "error": "NOT_FOUND",
+                                                    "message": "Entity not found"}
     assert stub.calls == [("issue_get", "NOPE-1")]  # no search after the failed lookup
 
 
@@ -394,7 +395,8 @@ def test_search_passes_linear_error_code(pin_ctx, stub, method, args):
         raise LinearError("rate limited", code="RATELIMITED")
 
     setattr(stub, method, limited)
-    assert linear_search(args) == {"ok": False, "error": "RATELIMITED"}
+    assert linear_search(args) == {"ok": False, "error": "RATELIMITED",
+                                   "message": "rate limited"}
 
 
 @pytest.mark.parametrize("args", [
