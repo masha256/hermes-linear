@@ -1332,7 +1332,9 @@ def _field_props(nullable: bool) -> dict[str, dict]:
             "An agent (app) user: UUID, name, display name or email; me is this app, "
             "which starts no session (starts_session: false).")},
         "priority": {"type": s, "description": _PRIORITY},
-        "estimate": {"type": i, "description": "Estimate points, an integer >= 0."},
+        "estimate": {"type": i, "description": ("Estimate points, an integer >= 0. Linear "
+                                                "stores it even when the team doesn't use "
+                                                "estimates.")},
         "due_date": {"type": s, "description": "YYYY-MM-DD."},
         "cycle": {"type": s, "description": ("Cycle UUID, number, name, current or next, in "
                                              "the issue's team.")},
@@ -1368,8 +1370,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "name": "linear_issue_update",
         "description": ("Update a Linear issue as the Linear app: title, description, state, "
                         "labels, parent, project, assignee, delegate, priority, estimate, "
-                        "due date, cycle, milestone (null clears a field). Another project "
-                        "than the session issue's or the parent's needs a human's approval. "
+                        "due date, cycle, milestone (null clears a field). A project other "
+                        "than the issue's own, the session issue's or the parent's needs a "
+                        "human's approval. "
                         + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
@@ -1388,8 +1391,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                        "detached issue you did not create leaves your scope.")},
             "project": {"type": ["string", "null"],
                         "description": ("Project UUID or name; null removes the project. "
-                                        "Moving to another project clears the milestone "
-                                        "unless milestone is given too.")},
+                                        "The issue's current project, the session issue's "
+                                        "and the parent's need no approval; another one "
+                                        "does. Moving to another project clears the "
+                                        "milestone unless milestone is given too.")},
             **_field_props(nullable=True),
         }, "required": ["id"]},
     },
@@ -1399,7 +1404,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "the app's earlier comment carrying that marker instead of adding a "
                         "new one. With reply_to, reply in that comment's thread; resolve: true "
                         "also resolves the thread (needs reply_to; not with edit_marker). "
-                        + _GATED_NOTE),
+                        "With reply_to, the result's thread_id is the thread and resolved "
+                        "its current state (already_resolved: true if it was resolved "
+                        "before). " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "body": {"type": "string", "description": "Markdown."},

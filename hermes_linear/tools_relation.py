@@ -1,5 +1,7 @@
-"""``linear_relation`` (RET-121 spec §1.4; RET-141) and ``ensure_relation``, which
-``linear_task_state``'s ``blocked_by`` reuses (§1.6).
+"""``linear_relation`` (RET-121 spec §1.4; RET-141) and its relation helpers:
+``check_relation`` (a read) and ``create_relation`` (after the gate), which
+``linear_task_state``'s ``blocked_by`` calls separately around its label write (§1.6),
+and ``ensure_relation`` (the two in a row), which ``linear_relation`` uses.
 
 Built on ``agent_tools``' ``_tool`` machinery. Like ``tools_read``, this module registers
 itself at its end (Ruling R3).
