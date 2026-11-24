@@ -48,7 +48,11 @@ Usage::
   more); ``issue_create`` / ``issue_update`` store a known ``projectId`` as the issue's
   ``project`` and the other new input keys as given under ``issues[id]["fields"]``.
 
-Later tasks extend it (relations, documents, …); keep each addition small and listed here.
+- relations (RET-141): ``issue_relations`` / ``relation_create`` over ``relations``, as
+  Linear answered the live probe: one relation per issue pair; an identical create (or
+  ``related`` either way) returns the existing id, any other type or direction replaces it.
+
+Later tasks extend it (documents, …); keep each addition small and listed here.
 """
 
 from __future__ import annotations
@@ -137,6 +141,7 @@ class FakeWorkspace:
         self.milestones_rows: dict[str, list[dict]] = {}
         self.uploads: dict[str, dict] = {}  # asset URL -> {name, content_type, data}
         self.attachments: dict[str, dict] = {}  # id -> {id, issue, url, title, subtitle}
+        self.relations: dict[str, dict] = {}  # id -> {id, type, issue, related}
         self.calls: list[tuple[str, Any]] = []
         self._ids = itertools.count(1)
         self._numbers = itertools.count(100)
@@ -198,7 +203,8 @@ class FakeWorkspace:
     def writes(self) -> list[tuple[str, Any]]:
         return [c for c in self.calls if c[0] in {
             "issue_create", "issue_update", "comment_create", "comment_update", "file_upload",
-            "attachment_create", "attachment_link_url", "attachment_link_github_pr"}]
+            "attachment_create", "attachment_link_url", "attachment_link_github_pr",
+            "relation_create"}]
 
     def default_state(self, team: str) -> str:
         """The team's first ``backlog``/``unstarted`` state (see the module docstring)."""
@@ -381,3 +387,29 @@ class FakeWorkspace:
     async def attachment_link_github_pr(self, issue_id: str, url: str) -> dict:
         self.calls.append(("attachment_link_github_pr", (issue_id, url)))
         return self._attach(issue_id, url, None)
+
+    # -- relations (RET-141) --------------------------------------------
+    def add_relation(self, issue_id: str, related_id: str, type_: str) -> str:
+        """Seed (or, like Linear, replace) the one relation between two issues."""
+        a, b = self.issue(issue_id)["id"], self.issue(related_id)["id"]
+        for rid, r in list(self.relations.items()):
+            if {r["issue"], r["related"]} == {a, b}:
+                if (r["issue"], r["related"], r["type"]) == (a, b, type_) or (
+                        type_ == "related" and r["type"] == "related"):
+                    return rid  # live probe: an identical create returns the same relation
+                del self.relations[rid]  # live probe: another type/direction replaces it
+        rid = f"rel-{next(self._ids)}"
+        self.relations[rid] = {"id": rid, "type": type_, "issue": a, "related": b}
+        return rid
+
+    async def issue_relations(self, issue_id: str) -> list[dict]:
+        self.calls.append(("issue_relations", issue_id))
+        iid = self.issue(issue_id)["id"]
+        return [{"id": r["id"], "type": r["type"], "issue_id": r["issue"],
+                 "related_id": r["related"]}
+                for r in self.relations.values() if iid in (r["issue"], r["related"])]
+
+    async def relation_create(self, issue_id: str, related_id: str, type_: str) -> str:
+        self.calls.append(("relation_create", (issue_id, related_id, type_)))
+        assert type_ in {"blocks", "related", "duplicate", "similar"}, type_
+        return self.add_relation(issue_id, related_id, type_)

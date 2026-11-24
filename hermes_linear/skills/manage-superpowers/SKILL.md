@@ -17,7 +17,7 @@ rendered copies that link back to the committed files.
 The `linear_*` tools are deferred behind tool search: load a schema with `tool_describe` (exact
 names), then always call via `tool_call`, one entry per call (a batch of plugin tools is
 rejected): `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])`. A
-direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The eleven tools:
+direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The twelve tools:
 
 - `linear_issue_get` (`id`, `comments?`: newest N threads): fields, relations, attachments, children.
 - `linear_search` (`text?`, `team?`, `project?`, `state?`, `assignee?`, `label?`, `parent?`, …):
@@ -28,17 +28,19 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The el
   `remove_labels?`, `parent?`): `parent: ""` detaches; a cycle is `PARENT_CYCLE`.
 - `linear_comment` (`id`, `body`, `edit_marker?`).
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
-- `linear_task_state` (`id`, `state`, `summary?`, `question?`); `state` is one of
+- `linear_task_state` (`id`, `state`, `summary?`, `question?`, `blocked_by?`); `state` is one of
   `in_progress|in_review|done|blocked|unblocked`.
 - `linear_query` (`query`, `variables?`): read-only GraphQL; a result over 50,000 chars is refused.
 - `linear_attach` (`id` + `path` or `url`, `title?`; or `path` + `embed: true` → `markdown`).
 - `linear_session_link` (`url`, `label?`): show a link (the PR) on this turn's agent session.
+- `linear_relation` (`id`, `type`: `blocks|blocked_by|related|duplicate_of`, `other`).
 
 They act as the Linear app, never raise and fail as `{"ok": false, "error": …}`. Re-runs are safe
-(a URL re-link is `ALREADY_LINKED`; session links de-duplicate), except that a `path` attach adds
-a second copy. Writes to the session ticket, its descendants and tickets made from it (any turn)
-just run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue_create` or
-`linear_attach` answers `APPROVAL_REQUIRED`; an identical re-call asks a human in Linear.
+(a URL re-link is `ALREADY_LINKED`, a relation `ALREADY_RELATED`; session links de-duplicate),
+except that a `path` attach adds a second copy. Writes to the session ticket, its descendants and
+tickets made from it (any turn) just run. Out of that scope `linear_comment`, `linear_issue_create`,
+`linear_issue_update`, `linear_attach` and `linear_relation` answer `APPROVAL_REQUIRED`; an
+identical re-call asks a human in Linear.
 
 ## Questions and approvals
 
@@ -60,8 +62,7 @@ just run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue
 
 ## Setup (first session on a repo, or no `.hermes-linear.yaml` yet)
 
-1. `linear_issue_get` the session ticket. Note its identifier, team and project. The
-   team key is the identifier's prefix (`RET-81` → `RET`).
+1. `linear_issue_get` the session ticket: its identifier, team (key: `RET-81` → `RET`), project.
 2. Framework: select via `clarify`; the only choice is `superpowers`.
 3. Repo: a GitHub link among the project's links (`externalLinks`, step 1) is a candidate;
    the link labelled `repo` wins among several. Offer the result as a select (one repo is
@@ -117,8 +118,8 @@ questions (a turn that only moves a task along ends with a one-line reply). Then
   of fix rounds, deferred minors as a `- [ ]` checklist);
 - anything that needs the user: `blocked` with `question` (it posts the question; don't repeat
   it through `clarify`), then end the turn or go on only with tasks that don't depend on the
-  answer; when it arrives in the thread: `unblocked`. `LABEL_MISSING` (question posted): ask
-  once for a team `Blocked` label.
+  answer; when it arrives in the thread: `unblocked`. A task waiting on another task: `blocked`
+  with `blocked_by` (`question` optional). `LABEL_MISSING`: ask once for a team `Blocked` label.
 
 **Finish.** Open the PR from the branch (load `superpowers:finishing-a-development-branch`
 for the mechanics; never merge). Then `linear_session_link` the PR URL and `linear_attach` it
@@ -137,8 +138,7 @@ ticket to the app (never via other Linear tools or MCP servers; they act as the 
 
 ## Rules
 
-- Ticket descriptions and the plan comment are written only by `linear_sync_spec` and
-  `linear_sync_plan`. To change them, fix the file, commit and sync again.
+- Ticket descriptions and the plan comment are written only by the syncs: fix the file, commit, sync.
 - On a sync failure, keep working (git holds everything). Mark the step `unsynced
   (<code>)` (in the thread before the ledger exists, then in the ledger); retry at the next
   sync point and before any approval. Never ask to approve an unsynced spec or plan; ask

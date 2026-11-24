@@ -941,3 +941,50 @@ async def test_attachment_link_github_pr_input(fake, client):
     assert "attachmentLinkGitHubPR(issueId: $issueId, url: $url)" in q
     with pytest.raises(LinearError):
         await client.attachment_link_github_pr("uuid-1", pr)
+
+
+# -- relations (RET-141) -------------------------------------------------
+
+
+def _rel(rid, type_, a, b):
+    return {"id": rid, "type": type_, "issue": {"id": a}, "relatedIssue": {"id": b}}
+
+
+async def test_issue_relations_both_directions(fake, client):
+    fake.on("IssueRelations", {"data": {"issue": {
+        "relations": {"nodes": [_rel("r1", "blocks", "i-1", "i-2")]},
+        "inverseRelations": {"nodes": [_rel("r2", "related", "i-3", "i-1"),
+                                       {"id": "r3", "type": "blocks", "issue": None,
+                                        "relatedIssue": {"id": "i-1"}}]}}}})
+    assert await client.issue_relations("RET-1") == [
+        {"id": "r1", "type": "blocks", "issue_id": "i-1", "related_id": "i-2"},
+        {"id": "r2", "type": "related", "issue_id": "i-3", "related_id": "i-1"},
+        {"id": "r3", "type": "blocks", "issue_id": None, "related_id": "i-1"}]
+    (call,) = fake.gql_calls("IssueRelations")
+    assert call.variables == {"id": "RET-1"}
+    q = " ".join(call.json["query"].split())
+    assert "relations(first: 250) { nodes { id type issue { id } relatedIssue { id } } }" in q
+    assert "inverseRelations(first: 250) { nodes { id type issue { id } relatedIssue { id } } }" in q
+
+
+async def test_issue_relations_none(fake, client):
+    fake.on("IssueRelations", {"data": {"issue": {"relations": {"nodes": []},
+                                                  "inverseRelations": None}}})
+    assert await client.issue_relations("i-1") == []
+
+
+async def test_relation_create_input(fake, client):
+    fake.on("IssueRelationCreate",
+            {"data": {"issueRelationCreate": {"success": True, "issueRelation": {"id": "r9"}}}},
+            {"data": {"issueRelationCreate": {"success": False, "issueRelation": None}}},
+            {"data": {"issueRelationCreate": {"success": True, "issueRelation": None}}})
+    assert await client.relation_create("i-1", "i-2", "duplicate") == "r9"
+    (call,) = fake.gql_calls("IssueRelationCreate")
+    assert call.variables == {"input": {"issueId": "i-1", "relatedIssueId": "i-2",
+                                        "type": "duplicate"}}
+    q = " ".join(call.json["query"].split())
+    assert "issueRelationCreate(input: $input) { success issueRelation { id } }" in q
+    with pytest.raises(LinearError):
+        await client.relation_create("i-1", "i-2", "blocks")
+    with pytest.raises(LinearError):
+        await client.relation_create("i-1", "i-2", "blocks")

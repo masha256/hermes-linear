@@ -1102,8 +1102,13 @@ def _parse_task_state(args: dict) -> dict:
     if not isinstance(state, str) or state.strip() not in TASK_STATES:
         raise _Refusal("BAD_ARGS")
     a = {"id": _req_str(args, "id"), "state": state.strip(),
-         "summary": _opt_str(args, "summary"), "question": _opt_str(args, "question")}
-    if a["state"] == "blocked":
+         "summary": _opt_str(args, "summary"), "question": _opt_str(args, "question"),
+         "blocked_by": None}
+    if args.get("blocked_by") is not None:  # RET-121 §1.6: only with blocked
+        if a["state"] != "blocked":
+            raise _Refusal("BAD_ARGS")
+        a["blocked_by"] = _req_str(args, "blocked_by").strip()
+    if a["state"] == "blocked" and (a["blocked_by"] is None or a["question"] is not None):
         a["question"] = _req_str(args, "question").strip()  # before any write (or read)
     return a
 
@@ -1191,18 +1196,28 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
         return out  # nothing to remove: zero writes
 
     # blocked: the question goes to the project ticket (the session issue), scope-checked
-    # like every write target, before anything is written.
+    # like every write target, before anything is written. So is the blocker (RET-121
+    # §1.6), without a gate: this tool stays tree-only, an out-of-tree blocker is
+    # OUT_OF_SCOPE (``linear_relation`` asks for it).
     project = await _writable(ctx, ctx.session_issue_id or "")
+    blocker = await _writable(ctx, a["blocked_by"]) if a["blocked_by"] else None
+    if blocker is not None and blocker["id"] == task["id"]:
+        raise _Refusal("BAD_ARGS")
     if label is not None and not carried:
         await client.issue_update(task["id"], {"addedLabelIds": [label]})
-    await client.comment_create(
-        project["id"], f"**{task.get('identifier')} needs input:** {a['question']}")
-    _track_open_task(ctx, task["id"], False)  # posted: blocked, even with LABEL_MISSING
-    if label is None:  # Ruling S18: the question is posted, the label could not be
+    rel: dict[str, Any] = {}
+    if blocker is not None:  # an existing relation is kept: a re-run writes nothing
+        from .tools_relation import ensure_relation  # bottom-imported module (R3)
+        rid, created = await ensure_relation(ctx, blocker, task, "blocks")
+        rel = {"relation_id": rid, "relation_created": created}
+    if a["question"]:
+        await client.comment_create(
+            project["id"], f"**{task.get('identifier')} needs input:** {a['question']}")
+    _track_open_task(ctx, task["id"], False)  # blocked, even with LABEL_MISSING
+    if label is None:  # Ruling S18: the rest is done, the label could not be
         return {"ok": False, "error": "LABEL_MISSING", "issue": task.get("identifier"),
-                "label_missing": True, "question_posted": True}
-    out["question_posted"] = True
-    return out
+                "label_missing": True, "question_posted": bool(a["question"]), **rel}
+    return {**out, "question_posted": bool(a["question"]), **rel}
 
 
 # -- linear_query (RET-119 spec §3)
@@ -1387,8 +1402,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "stay in or move to a started state); done: move to a completed "
                         "state, posting summary (if given) on the task ticket; blocked: add "
                         "the Blocked label and post question on the session (project) "
-                        "ticket as '**<ID> needs input:** <question>' (LABEL_MISSING if the "
-                        "team has no Blocked label, the question is still posted); "
+                        "ticket as '**<ID> needs input:** <question>'; with blocked_by, also "
+                        "record '<blocked_by> blocks <id>' (question then optional; both in "
+                        "the session tree, else OUT_OF_SCOPE) (LABEL_MISSING if the team "
+                        "has no Blocked label, the rest is still done); "
                         "unblocked: remove the Blocked label. Already-applied changes are "
                         "not rewritten."),
         "parameters": {"type": "object", "properties": {
@@ -1397,7 +1414,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "summary": {"type": "string",
                         "description": "Markdown; with done, posted on the task ticket."},
             "question": {"type": "string",
-                         "description": "Required with blocked: what you need answered."},
+                         "description": ("With blocked: what you need answered (required "
+                                         "without blocked_by).")},
+            "blocked_by": {"type": "string",
+                           "description": ("Only with blocked: the issue blocking this one "
+                                           "(identifier or UUID, in the session tree).")},
         }, "required": ["id", "state"]},
     },
     "linear_query": {
@@ -1412,6 +1433,12 @@ TOOL_SCHEMAS: dict[str, dict] = {
                           "description": "Values for the query's variables."},
         }, "required": ["query"]},
     },
+    # Placeholders: the tool modules fill these slots (Ruling R3), so the roster order is
+    # fixed whichever module is imported first.
+    "linear_search": {},
+    "linear_attach": {},
+    "linear_session_link": {},
+    "linear_relation": {},
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
@@ -1423,12 +1450,17 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_sync_plan": linear_sync_plan,
     "linear_task_state": linear_task_state,
     "linear_query": linear_query,
+    "linear_search": None,  # type: ignore[dict-item]  # registered by tools_read (R3)
+    "linear_attach": None,  # type: ignore[dict-item]  # registered by tools_attach (R3)
+    "linear_session_link": None,  # type: ignore[dict-item]  # registered by tools_attach
+    "linear_relation": None,  # type: ignore[dict-item]  # registered by tools_relation
 }
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_attach", "linear_comment", "linear_issue_create", "linear_issue_get",
-           "linear_issue_update", "linear_query", "linear_search", "linear_session_link",
+           "linear_issue_update", "linear_query", "linear_relation", "linear_search",
+           "linear_session_link",
            "linear_sync_plan", "linear_sync_spec", "linear_task_state", "resolve_context",
            "resolve_state", "run_on_adapter"]
 
@@ -1438,3 +1470,4 @@ __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
 # here: a tool module imported first is still partially initialized at this point.
 from . import tools_read  # noqa: E402,F401
 from . import tools_attach  # noqa: E402,F401
+from . import tools_relation  # noqa: E402,F401

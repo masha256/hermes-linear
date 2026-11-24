@@ -24,7 +24,8 @@ CMD = "<linear_comment> (plugin approval rule)"
 
 def test_constants_verbatim():
     assert GATED_TOOLS == frozenset(
-        {"linear_comment", "linear_issue_update", "linear_issue_create", "linear_attach"}
+        {"linear_comment", "linear_issue_update", "linear_issue_create", "linear_attach",
+         "linear_relation"}
     )
     assert REQUIRED_TEXT == (
         "Not run: {targets} is outside this session's write scope. Call {tool} "

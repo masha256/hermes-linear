@@ -233,6 +233,21 @@ QUERY_PROJECT_MILESTONES = """query ProjectMilestones($projectId: String!, $afte
   }
 }"""
 
+# Both directions of an issue's relations (RET-121 spec §2.1), first 250 each.
+QUERY_ISSUE_RELATIONS = """query IssueRelations($id: String!) {
+  issue(id: $id) {
+    relations(first: 250) { nodes { id type issue { id } relatedIssue { id } } }
+    inverseRelations(first: 250) { nodes { id type issue { id } relatedIssue { id } } }
+  }
+}"""
+
+# Live probe (RET-141, 2026-11-24): Linear keeps one relation per issue pair. An identical
+# create answers the existing relation (same id); another type or direction replaces it.
+# ``duplicate``: ``issueId`` is the duplicate (it moves to the Duplicate state).
+MUTATION_RELATION_CREATE = """mutation IssueRelationCreate($input: IssueRelationCreateInput!) {
+  issueRelationCreate(input: $input) { success issueRelation { id } }
+}"""
+
 MUTATION_FILE_UPLOAD = """mutation FileUpload($size: Int!, $filename: String!, $contentType: String!) {
   fileUpload(size: $size, filename: $filename, contentType: $contentType) {
     success uploadFile { uploadUrl assetUrl headers { key value } }
@@ -752,6 +767,26 @@ class LinearClient:
         return [{"id": m["id"], "name": m.get("name") or ""} for m in nodes]
 
     # -- uploads and attachments (RET-120) ---------------------------------
+
+    async def issue_relations(self, issue_id: str) -> list[dict]:
+        """``[{id, type, issue_id, related_id}]``: the issue's outbound ``relations`` then
+        its inbound ``inverseRelations`` (first 250 each)."""
+        data = await self.gql(QUERY_ISSUE_RELATIONS, {"id": issue_id})
+        issue = data.get("issue") or {}
+        return [{"id": r.get("id"), "type": r.get("type"),
+                 "issue_id": (r.get("issue") or {}).get("id"),
+                 "related_id": (r.get("relatedIssue") or {}).get("id")}
+                for key in ("relations", "inverseRelations")
+                for r in self._nodes(issue.get(key))]
+
+    async def relation_create(self, issue_id: str, related_id: str, type: str) -> str:  # noqa: A002
+        """``issueRelationCreate`` (``issue_id`` <type> ``related_id``); the relation id."""
+        data = await self.gql(MUTATION_RELATION_CREATE, {"input": {
+            "issueId": issue_id, "relatedIssueId": related_id, "type": type}})
+        rel = self._require_success(data, "issueRelationCreate").get("issueRelation")
+        if not isinstance(rel, dict) or not rel.get("id"):
+            raise LinearError("issueRelationCreate returned no relation")
+        return rel["id"]
 
     async def file_upload(self, name: str, content_type: str, data: bytes) -> str:
         """Upload ``data`` and return its ``assetUrl``: ``fileUpload``, then a PUT of the

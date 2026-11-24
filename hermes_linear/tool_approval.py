@@ -14,7 +14,7 @@ import re
 from typing import Any
 
 GATED_TOOLS = frozenset({"linear_comment", "linear_issue_update", "linear_issue_create",
-                         "linear_attach"})
+                         "linear_attach", "linear_relation"})
 
 REQUIRED_TEXT = (
     "Not run: {targets} is outside this session's write scope. Call {tool} "
@@ -49,6 +49,7 @@ FIELD_TYPES: dict[str, dict[str, str]] = {
                             "delegate": "string|null", "priority": "string|null",
                             "estimate": "integer|null", "due_date": "string|null",
                             "cycle": "string|null", "milestone": "string|null"},
+    "linear_relation": {"id": "string", "type": "string", "other": "string"},
 }
 
 

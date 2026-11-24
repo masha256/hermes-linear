@@ -402,3 +402,28 @@ async def test_out_of_scope_attach_end_to_end(e2e, tmp_path, monkeypatch):
     [att] = ws.attachments.values()
     assert att["issue"] == OTHER and att["url"] == out["asset_url"] and att["title"] == "shot.png"
     assert store.request(SK, d) is None
+
+
+async def test_e2e_relation_out_of_scope(e2e):
+    """RET-141: ``linear_relation`` with an out-of-scope ``other`` asks once; after "Allow
+    once" the identical re-call creates the relation exactly once."""
+    h, a, client, gw, store, ws, config = e2e
+    tool, args = "linear_relation", {"id": "RET-1", "type": "blocks", "other": "OTH-9"}
+    first = await h.run(tool, args, cid="c-first")
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert ws.writes() == []
+    d = tool_approval.digest(tool, args)
+    assert store.request(SK, d).targets == [OTHER]
+    task = asyncio.create_task(h.run(tool, args, cid="c-again"))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert data["command"] == f"<{tool}> (plugin approval rule)"
+    assert '\n- OTH-9 "Unrelated"\n' in data["description"]
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out == {"ok": True, "relation_id": out["relation_id"], "issue": "RET-1",
+                   "other": "OTH-9", "type": "blocks"}, out
+    assert ws.writes() == [("relation_create", (SELF, OTHER, "blocks"))]
+    assert len(h.notified) == 1 and store.request(SK, d) is None
