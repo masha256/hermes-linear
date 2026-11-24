@@ -436,6 +436,8 @@ async def test_e2e_relation_out_of_scope(e2e):
 SLACK_SK = "agent:main:slack:dm:C0E2E:1700000000.0001"
 SLACK_CHAT = "C0E2E"
 OUT_ARGS = {"id": "RET-1", "body": "hello from Slack"}  # the Linear session's own ticket
+#: The origin footer (RET-148 §4): set_session_vars binds profile "" -> "default".
+SLACK_FOOTER = "\n\n---\n_Filed by default via slack_"
 
 
 class SlackHermes(Hermes):
@@ -513,7 +515,8 @@ async def test_e2e_outside_comment_approve_writes(e2e_outside):
     assert _comments(ws, SELF) == []
     out = await h.run(args=OUT_ARGS, cid="c-again")
     assert out["ok"] is True and out["issue"] == "RET-1", out
-    assert _comments(ws, SELF) == [OUT_ARGS["body"]]  # exactly one
+    # exactly one, with the origin footer from the tool thread's session (Task 2)
+    assert _comments(ws, SELF) == [OUT_ARGS["body"] + SLACK_FOOTER]
     assert len(h.notified) == 1 and h.sent == [1]
     data = h.notified[0]
     assert data["command"] == RULE and data["description"].endswith(f"digest: {d}")
@@ -536,3 +539,40 @@ async def test_e2e_outside_comment_deny_never_writes(e2e_outside):
     raw = json.loads(await asyncio.to_thread(plugin.tool_handler(TOOL), dict(OUT_ARGS),
                                              session_id="sess-1"))
     assert raw["error"] == "APPROVAL_REQUIRED" and ws.writes() == []
+
+
+async def test_e2e_outside_create_approve_writes_once(e2e_outside):
+    """RET-148 Task 2: an outside create (no parent; the destination is the only target)
+    through the real hook and gate. The hook sees the model's raw ``labels: "bug"``, the
+    handler the ``coerce_tool_args`` output ``["bug"]``; both digest the same, so the
+    approved re-call writes exactly once, with the footer bound in the tool thread."""
+    import dataclasses
+
+    from fake_workspace import TEAM
+
+    make, client, store, ws = e2e_outside
+    a = agent_tools.resolve_context().adapter  # the pinned outside context's adapter
+    a._settings = dataclasses.replace(a._settings, default_team="RET")
+    h = make("once")
+    tool = "linear_issue_create"
+    raw, coerced = {"title": "From Slack", "labels": "bug"}, \
+        {"title": "From Slack", "labels": ["bug"]}
+    first = await h.run(tool, raw, cid="c-first", coerced=coerced)
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert "outside a Linear session" in first["message"] and "RET" in first["message"]
+    d = tool_approval.digest(tool, raw)
+    assert d == tool_approval.digest(tool, coerced)
+    assert store.request(SLACK_SK, d).targets == [f"team:{TEAM}"]
+    assert ws.writes() == []
+    out = await h.run(tool, raw, cid="c-again", coerced=coerced)
+    assert out["ok"] is True, out
+    (create,) = [w for w in ws.writes() if w[0] == "issue_create"]
+    assert ws.writes() == [create]
+    stored = ws.issues[out["issue"]["id"]]
+    assert stored["team"] == TEAM and stored["labels"] == ["lb-bug"]
+    assert stored["description"] == SLACK_FOOTER.lstrip("\n")
+    assert len(h.notified) == 1
+    desc = h.notified[0]["description"]
+    assert desc.splitlines()[0] == f"Approve `{tool}` from outside a Linear session?"
+    assert '- RET "new issue in RET"' in desc and desc.endswith(f"digest: {d}")
+    assert store.request(SLACK_SK, d) is None

@@ -723,6 +723,42 @@ async def test_client_teams_pages_workspace_connection(fake, client):
     assert "viewer" not in calls[0].json["query"]
 
 
+async def test_projects_named_query_and_shape(fake, client):
+    """RET-148: projects by name (Linear's ``eqIgnoreCase``), each with its team ids."""
+    fake.on("ProjectsByName", {"data": {"projects": {"nodes": [
+        {"id": "p1", "name": "hermes linear test project",
+         "teams": {"nodes": [{"id": "T1"}]}}]}}})
+    assert await client.projects_named("hermes linear test project") == [
+        {"id": "p1", "name": "hermes linear test project", "team_ids": ["T1"]}]
+    (call,) = fake.gql_calls("ProjectsByName")
+    assert call.variables == {"name": "hermes linear test project"}
+    q = " ".join(call.json["query"].split())
+    assert "projects(filter: { name: { eqIgnoreCase: $name } }, first: 10)" in q
+    assert "teams { nodes { id } }" in q
+
+
+async def test_project_by_id_and_missing_returns_none(fake, client):
+    fake.on("Project",
+            {"data": {"project": {"id": "p1", "name": "P", "teams": {"nodes": [
+                {"id": "T1"}, {"id": "T2"}]}}}},
+            {"data": None, "errors": [{
+                "message": "Entity not found: Project", "path": ["project"],
+                "extensions": {"code": "INPUT_ERROR", "userError": True}}]},
+            {"data": {"project": None}})
+    assert await client.project("p1") == {"id": "p1", "name": "P", "team_ids": ["T1", "T2"]}
+    assert fake.gql_calls("Project")[0].variables == {"id": "p1"}
+    assert await client.project("00000000-0000-0000-0000-000000000000") is None
+    assert await client.project("p-null") is None
+
+
+async def test_project_other_errors_raise(fake, client):
+    fake.on("Project", {"data": None, "errors": [{
+        "message": "Argument Validation Error", "extensions": {"code": "INPUT_ERROR"}}]})
+    with pytest.raises(LinearError) as ei:
+        await client.project("x")
+    assert ei.value.code == "INPUT_ERROR"
+
+
 async def test_client_paging_stops_at_cap(fake, client):
     from hermes_linear.linear_client import QUERY_TEAM_LABELS
     n = iter(range(100))

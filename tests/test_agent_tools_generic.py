@@ -14,7 +14,8 @@ import threading
 import pytest
 
 from test_agent_tools_runtime import new_adapter
-from fake_workspace import HUMAN, PROJECT, TEAM, VIEWER, FakeWorkspace
+from fake_workspace import (HUMAN, OTHER_PROJECT, OTHER_TEAM, PROJECT, TEAM, TEAMS, VIEWER,
+                            FakeWorkspace)
 
 from hermes_linear.linear_client import LinearError
 
@@ -230,10 +231,167 @@ def test_create_parent_out_of_scope_refused(pin_ctx, ws, adapter):
     assert ws.writes() == [] and adapter._store.created_by(SELF) == set()
 
 
-def test_create_refused_outside_linear_session(pin_ctx, ws):
+# ------------------------------------- linear_issue_create outside a session (RET-148)
+
+FOOTER = "\n\n---\n_Filed by default via slack_"  # profile "" -> default
+
+
+@pytest.fixture
+def origin(monkeypatch):
+    """The calling session's env as ``get_session_env`` sees it (a Slack DM, default bot)."""
+    names = {"HERMES_SESSION_PLATFORM": "slack", "HERMES_SESSION_PROFILE": ""}
+    monkeypatch.setattr(agent_tools, "get_session_env", lambda n, d="": names.get(n, d))
+    return names
+
+
+def outside(adapter, mode="allow", **settings) -> None:
+    adapter._settings = dataclasses.replace(adapter._settings, outside_session_writes=mode,
+                                            **settings)
+    seed_other_team(adapter.client)
+
+
+def seed_other_team(ws) -> None:
+    """``OTH`` (``OTHER_TEAM``, its ``oth-`` states/labels) and its project ``Elsewhere`` in
+    the directory lists (once)."""
+    if not any(t["id"] == OTHER_TEAM for t in ws.teams_rows):
+        ws.teams_rows.append(dict(TEAMS[1]))
+        ws.projects_rows.append({"id": OTHER_PROJECT["id"], "name": OTHER_PROJECT["name"],
+                                 "state": "started"})
+
+
+def _requests(adapter) -> int:
+    return adapter._store.conn.execute("SELECT COUNT(*) FROM approval_requests").fetchone()[0]
+
+
+def _created_rows(adapter) -> int:
+    return adapter._store.conn.execute("SELECT COUNT(*) FROM created_issues").fetchone()[0]
+
+
+def test_outside_create_without_team_bad_args(pin_ctx, ws, adapter):
     pin_ctx(linear=False)
-    assert linear_issue_create({"title": "x"}) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    for mode in ("approve", "allow"):
+        outside(adapter, mode)  # default_team ""
+        assert linear_issue_create({"title": "x"}) == {"ok": False, "error": "BAD_ARGS"}
+        assert linear_issue_create({"title": "x", "team": "  "}) == {
+            "ok": False, "error": "BAD_ARGS"}
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_outside_create_allow_uses_defaults_and_footer(pin_ctx, ws, adapter, origin):
+    pin_ctx(linear=False)
+    outside(adapter, default_team="RET", default_project=PROJECT["name"])
+    out = linear_issue_create({"title": "From Slack", "description": "body"})
+    assert out["ok"] is True, out
+    stored = ws.issues[out["issue"]["id"]]
+    assert stored["team"] == TEAM and stored["project"] == PROJECT
+    assert stored["description"] == "body" + FOOTER
+    bare = linear_issue_create({"title": "No body"})
+    assert ws.issues[bare["issue"]["id"]]["description"] == FOOTER.lstrip("\n")
+    assert [c[0] for c in ws.writes()] == ["issue_create", "issue_create"]
+    assert _created_rows(adapter) == 0 and _requests(adapter) == 0  # nothing remembered
+    origin["HERMES_SESSION_PROFILE"] = "neo"
+    del origin["HERMES_SESSION_PLATFORM"]
+    named = linear_issue_create({"title": "Named", "description": "d"})
+    assert ws.issues[named["issue"]["id"]]["description"] == (
+        "d\n\n---\n_Filed by neo via unknown_")
+
+
+def test_outside_create_team_by_key_name_or_uuid(pin_ctx, ws, adapter, origin):
+    pin_ctx(linear=False)
+    outside(adapter)
+    for ref, team in (("oth", OTHER_TEAM), ("Other", OTHER_TEAM), ("ret", TEAM),
+                      ("RETAIL", TEAM), (OTHER_TEAM, OTHER_TEAM)):
+        out = linear_issue_create({"title": f"in {ref}", "team": ref})
+        assert out["ok"] is True, (ref, out)
+        stored = ws.issues[out["issue"]["id"]]
+        assert stored["team"] == team and stored["project"] is None, ref
+    assert linear_issue_create({"title": "x", "team": "NOPE"}) == {
+        "ok": False, "error": "TEAM_NOT_FOUND"}
+
+
+def test_outside_create_team_arg_beats_default(pin_ctx, ws, adapter, origin):
+    pin_ctx(linear=False)
+    outside(adapter, default_team="RET", default_project=PROJECT["name"])
+    out = linear_issue_create({"title": "x", "team": "OTH", "project": "elsewhere"})
+    stored = ws.issues[out["issue"]["id"]]
+    assert stored["team"] == OTHER_TEAM and stored["project"]["id"] == OTHER_PROJECT["id"]
+
+
+def test_outside_create_project_by_uuid(pin_ctx, ws, adapter, origin):
+    puid = "0b7e3c6a-1d2f-4a5b-9c8d-7e6f5a4b3c2d"
+    ws.named_projects[puid] = {"id": puid, "name": "By id", "externalLinks": [],
+                               "team_ids": [TEAM]}
+    ws.add_project(puid, "By id")
+    pin_ctx(linear=False)
+    outside(adapter)
+    out = linear_issue_create({"title": "x", "team": "RET", "project": puid})
+    assert ws.issues[out["issue"]["id"]]["project"]["id"] == puid
+    assert ("project", puid) in ws.calls
+    assert not [c for c in ws.calls if c[0] == "projects_named"]  # found by id: no name query
+    out = linear_issue_create({"title": "y", "team": "RET", "project": "hermes"})  # a name
+    assert ws.issues[out["issue"]["id"]]["project"]["id"] == PROJECT["id"]
+    assert not [c for c in ws.calls if c == ("project", "hermes")]
+
+
+def test_outside_create_duplicate_team_name_not_found(pin_ctx, ws, adapter):
+    ws.teams_rows += [{"id": "team-3", "key": "SA1", "name": "Same"},
+                      {"id": "team-4", "key": "SA2", "name": "same"}]
+    pin_ctx(linear=False)
+    outside(adapter)
+    assert linear_issue_create({"title": "x", "team": "Same"}) == {
+        "ok": False, "error": "TEAM_NOT_FOUND"}
     assert ws.writes() == []
+
+
+def test_outside_create_project_other_team_not_found(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    for mode in ("approve", "allow"):
+        outside(adapter, mode)
+        for project in (OTHER_PROJECT["name"], OTHER_PROJECT["id"], "No such project"):
+            assert linear_issue_create({"title": "x", "team": "RET", "project": project}) == {
+                "ok": False, "error": "PROJECT_NOT_FOUND"}, (mode, project)
+    outside(adapter, "approve", default_team="RET", default_project="Elsewhere")
+    assert linear_issue_create({"title": "x"}) == {"ok": False, "error": "PROJECT_NOT_FOUND"}
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_outside_create_state_and_labels_resolve_on_destination_team(pin_ctx, ws, adapter,
+                                                                     origin):
+    pin_ctx(linear=False)
+    outside(adapter, default_team="OTH")
+    out = linear_issue_create({"title": "x", "state": "In Progress", "labels": ["bug"]})
+    stored = ws.issues[out["issue"]["id"]]
+    assert stored["team"] == OTHER_TEAM
+    assert stored["state"] == "oth-st-progress" and stored["labels"] == ["oth-lb-bug"]
+    assert ("team_states", OTHER_TEAM) in ws.calls and ("team_labels", OTHER_TEAM) in ws.calls
+    assert linear_issue_create({"title": "x", "state": "Limbo"})["error"] == "STATE_NOT_FOUND"
+
+
+def test_outside_comment_footer_and_edit_does_not_stack_footer(pin_ctx, ws, adapter, origin):
+    pin_ctx(linear=False)
+    outside(adapter)
+    plain = linear_comment({"id": "RET-2", "body": "plain"})
+    assert ws.comments[plain["comment_id"]]["body"] == "plain" + FOOTER
+    tag = "\n\n<!-- hermes-linear:m -->"
+    first = linear_comment({"id": "RET-2", "body": "v1", "edit_marker": "m"})
+    body1 = ws.comments[first["comment_id"]]["body"]
+    assert body1 == "v1" + FOOTER + tag  # the marker stays last
+    # the model passes the whole earlier comment back: one footer, one marker
+    again = linear_comment({"id": "RET-2", "body": body1.replace("v1", "v2"),
+                            "edit_marker": "m"})
+    assert again["edited"] is True and again["comment_id"] == first["comment_id"]
+    body2 = ws.comments[first["comment_id"]]["body"]
+    assert body2 == "v2" + FOOTER + tag
+    assert body2.count("_Filed by") == 1
+    third = linear_comment({"id": "RET-2", "body": "v3" + FOOTER, "edit_marker": "m"})
+    assert ws.comments[third["comment_id"]]["body"] == "v3" + FOOTER + tag
+
+
+def test_outside_update_has_no_footer(pin_ctx, ws, adapter, origin):
+    pin_ctx(linear=False)
+    outside(adapter)
+    assert linear_issue_update({"id": "RET-2", "description": "new body"})["ok"] is True
+    assert ws.issues["uuid-child"]["description"] == "new body"
 
 
 #: ``STATE_NOT_FOUND`` candidates for FakeWorkspace's default states (no substring match).

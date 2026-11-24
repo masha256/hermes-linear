@@ -692,17 +692,91 @@ def _project_of(issue: dict | None) -> str | None:
 
 # -- linear_issue_create
 
+#: A Linear UUID (team, project); anything else is a key or a name.
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                      r"-[0-9a-fA-F]{12}$")
+#: A trailing origin footer (``_origin_footer``), stripped so a re-edit never stacks two.
+_FOOTER_RE = re.compile(r"\n*---\n_Filed by [^\n]* via [^\n]*_\s*$")
+
+
+def _origin_footer() -> str:
+    """``"\\n\\n---\\n_Filed by <profile> via <platform>_"`` from the calling session (RET-148
+    spec §4), never from args. Call in the tool thread: the session vars are bound there,
+    not on the adapter loop."""
+    profile = (get_session_env("HERMES_SESSION_PROFILE") or "").strip() or "default"
+    platform = (get_session_env("HERMES_SESSION_PLATFORM") or "").strip() or "unknown"
+    return f"\n\n---\n_Filed by {profile} via {platform}_"
+
+
+def _with_footer(text: str | None, footer: str) -> str:
+    """``text`` without a trailing origin footer, then ``footer`` (alone if no text)."""
+    base = _FOOTER_RE.sub("", text or "").rstrip()
+    return base + footer if base else footer.lstrip("\n")
+
 
 def _parse_create(args: dict) -> dict:
     return {"title": _req_str(args, "title"), "description": _opt_str(args, "description"),
             "parent": _opt_str(args, "parent"), "labels": _opt_names(args, "labels"),
             "state": _opt_str(args, "state"),
-            "fields": issue_fields.parse(args, update=False)}
+            "fields": issue_fields.parse(args, update=False), "footer": _origin_footer()}
+
+
+async def _team(ctx: ToolContext, ref: str) -> dict:
+    """The team ``ref`` names: UUID, then key, then name (case-insensitive; a name two
+    teams share names none). ``TEAM_NOT_FOUND`` otherwise."""
+    teams = await ctx.client.teams()
+    want = ref.casefold()
+    for match in (lambda t: t.get("id") == ref,
+                  lambda t: (t.get("key") or "").casefold() == want):
+        found = [t for t in teams if match(t)]
+        if found:
+            return found[0]
+    named = [t for t in teams if (t.get("name") or "").casefold() == want]
+    if len(named) != 1:
+        raise _Refusal("TEAM_NOT_FOUND")
+    return named[0]
+
+
+async def _projects(ctx: ToolContext, ref: str) -> list[dict]:
+    """The projects ``ref`` may name: by id if it is UUID-shaped and exists, else by name."""
+    if _UUID_RE.match(ref):
+        p = await ctx.client.project(ref)
+        if p is not None:
+            return [p]
+    return await ctx.client.projects_named(ref)
+
+
+async def _destination(ctx: ToolContext, team_ref: str,
+                       project_ref: str | None) -> tuple[dict, dict | None]:
+    """Team ``{id, key, name}`` and project ``{id, name, team_ids}`` (or ``None``) for a new
+    issue. ``BAD_ARGS`` without a team; ``TEAM_NOT_FOUND``; ``PROJECT_NOT_FOUND`` unless
+    exactly one project of that reference is in the team. Reads only."""
+    if not (team_ref or "").strip():
+        raise _Refusal("BAD_ARGS")
+    team = await _team(ctx, team_ref.strip())
+    pref = (project_ref or "").strip()
+    if not pref:
+        return team, None
+    found = {p["id"]: p for p in await _projects(ctx, pref)
+             if team["id"] in (p.get("team_ids") or [])}
+    if len(found) != 1:
+        raise _Refusal("PROJECT_NOT_FOUND")
+    return team, next(iter(found.values()))
+
+
+def _destination_target(team: dict, project: dict | None) -> dict:
+    """The gate's pseudo-target for a new issue in ``team`` / ``project`` (spec §2 item 2)."""
+    key = team.get("key") or team["id"]
+    return {"id": f"team:{team['id']}" + (f"/project:{project['id']}" if project else ""),
+            "identifier": key,
+            "title": f"new issue in {key}" + (f" / {project['name']}" if project else "")}
 
 
 async def _create(ctx: ToolContext, a: dict) -> dict:
     """Base team and project (RET-121 spec §1.2): the parent's with ``parent``, else the
     session ticket's. An explicit team / project other than the base is a target."""
+    if ctx.outside:
+        return await _create_outside(ctx, a)
     if not ctx.is_linear or not ctx.session_issue_id:
         raise _Refusal("NOT_LINEAR_SESSION")
     parent = None
@@ -734,6 +808,38 @@ async def _create(ctx: ToolContext, a: dict) -> dict:
     issue = await ctx.client.issue_create(inp)
     _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
     return {"ok": True, "issue": issue}
+
+
+async def _create_outside(ctx: ToolContext, a: dict) -> dict:
+    """A create from a non-Linear session (RET-148 spec §3): ``team``/``project`` or the
+    configured defaults; the destination is a gate target, then the parent if any. The
+    description carries the origin footer; nothing is recorded in ``created_issues``."""
+    gate = ctx.gate
+    if gate is None:  # only ever run through _gated
+        raise _Refusal("NOT_LINEAR_SESSION")
+    settings = getattr(ctx.adapter, "_settings", None)
+    team_ref = a["fields"].get("team") or (getattr(settings, "default_team", "") or "").strip()
+    project_ref = a["fields"].get("project") or (
+        getattr(settings, "default_project", "") or "").strip()
+    team, project = await _destination(ctx, team_ref, project_ref or None)
+    dest = _destination_target(team, project)
+    if dest["id"] not in gate.approved:
+        if gate.approved:  # approved for another destination (e.g. a default changed)
+            raise _Refusal("OUT_OF_SCOPE")
+        gate.record(dest)
+    inp: dict[str, Any] = {"teamId": team["id"], "title": a["title"],
+                           "description": _with_footer(a["description"], a["footer"])}
+    if project is not None:
+        inp["projectId"] = project["id"]
+    if a["parent"] and a["parent"].strip():
+        inp["parentId"] = (await _writable(ctx, a["parent"].strip()))["id"]
+    if a["state"] is not None:
+        inp["stateId"] = await _state_id(ctx, team["id"], a["state"])
+    labels = await _label_ids(ctx, team["id"], a["labels"])
+    if labels:
+        inp["labelIds"] = labels
+    _check_gate(ctx)
+    return {"ok": True, "issue": await ctx.client.issue_create(inp)}
 
 
 # -- linear_issue_update
@@ -856,7 +962,7 @@ def _parse_comment(args: dict) -> dict:
     resolve = False if args.get("resolve") is None else args["resolve"]
     a = {"id": _req_str(args, "id"), "body": _req_str(args, "body"),
          "edit_marker": _opt_str(args, "edit_marker"), "reply_to": reply_to,
-         "resolve": resolve}
+         "resolve": resolve, "footer": _origin_footer()}
     if a["edit_marker"] is not None and not MARKER_RE.match(a["edit_marker"]):
         raise _Refusal("BAD_ARGS")
     # RET-121 §1.5: resolve needs reply_to; a marker edit is never a reply.
@@ -891,6 +997,10 @@ async def _comment(ctx: ToolContext, a: dict) -> dict:
     thread = await _thread_of(ctx, issue, a["reply_to"]) if a["reply_to"] else None
     _check_gate(ctx)  # after the scope and comment checks
     body, marker = a["body"], a["edit_marker"]
+    if ctx.outside:  # the origin footer (spec §4), before the marker so the tag stays last
+        if marker is not None:
+            body = ANY_MARKER_RE.sub("", body)  # a body copied back with its old tag
+        body = _with_footer(body, a["footer"])
 
     def done(comment_id: str, edited: bool) -> dict:
         return {"ok": True, "comment_id": comment_id, "edited": edited,
@@ -1380,8 +1490,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_issue_create": {
         "name": "linear_issue_create",
         "description": ("Create a Linear issue as the Linear app, in the parent's team and "
-                        "project (with parent: a sub-issue), else the session issue's. A "
-                        "team or project other than that needs a human's approval. "
+                        "project (with parent: a sub-issue), else the session issue's; outside "
+                        "a Linear session without parent, in default_team / default_project. "
+                        "A team or project other than that needs a human's approval; outside "
+                        "a Linear session every create does (per outside_session_writes). "
                         "Delegating to this app is refused (SELF_DELEGATION). " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "title": {"type": "string"},
@@ -1394,8 +1506,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "team": {"type": "string", "description": "Team UUID, key (e.g. RET) or name."},
             "project": {"type": "string",
                         "description": ("Project UUID or name; omitted or null: the parent's "
-                                        "(else the session issue's); with another team: "
-                                        "no project.")},
+                                        "(else the session issue's, or default_project "
+                                        "outside a session); with another team: no "
+                                        "project.")},
             **_field_props(nullable=False),
         }, "required": ["title"]},
     },

@@ -52,6 +52,9 @@ Usage::
   Linear answered the live probe: one relation per issue pair; an identical create (or
   ``related`` either way) returns the existing id, any other type or direction replaces it.
 
+- projects by name (RET-148): ``named_projects`` (id -> project dict plus ``team_ids``)
+  backs ``projects_named()`` and ``project()``.
+
 Later tasks extend it (documents, …); keep each addition small and listed here.
 """
 
@@ -69,6 +72,12 @@ HUMAN = "human-1"
 TEAM = "team-1"
 PROJECT = {"id": "proj-1", "name": "Hermes",
            "externalLinks": [{"label": "Spec", "url": "https://example.test/spec"}]}
+#: A second team (key ``OTH``) with its own states/labels and project (RET-148).
+OTHER_TEAM = "team-2"
+OTHER_PROJECT = {"id": "5f0c2d9e-8a7b-4c3d-9e1f-2a3b4c5d6e7f", "name": "Elsewhere",
+                 "externalLinks": []}  # a UUID-shaped id: resolved with ``project()``
+TEAMS = [{"id": TEAM, "key": "RET", "name": "Retina"},
+         {"id": OTHER_TEAM, "key": "OTH", "name": "Other"}]
 
 DEFAULT_STATES = [
     {"id": "st-backlog", "name": "Backlog", "type": "backlog"},
@@ -131,8 +140,16 @@ class FakeWorkspace:
         self.normalize = normalize
         self.issues: dict[str, dict] = {}
         self.comments: dict[str, dict] = {}
-        self.states: dict[str, list[dict]] = {TEAM: [dict(s) for s in DEFAULT_STATES]}
-        self.labels: dict[str, list[dict]] = {TEAM: [dict(lb) for lb in DEFAULT_LABELS]}
+        self.states: dict[str, list[dict]] = {
+            TEAM: [dict(s) for s in DEFAULT_STATES],
+            OTHER_TEAM: [{**s, "id": f"oth-{s['id']}"} for s in DEFAULT_STATES]}
+        self.labels: dict[str, list[dict]] = {
+            TEAM: [dict(lb) for lb in DEFAULT_LABELS],
+            OTHER_TEAM: [{**lb, "id": f"oth-{lb['id']}"} for lb in DEFAULT_LABELS]}
+        #: id -> the issue-side project dict plus ``team_ids`` (``projects_named`` / ``project``)
+        self.named_projects: dict[str, dict] = {
+            PROJECT["id"]: {**copy.deepcopy(PROJECT), "team_ids": [TEAM]},
+            OTHER_PROJECT["id"]: {**copy.deepcopy(OTHER_PROJECT), "team_ids": [OTHER_TEAM]}}
         self.workspace_labels: list[dict] = [dict(lb) for lb in WORKSPACE_LABELS]
         self.teams_rows: list[dict] = [dict(t) for t in DEFAULT_TEAMS]
         self.users_rows: list[dict] = [dict(u) for u in DEFAULT_USERS]
@@ -383,6 +400,22 @@ class FakeWorkspace:
     async def milestones(self, project_id: str) -> list[dict]:
         self.calls.append(("milestones", project_id))
         return [dict(m) for m in self.milestones_rows.get(project_id, [])]
+
+    # -- projects by name (RET-148) -------------------------------------
+    @staticmethod
+    def _project_row(p: dict) -> dict:
+        return {"id": p["id"], "name": p["name"], "team_ids": list(p["team_ids"])}
+
+    async def projects_named(self, name: str) -> list[dict]:
+        """Linear's ``eqIgnoreCase`` name filter."""
+        self.calls.append(("projects_named", name))
+        return [self._project_row(p) for p in self.named_projects.values()
+                if p["name"].casefold() == name.casefold()]
+
+    async def project(self, ref: str) -> dict | None:
+        self.calls.append(("project", ref))
+        p = self.named_projects.get(ref)
+        return self._project_row(p) if p else None
 
     # -- uploads and attachments (RET-134) ------------------------------
     async def file_upload(self, name: str, content_type: str, data: bytes) -> str:
