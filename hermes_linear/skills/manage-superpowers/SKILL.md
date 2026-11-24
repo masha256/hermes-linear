@@ -44,7 +44,8 @@ URL re-link is `ALREADY_LINKED`, a relation `ALREADY_RELATED`, any other one bet
 `RELATION_CONFLICT`; session links de-duplicate), except that a `path` attach adds a second copy.
 Writes to the session ticket, its descendants and tickets made from it (any turn) just run. Out of
 that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `linear_attach` and
-`linear_relation` answer `APPROVAL_REQUIRED`; an identical re-call asks a human in Linear.
+`linear_relation` answer `APPROVAL_REQUIRED`; an identical re-call asks a human in Linear. Outside a
+Linear session (Slack, CLI, cron) those five follow `outside_session_writes` and ask in that chat.
 
 ## Questions and approvals
 
@@ -61,7 +62,7 @@ that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `line
   same turn (its pre-approval ends with it, no second prompt); on `: denied` don't run it.
 - Out-of-scope write `BLOCKED: …`: timed out → pending in Linear, end the turn; denied: no retry.
   On ``Answer to approval for `<tool>` call <digest>: approved`` re-run the identical call now.
-- Answers count only in the ticket thread; one from Slack, the CLI etc. approves or unblocks nothing.
+- In a Linear session answers count only in the ticket thread, never from Slack, the CLI or elsewhere.
 
 ## Setup (first session on a repo, or no `.hermes-linear.yaml` yet)
 
@@ -92,9 +93,8 @@ that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `line
 **Brainstorm.** Load `superpowers:brainstorming`. Each question is a turn in the ticket thread;
 choices and design-section approvals are selects. No visual companion (it can't work in Linear).
 
-**Spec.** Put a whole line `Linear: <session ticket ID>` in the spec's header (before
-the first `## ` heading). Commit, then `linear_sync_spec` with the spec's absolute
-path. The spec review gate is a select. Each requested change: edit → commit → sync.
+**Spec.** Header line `Linear: <session ticket ID>` (before the first `## ` heading). Commit, then
+`linear_sync_spec` (absolute path). Review gate: a select; each change: edit → commit → sync.
 
 **Plan.** Load `superpowers:writing-plans`. Header line `Linear: <ID>`; tasks keep the
 heading form `### Task N: <name>`. Commit, then `linear_sync_plan` (absolute path). It

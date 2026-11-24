@@ -1455,8 +1455,10 @@ linear_task_state = _tool(_parse_task_state, _task_state)
 linear_query = _tool(_parse_query, _query)
 
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
-_GATED_NOTE = ("Outside the session issue's tree (issues you did not create) the first call "
-               "returns APPROVAL_REQUIRED; call again with identical arguments to ask a human.")
+_GATED_NOTE = ("Outside the session issue's tree (issues you did not create), or from outside a "
+               "Linear session (per outside_session_writes), the first call may return "
+               "APPROVAL_REQUIRED; call again with identical arguments to ask a human in "
+               "this chat.")
 _PRIORITY = ("none, urgent, high, medium or low, or Linear's number 0-4 "
              "(0 none, 1 urgent, 2 high, 3 medium, 4 low).")
 

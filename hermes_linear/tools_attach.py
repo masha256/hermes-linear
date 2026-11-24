@@ -212,8 +212,8 @@ SCHEMAS: dict[str, dict] = {
             "Attach to a Linear issue as the Linear app. path + id: upload a local file "
             "(files Hermes may deliver as media; .env, credential dirs and Hermes state are "
             "refused; max 50 MB) and attach it. url + id: link a URL (a GitHub PR URL as a "
-            "PR); ALREADY_LINKED if the issue has it. path + embed: upload only and return "
-            "markdown to put in a comment. " + agent_tools._GATED_NOTE),
+            "PR); ALREADY_LINKED if the issue has it. path + embed (Linear sessions only): "
+            "upload only and return markdown to put in a comment. " + agent_tools._GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": _prop("string", "Target issue (not with embed): " + agent_tools._ISSUE_REF),
             "path": _prop("string", "Absolute path of a local file (not with url)."),
