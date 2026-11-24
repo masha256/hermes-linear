@@ -25,7 +25,7 @@ write is attributed to the app; behaviour inside Linear sessions does not change
 | Q2.1 | Team / project of a new issue outside a session | New optional `team` (key, name or UUID) and `project` (name or UUID) arguments on `linear_issue_create`, falling back to settings `default_team` / `default_project`. No team at all → `BAD_ARGS`. Inside a session nothing changes. |
 | Q2.2 | Prompt-injection carry-over | Issues and comments written outside a session get an origin footer `Filed by <profile> via <platform>` (both values from the session, never from args). |
 | Q2.3 | RET-119's "A Slack approval must never authorize a Linear write" | **Reversed** (RET-119 spec, Coverage list, struck there). Its reason was Linear's *deferred* answers ("answers only count in the ticket thread"). Off Linear, core's gate is answered synchronously inside the turn by the chat's own authorized user, as for any dangerous shell command. |
-| Q2.4 | Approval grain | Unchanged: `rule_key = <tool>:<digest>`. The plugin can't narrow another platform's card, so Slack shows Hermes's full choice set; *session* and *always* then cover only byte-identical calls. |
+| Q2.4 | Approval grain | Inside a Linear session unchanged: `rule_key = <tool>:<digest>`. The plugin can't narrow another platform's card, so Slack shows Hermes's full choice set; *session* and *always* then cover only identical calls (same tool and arguments). Outside rule keys are `<tool>:outside:<digest>` (final review), so permanent off-Linear grants never apply in Linear sessions (which still ask once/deny in the ticket thread), nor in-Linear keys off Linear. "Outside" is `tool_approval.is_linear_platform` false, the one predicate the tool context and the hook share; an unbound `HERMES_SESSION_PLATFORM` counts as outside. |
 | Q2.5 | No human present | Under `approve`, Hermes's presence rules block (cron follows `approvals.cron_mode`). Under `allow`, it writes. |
 | Q2.6 | What stays session-only | `linear_sync_spec`, `linear_sync_plan`, `linear_task_state`, `linear_session_link`, `linear_attach` with `embed`: `NOT_LINEAR_SESSION` as today. Issues created outside a session are not remembered for follow-ups (v2): every later write to them is an outside write again. |
 
@@ -106,12 +106,13 @@ team/project silently); one that doesn't exist → `TEAM_NOT_FOUND` / `PROJECT_N
 
 Outside, in order:
 1. Team = `team` arg, else `default_team`, else `BAD_ARGS`. Resolve via the existing
-   `client.teams()` (match UUID, key case-insensitive, then name case-insensitive); no
-   match → `TEAM_NOT_FOUND`.
-2. Project = `project` arg, else `default_project`, else none. Resolve with a new
-   `client.projects_by_name(name)` (`projects(filter: {name: {eqIgnoreCase: $name}})`, also
-   accepting a UUID via `project(id:)`), and require the team among the project's
-   `teams`; no match or wrong team → `PROJECT_NOT_FOUND`.
+   `client.teams()` (match UUID, then key, then name, all case-insensitive; a name two
+   teams share matches none); no match → `TEAM_NOT_FOUND`.
+2. Project = `project` arg, else `default_project`, else none. Resolve a UUID-shaped
+   reference with `client.project(ref)` (`project(id:)`), otherwise (or when no project has
+   that id) by name with `client.projects_named(name)` (`projects(filter: {name:
+   {eqIgnoreCase: $name}})`), and require the team among the project's `teams`; no match,
+   wrong team, or a name two projects in the team share → `PROJECT_NOT_FOUND`.
 3. `parent` (optional) → `_writable` (a gate target). `state`, `labels` resolve against
    the destination team as today.
 4. Footer appended to `description` (§4); then `_check_gate`, then `issueCreate`.
