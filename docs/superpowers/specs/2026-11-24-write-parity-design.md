@@ -137,7 +137,14 @@ New args: `project`, `assignee`, `delegate`, `priority`, `estimate`, `due_date`,
   (the tool is gated). `id == other` (by UUID): `BAD_ARGS`.
 - Before the create, the existing relations of `id` (both directions) are read. A match is
   `ALREADY_RELATED` with no write: same type and direction for `blocks` / `duplicate`,
-  either direction for `related`.
+  either direction for `related`. This is a read, so it needs no approval even for
+  out-of-scope ends.
+- Linear keeps **one relation per issue pair**: creating another type or direction
+  silently replaces the old one (live probe, RET-141). That is a delete, which C rules out
+  (Q2), so any other existing relation between the two issues is `RELATION_CONFLICT` with
+  `existing: {relation_id, type, direction}` and no write. A human changes it (Ruling R9).
+- `duplicate_of` also moves `id` to its team's Duplicate state (Linear's behaviour; said in
+  the description).
 - Result: `{ok: true, relation_id, issue, other, type}` (identifiers for `issue`/`other`).
 
 ### 1.5 `linear_comment` additions
@@ -164,7 +171,8 @@ New args: `reply_to` (a comment UUID, as returned by `linear_issue_get` `comment
 - The blocker goes through `_writable` without a gate (the tool stays tree-only): an
   out-of-tree blocker is `OUT_OF_SCOPE`, and the agent uses `linear_relation`, which asks.
   The blocker equal to the task: `BAD_ARGS`.
-- Order: both scope checks; then the label (as today); then `<blocked_by> blocks <task>`
+- Order: both scope checks and the relation check (`RELATION_CONFLICT` refuses before any
+  write, §1.4); then the label (as today); then `<blocked_by> blocks <task>`
   through `ensure_relation` (skipped if it exists, so a re-run is safe); then the question
   comment, only if `question` was given.
 - Result adds `relation_id` and `relation_created` (false when it existed).
@@ -270,7 +278,7 @@ registers its schemas and handlers at its own end; `agent_tools.py` ends with ba
   tools do.
 - New plugin codes: `STATE_NOT_FOUND`, `USER_NOT_FOUND`, `AMBIGUOUS`, `DELEGATE_NOT_AGENT`,
   `CYCLE_NOT_FOUND`, `MILESTONE_NOT_FOUND`, `PROJECT_NOT_FOUND`, `TEAM_NOT_FOUND`,
-  `ALREADY_RELATED`, `COMMENT_NOT_ON_ISSUE`.
+  `ALREADY_RELATED`, `COMMENT_NOT_ON_ISSUE`, `RELATION_CONFLICT`.
 - `linear_task_state`'s own "the team has no such state" (`_target_state`) stays `BAD_ARGS`:
   that is not a name the agent supplied.
 
