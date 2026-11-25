@@ -326,8 +326,10 @@ Linear's markdown normalization, probe P8):
 - **Plan sync:** the current description up to (excluding) its plan part, `rstrip()`ed;
   with no plan part yet, the whole current description. Then `\n\n` and the new plan part.
   Task lines are written after the sub-tickets exist, so they carry the IDs.
-- A description that would exceed `SPEC_INLINE_MAX` (200,000) cuts the task list first,
-  then the summary, the same way `plan_comment` cuts today.
+- Size: the spec part is bounded (summary ≤ 5,000 plus one source line). The **plan sync**
+  fits its own part into `SPEC_INLINE_MAX` (200,000) minus what precedes it, cutting the
+  task list first, then the summary. The spec sync never cuts the plan part (it keeps it
+  byte for byte); if Linear still refuses, its error is returned with `document_id`.
 - The description is written only when it changed (compared after the same
   normalization the hash uses), so a no-op re-sync makes no issue update.
 
