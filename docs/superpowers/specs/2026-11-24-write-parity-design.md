@@ -208,7 +208,8 @@ registers its schemas and handlers at its own end; `agent_tools.py` ends with ba
 - `hermes_linear/directory.py`: the cache and resolution (§2.2). No tool of its own.
 - `hermes_linear/issue_fields.py`: `parse(args, *, update: bool) -> dict` (sync, raises
   `_Refusal("BAD_ARGS")` before any I/O) and `async resolve(ctx, parsed, *, team, project)`
-  → `(input_fields: dict, warnings: list[str], targets: list[dict], starts_session)`
+  → `Resolved(input, team_id, project_id, team, project)`; the caller builds the team /
+  project approval targets from `team` / `project` against the base
   for the shared fields of §1.1. Create and update (still in `agent_tools.py`) call it.
 - `hermes_linear/tools_relation.py`: `linear_relation` and
   `async ensure_relation(ctx, issue, other, type) -> (relation_id, created)`, reused by

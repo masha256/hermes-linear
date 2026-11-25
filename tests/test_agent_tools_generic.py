@@ -914,6 +914,9 @@ def test_issue_field_schemas():
         if name != "team":
             assert update[name]["type"] == [want, "null"], name
     assert "team" not in update
+    for tool in ("linear_issue_create", "linear_issue_update"):  # Q3' = A (RET-154)
+        desc = TOOL_SCHEMAS[tool]["description"]
+        assert "starts no session" not in desc and "no session starts" not in desc, tool
     for props in (create, update):
         assert all(w in props["priority"]["description"]
                    for w in ("none", "urgent", "high", "medium", "low", "0", "4"))
