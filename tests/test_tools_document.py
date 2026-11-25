@@ -176,6 +176,23 @@ def test_create_on_session_ticket_no_prompt(pin_ctx, ws, adapter):
     assert _requests(adapter) == 0
 
 
+@pytest.mark.parametrize("title", ["Spec: Mine", "Plan: Mine", "  Spec:x", "Plan:"])
+@pytest.mark.parametrize("target", [{}, {"issue": "OTH-9"}, {"project": "Hermes"}])
+def test_create_reserved_sync_title_bad_args(pin_ctx, ws, adapter, title, target):
+    """Ruling 11: ``Spec:`` / ``Plan:`` titles (after strip, case-sensitive) belong to the
+    sync tools; refused before any read or gate, wherever the document would go."""
+    out = linear_document({"action": "create", "title": title, "content": "c", **target})
+    assert out["ok"] is False and out["error"] == "BAD_ARGS", out
+    assert "linear_sync_spec" in out["message"] and "linear_sync_plan" in out["message"]
+    assert ws.calls == [] and _requests(adapter) == 0
+
+
+@pytest.mark.parametrize("title", ["spec: lower", "Specs: x", "My Spec: x", "Plan x"])
+def test_create_title_not_reserved(pin_ctx, ws, adapter, title):
+    out = linear_document({"action": "create", "title": title, "content": "c"})
+    assert out["ok"] is True, out
+
+
 def test_create_on_out_of_scope_issue_asks(pin_ctx, ws, adapter):
     args = {"action": "create", "title": "Their notes", "content": "c", "issue": "OTH-9"}
     out = linear_document(dict(args))
@@ -314,6 +331,19 @@ def test_update_in_scope_no_prompt(pin_ctx, ws, adapter):
     assert out["ok"] is True and ws.documents[did]["title"] == "T"
     assert _calls(ws, "document_update") == [(did, {"content": "new"}), (did, {"title": "T"})]
     assert _requests(adapter) == 0
+
+
+@pytest.mark.parametrize("title", ["Spec: Taken", " Plan: Taken "])
+def test_update_reserved_sync_title_bad_args(pin_ctx, ws, adapter, title):
+    """Ruling 11: retitling a document to ``Spec:`` / ``Plan:`` is refused the same way,
+    before the document is read (no gate, no write), with or without content."""
+    did = ws.add_document("Child doc", "old", issue="RET-2")
+    for extra in ({}, {"content": "new"}):
+        out = linear_document({"action": "update", "id": did, "title": title, **extra})
+        assert out["ok"] is False and out["error"] == "BAD_ARGS", out
+        assert "reserved" in out["message"]
+    assert ws.calls == [] and _requests(adapter) == 0
+    assert ws.documents[did]["title"] == "Child doc"
 
 
 def test_update_created_document_after_restart_no_prompt(pin_ctx, ws, adapter, tmp_path):

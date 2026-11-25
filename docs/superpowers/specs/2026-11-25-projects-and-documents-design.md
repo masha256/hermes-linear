@@ -109,8 +109,10 @@ refetches once and then answers `PROJECT_NOT_FOUND` with `candidates`.
   `MILESTONE_NOT_FOUND` with `candidates`) it updates that milestone, and at least one of
   `name`, `description` and `target_date` is required. `target_date: null` clears the
   date on update. Linear can't clear a milestone description (null and `""` leave it
-  unchanged, §7), so `description: null` or a blank one on update is `BAD_ARGS` with a
-  message, and nothing is written. `target_date` is `YYYY-MM-DD` (the same
+  unchanged, §7): on update `description: null` counts as absent (models fill unused
+  fields with null; Ruling 11, amending Ruling 7), so an update whose only field is a null
+  description has no field and is `BAD_ARGS`; a blank or whitespace-only `description` is
+  `BAD_ARGS` with a message, and nothing is written. `target_date` is `YYYY-MM-DD` (the same
   grammar C uses for `due_date`). Linear's duplicate-name refusal becomes
   `ALREADY_EXISTS` with Linear's message. Returns `milestone_id`, `name`,
   `target_date`, and `created: true | false`.
@@ -141,6 +143,9 @@ Arguments: `action` (required: `get | create | update`).
 - **`update`** (`id` as for `get`; `title?`, `content?`, at least one, else `BAD_ARGS`).
   Sends only `title` and `content`: never `issueId`, `projectId`, `trashed` or `hiddenAt`,
   so the tool can't move, trash or hide a document. Returns `document_id`, `url`.
+- A `title` on `create` or `update` that starts with `Spec:` or `Plan:` (after stripping,
+  case-sensitive: the sync tools' prefixes, §6.2) is `BAD_ARGS` with a message naming
+  `linear_sync_spec` / `linear_sync_plan`, before any read or gate (Ruling 11).
 
 ### 1.3 `linear_issue_get` gains `documents`
 
@@ -254,8 +259,21 @@ In project **hermes linear test project**, after `deploy-live` and a gateway res
    `---` bar with the task list, the old plan comment now points to the plan document,
    and a second identical re-sync writes nothing (`document_skipped: true`, no issue
    update).
-8. Should NOT happen: any prompt in steps 1–2; any write after a Deny; any second link
-   or document.
+8. `milestone` renaming the step-5 milestone to a name another milestone of the project
+   already has: one card, then `ALREADY_EXISTS` with Linear's message; neither milestone
+   changed.
+9. Commit the plan file with the ticket IDs step 7 wrote back (`file_changed`), then
+   re-sync the plan: nothing is written (`document_skipped: true`, no sub-ticket or
+   description update, `file_changed: false`).
+10. Read RET-122's description back with `linear_query` and record how Linear stores its
+    `**Spec:** [..](..) · source [.. @ ..](..)` link line (as written or
+    rewritten). Then re-sync the spec: no description update, so a stored rewrite doesn't
+    cause a rewrite loop.
+11. Trash a test document in the Linear UI, then read its ticket with `linear_issue_get`
+    and record whether `Issue.documents` still lists it (adjust §1.3 / the README if it
+    does).
+12. Should NOT happen: any prompt in steps 1–2; any write after a Deny; any second link
+    or document; any write in steps 9–10.
 
 Afterwards, as the app, remove the brainstorm probe leftovers: the two "RET-122 probe doc"
 documents on RET-161, the two `ret-122 probe` links and the "ret-122 probe" milestone in
@@ -367,7 +385,7 @@ sync tools change to match.
 
 - Settled (RET-169, Task 7): the plan sync's order of writes. The document lookup (and so
   `AMBIGUOUS`) runs before any write; the `Plan:` document is then written **after** the
-  sub-tickets, not first as §6.5 lists it, because its content is the file with every ticket
+  sub-tickets (as §6.5 now lists it), because its content is the file with every ticket
   ID written back, and on a first sync new tasks have no ID until their sub-ticket exists.
   Writing it first would leave the IDs out and rewrite it on the next identical run. Order:
   lookup, sub-tickets, document, description, old comment. A failure after the sub-tickets
@@ -388,8 +406,10 @@ sync tools change to match.
   still `"x"`, targetDate `null` (read back the same, updatedAt 22:06:17Z). Linear's own
   schema says so: `ProjectMilestoneUpdateInput.description` is "An empty string or null
   leaves the description unchanged", `targetDate` is "Null clears the target date". So
-  §1.1 was amended (controller ruling, 2026-11-25): the tool answers `description: null` (or blank) on update with `BAD_ARGS` and
-  a message, rather than a success that changed nothing. The probe milestone now has
+  §1.1 was amended (controller ruling, 2026-11-25): the tool answers a blank description on
+  update with `BAD_ARGS` and a message, rather than a success that changed nothing
+  (Ruling 11 amended Ruling 7: `description: null` is now treated as absent, since models
+  fill unused fields with null). The probe milestone now has
   description `"x"` and no target date.
 - Settled (RET-163 probes on the test project `d984ad14-969e-4d89-9538-14285b5e1743`,
   2026-11-25; Task 1 report, live probes 4, 5 and 8): the `Project`

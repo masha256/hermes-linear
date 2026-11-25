@@ -51,11 +51,12 @@ _ARGS: dict[str, frozenset[str]] = {
 #: ``link``'s URL after ``strip()`` (spec §1.1): http(s) only, no whitespace inside.
 _LINK_URL = re.compile(r"^https?://\S+$")
 
-#: ``description: null`` (or blank) on a milestone update: Linear leaves the description as
-#: it is (RET-166 probe, spec §7), so the tool refuses rather than report a clear it can't do.
+#: A blank ``description`` on a milestone update: Linear leaves the description as it is
+#: (RET-166 probe, spec §7), so the tool refuses rather than report a clear it can't do.
+#: ``description: null`` counts as absent (Ruling 11).
 MILESTONE_DESCRIPTION_CLEAR_MESSAGE = (
-    "Linear can't clear a milestone description: null or an empty string leaves it "
-    "unchanged. Pass new text to replace it.")
+    "Linear can't clear a milestone description: an empty string leaves it unchanged. "
+    "Pass new text to replace it, or leave description out.")
 
 
 def _blank_to_none(v: Any) -> Any:
@@ -91,7 +92,10 @@ def _parse_milestone(args: dict, out: dict) -> dict:
     fields: dict[str, Any] = {}
     if name is not None:
         fields["name"] = name
-    if "description" in args:
+    # A null description is absent (models fill unused fields with null, Ruling 11); a blank
+    # string asks for a clear Linear can't do, so it is refused.
+    raw_description = args.get("description")
+    if raw_description is not None:
         if description is None:
             raise _Refusal("BAD_ARGS", extra={"message": MILESTONE_DESCRIPTION_CLEAR_MESSAGE})
         fields["description"] = description
@@ -318,8 +322,8 @@ SCHEMAS: dict[str, dict] = {
                 "milestone: the milestone to edit (name or UUID); omit to create one.")},
             "name": {"type": "string", "description": "milestone: its name."},
             "description": {"type": ["string", "null"], "description": (
-                "milestone: its description (Linear can't clear it; null is refused on "
-                "an edit).")},
+                "milestone: its description (Linear can't clear it: null leaves it as it "
+                "is, a blank one is refused on an edit).")},
             "target_date": {"type": ["string", "null"], "description": (
                 "milestone: YYYY-MM-DD (null clears on an edit).")},
             "url": {"type": "string", "description": "link: an http(s) URL."},

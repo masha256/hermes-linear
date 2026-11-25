@@ -23,8 +23,15 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 
-from . import agent_tools, directory, issue_fields
+from . import agent_tools, directory, issue_fields, sync
 from .agent_tools import _Refusal
+
+#: ``create`` / ``update`` with a title starting ``Spec:`` or ``Plan:`` (after strip,
+#: case-sensitive): ``BAD_ARGS`` before any read or gate (Ruling 11, spec §1.2).
+RESERVED_TITLE_MESSAGE = (
+    "Titles starting with 'Spec:' or 'Plan:' are reserved for the documents "
+    "linear_sync_spec / linear_sync_plan write; sync the file with them instead, or pick "
+    "another title.")
 
 #: ``get`` cuts ``content`` here (with ``content_truncated`` / ``content_length``).
 DOCUMENT_CONTENT_MAX = 50_000
@@ -75,6 +82,8 @@ def _parse(args: dict) -> dict:
     title = agent_tools._opt_str(args, "title")
     if title is not None and not title.strip():
         raise _Refusal("BAD_ARGS")
+    if title is not None and title.strip().startswith(sync.SYNC_TITLE_PREFIXES):
+        raise _Refusal("BAD_ARGS", extra={"message": RESERVED_TITLE_MESSAGE})
     content = agent_tools._opt_str(args, "content")  # may be empty
     if action == "update":
         if title is None and content is None:
@@ -213,7 +222,9 @@ SCHEMAS: dict[str, dict] = {
             "its issue or project, creator. create (title, content; issue or project, at "
             "most one; neither: the session ticket): a document with the same title there "
             "is ALREADY_EXISTS with its document_id and url, and nothing is written. update "
-            "(id; title and/or content): edits in place, never moves or deletes. A document "
+            "(id; title and/or content): edits in place, never moves or deletes. A title "
+            "starting 'Spec:' or 'Plan:' is BAD_ARGS (reserved for linear_sync_spec / "
+            "linear_sync_plan). A document "
             "on an in-scope issue, or one created from this ticket, needs no approval; "
             "creating one on a project always does. DOCUMENT_NOT_FOUND for an unknown id. "
             + agent_tools._GATED_NOTE),

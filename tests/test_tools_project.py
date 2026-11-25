@@ -451,7 +451,9 @@ def test_milestone_update_by_name_and_uuid(pin_ctx, ws, adapter):
 
 
 @pytest.mark.parametrize("extra", [{}, {"name": None}, {"name": ""}, {"name": "  "},
-                                   {"name": 3}, {"description": 3}, {"target_date": 3}])
+                                   {"name": 3}, {"description": 3}, {"target_date": 3},
+                                   {"description": None},
+                                   {"description": None, "name": None}])
 def test_milestone_update_needs_a_field(pin_ctx, ws, adapter, extra):
     _seed_milestones(ws, "Alpha")
     out = linear_project({"action": "milestone", "milestone": "Alpha", **extra})
@@ -468,9 +470,10 @@ def test_milestone_bad_ref(pin_ctx, ws, adapter, ref):
 
 def test_milestone_update_null_clears(pin_ctx, ws, adapter, monkeypatch):
     """``target_date: null`` (or the raw ``"null"`` Hermes coerces to ``None``) clears the
-    date: ``targetDate: None`` is sent. ``description: null`` can't clear: Linear leaves a
-    description unchanged on null or "" (RET-166 probe, spec §7), so it is ``BAD_ARGS``
-    with a message instead of a success that changed nothing."""
+    date: ``targetDate: None`` is sent. ``description: null`` counts as absent (models fill
+    unused fields with null, Ruling 11). A blank description can't clear: Linear leaves a
+    description unchanged on "" (RET-166 probe, spec §7), so it is ``BAD_ARGS`` with a
+    message instead of a success that changed nothing."""
     import copy
 
     from tools.arg_coercion import coerce_tool_args
@@ -490,12 +493,17 @@ def test_milestone_update_null_clears(pin_ctx, ws, adapter, monkeypatch):
                    "target_date": None, "created": False}
     assert ws.writes() == [("milestone_update", ("ms-alpha", {"targetDate": None}))]
     assert ws.milestone_meta["ms-alpha"]["targetDate"] is None
-    for desc in (None, "", "  "):
+    for desc in ("", "  "):
         out = linear_project({"action": "milestone", "milestone": "Alpha",
                               "description": desc, "name": "Alpha"})
         assert out["ok"] is False and out["error"] == "BAD_ARGS", desc
         assert "description" in out["message"]
     assert len(ws.writes()) == 1
+    # a null description beside a real field is absent: only the name is sent
+    out = linear_project({"action": "milestone", "milestone": "Alpha",
+                          "description": None, "name": "Alpha 2"})
+    assert out["ok"] is True, out
+    assert ws.writes()[-1] == ("milestone_update", ("ms-alpha", {"name": "Alpha 2"}))
 
 
 def test_milestone_not_found_candidates(pin_ctx, ws, adapter):

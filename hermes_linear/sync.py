@@ -370,6 +370,11 @@ _BAR_BEFORE_RE = re.compile(r"(?:^|(?<=\n))[ \t]*-{3,}[ \t]*\n(?:[ \t]*\n)*[ \t]
 _LIST_ITEM_RE = re.compile(r"^(\s*)[-*+] ")
 
 
+#: Title prefixes of the documents the sync tools write (``doc_title``) and find again;
+#: ``linear_document`` refuses them on create and update (Ruling 11).
+SYNC_TITLE_PREFIXES = ("Spec:", "Plan:")
+
+
 def doc_title(kind: str, text: str, path: str) -> str:
     """``<kind>: <H1>``: the first ``# `` heading outside code fences (stripped), else
     the file name without its extension. ``kind`` is ``"Spec"`` or ``"Plan"``."""
@@ -490,7 +495,8 @@ def same_description(current: str | None, new: str) -> bool:
 __all__ = ["DESC_HASH_RE", "MANAGED_TITLE_RE", "desc_hash", "read_desc_hash",
            "with_desc_hash", "MAX_SOURCE_BYTES", "PlanTask",
            "PLAN_PART_MARKER", "SPEC_INLINE_MAX", "SPEC_PART_MARKER", "SYNC_DOCUMENT_MAX",
-           "SYNC_SUMMARY_MAX", "SourceInfo", "TASK_DESC_MAX", "TASK_HEADING_RE", "TRUNCATED",
+           "SYNC_SUMMARY_MAX", "SYNC_TITLE_PREFIXES", "SourceInfo", "TASK_DESC_MAX",
+           "TASK_HEADING_RE", "TRUNCATED",
            "doc_title", "document_content", "fit_plan_part", "footer", "git_short_commit",
            "github_repo", "parse_plan", "plan_part", "read_linear_header", "read_source",
            "run_git", "same_description", "source_info", "source_line", "source_path",
