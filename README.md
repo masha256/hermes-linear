@@ -106,6 +106,8 @@ hermes plugins enable linear
 
 Third-party plugins are disabled until you enable them.
 
+Both commands act on the current profile only. For another profile, add `-p <profile>` (see [Multiple Hermes profiles](#multiple-hermes-profiles)).
+
 ## Create the Linear OAuth app
 
 Create **one app per Hermes profile** you want in Linear. The app's name and icon are how the agent appears in Linear (mention menu, assignee/delegate menu), so pick something short and recognisable.
@@ -256,7 +258,7 @@ Easiest: run the wizard and follow the prompts.
 
 ```bash
 hermes linear setup            # or: hermes gateway setup → Linear
-# for another profile:
+# for another profile (install the plugin there first, see Multiple Hermes profiles):
 hermes -p <profile> linear setup
 ```
 
@@ -317,11 +319,21 @@ Fixed behaviour (not configurable): 60 s webhook replay window, 1 MB body limit,
 
 ## Multiple Hermes profiles
 
-Each profile gets its own Linear app, credentials, allowlist, sessions and state; all share one listener.
+Each profile gets its own plugin install, Linear app, credentials, allowlist, sessions and state; all share one listener.
 
-1. Create one Linear OAuth app per profile (above).
-2. Set each app's webhook URL to `https://<host>/linear/<that-profile>/webhook`.
-3. Run `hermes -p <profile> linear setup` for each profile.
+For each profile:
+
+1. Install and enable the plugin in that profile. Hermes loads plugins per profile, so `hermes -p <profile> linear …` doesn't exist until you do:
+
+   ```bash
+   hermes -p <profile> plugins install masha256/hermes-linear   # --ref <commit-sha> pins this profile's copy
+   hermes -p <profile> plugins enable linear
+   ```
+
+   Every profile has its own copy under `<profile>/plugins/linear`, so each one can be pinned to its own commit and is updated on its own.
+2. Create a Linear OAuth app for the profile (above).
+3. Set the app's webhook URL to `https://<host>/linear/<that-profile>/webhook`.
+4. Run `hermes -p <profile> linear setup`, restart the gateway, and check with `hermes -p <profile> linear status`.
 
 Two apps can live in the same Linear workspace. Each only acts on tickets delegated to it or threads that mention it. Renaming a Hermes profile changes its webhook URL — update the Linear app afterwards (`hermes -p <profile> linear status` prints the current URL).
 
@@ -341,10 +353,11 @@ Two apps can live in the same Linear workspace. Each only acts on tickets delega
 | `hermes linear status` | Token validity and expiry, app user, webhook URL, last event received, access mode, errors. |
 | `hermes linear test` | Sends a locally signed test event through the listener to check signature verification and routing (no Linear involved). |
 
-Use `hermes -p <profile> linear …` for other profiles.
+Use `hermes -p <profile> linear …` for other profiles. The commands exist only in profiles where the plugin is installed and enabled.
 
 ## Troubleshooting
 
+- **`hermes: 'linear' is not a hermes command.`** The plugin isn't installed or isn't enabled in that profile. Plugins load per profile: run `hermes -p <profile> plugins install masha256/hermes-linear` and `hermes -p <profile> plugins enable linear`, then check `hermes -p <profile> plugins list`.
 - **Agent shows "unresponsive" in Linear.** Linear needs a first response within 10 s. Check the gateway is running, `hermes linear status` shows a recent event, and the tunnel is up (`tailscale funnel status`, `cloudflared tunnel info <name>`, or the ngrok dashboard).
 - **No events arriving.** Confirm the webhook URL in the Linear app matches `hermes linear status` exactly (including the profile name and port), and that *Agent session events* is ticked.
 - **401s in the gateway log.** The webhook signing secret doesn't match `LINEAR_WEBHOOK_SECRET`, the machine clock is off (replay window is 60 s), or a webhook URL for one profile was pasted into another profile's app.
