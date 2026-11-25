@@ -360,9 +360,25 @@ def test_milestone_create_asks_then_creates(pin_ctx, ws, adapter):
     assert _calls(ws, "milestone_create")[-1] == (PID, "Delta", None, None)
 
 
+def test_milestone_rename_then_same_name_edits_the_new_one(pin_ctx, ws, adapter):
+    """A milestone write drops the project's cached milestones: after renaming Alpha to
+    Alpha v1 and creating a new Alpha, an edit of Alpha hits the new one, never the cached
+    old id."""
+    _seed_milestones(ws, "Alpha")
+    _settings(adapter, out_of_scope_writes="allow")
+    assert linear_project({"action": "milestone", "milestone": "Alpha",
+                           "name": "Alpha v1"})["milestone_id"] == "ms-alpha"
+    made = linear_project({"action": "milestone", "name": "Alpha"})
+    assert made["ok"] is True and made["created"] is True, made
+    out = linear_project({"action": "milestone", "milestone": "Alpha", "description": "new"})
+    assert out["ok"] is True and out["milestone_id"] == made["milestone_id"] != "ms-alpha"
+    assert _calls(ws, "milestone_update")[-1] == (made["milestone_id"], {"description": "new"})
+    assert _calls(ws, "milestones") == [PID, PID]  # the edit refetched after the writes
+
+
 def test_milestone_new_name_resolves_after_create(pin_ctx, ws, adapter):
-    """The directory has no invalidate API: a name made after the project's milestones were
-    cached resolves through the directory's refetch-once on a miss."""
+    """A name made after the project's milestones were cached resolves: the write dropped
+    the project's cached milestones, so the next edit refetches."""
     _seed_milestones(ws, "Alpha")
     _settings(adapter, out_of_scope_writes="allow")
     assert linear_project({"action": "milestone", "milestone": "Alpha",

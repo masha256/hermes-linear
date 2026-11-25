@@ -108,6 +108,21 @@ async def test_entries_keyed_by_scope():
     assert client.calls == [("states", "t1"), ("states", "t2")]
 
 
+async def test_invalidate_drops_one_entry():
+    client = StubClient(states=[STATES], milestones=[[{"id": "m1", "name": "Alpha"}]])
+    d = Directory(client, clock=Clock())
+    await d.rows("milestones", "p1")
+    await d.rows("milestones", "p2")
+    await d.rows("states", "p1")
+    d.invalidate("milestones", "p1")
+    d.invalidate("milestones", "p3")  # nothing cached: a no-op
+    await d.rows("milestones", "p1")  # refetched
+    await d.rows("milestones", "p2")  # other scope: still cached
+    await d.rows("states", "p1")  # other kind, same scope: still cached
+    assert client.calls == [("milestones", "p1"), ("milestones", "p2"), ("states", "p1"),
+                            ("milestones", "p1")]
+
+
 async def test_miss_refetches_once():
     new = {"id": "s4", "name": "New", "type": "unstarted"}
     client = StubClient(states=[STATES, [*STATES, new]])

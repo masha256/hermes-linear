@@ -11,9 +11,10 @@ post project updates, create and edit milestones and add project links as the ap
 - ``post_update``, ``milestone`` and ``link`` always record the project as a target
   (``- project "<name>"``), the session ticket's own project included (Q3, spec §2.1).
   ``post_update`` is not idempotent. ``milestone`` resolves an existing one in the project
-  (directory ``milestones`` kind); Linear's duplicate-name refusal (seen only on write) is
-  ``ALREADY_EXISTS``. ``link`` reads the project's links first: the same URL (both
-  stripped) is ``ALREADY_LINKED`` before the gate, so a repeat never asks or writes.
+  (directory ``milestones`` kind, dropped after each milestone write); Linear's
+  duplicate-name refusal (seen only on write) is ``ALREADY_EXISTS``. ``link`` reads the
+  project's links first: the same URL (both stripped) is ``ALREADY_LINKED`` before the
+  gate, so a repeat never asks or writes.
 
 Every read, resolution and scope step comes before ``_check_gate``, so a first pass that
 needs approval writes nothing. Like ``tools_document``, this module registers itself at its
@@ -233,8 +234,8 @@ async def _milestone(ctx: agent_tools.ToolContext, a: dict) -> dict:
             "milestones", project["id"], a["milestone"], issue_fields._by_name)
     _ask_project(ctx, project)
     agent_tools._check_gate(ctx)
-    # The directory has no invalidate API: a name made or changed here resolves on a later
-    # call through its refetch-once on a miss.
+    # A successful write drops the project's cached milestones: a stale name (renamed, or
+    # reused by a new milestone) must never resolve to the old row's id.
     try:
         if milestone is None:
             made = await ctx.client.milestone_create(
@@ -246,6 +247,7 @@ async def _milestone(ctx: agent_tools.ToolContext, a: dict) -> dict:
             raise
         name = a["name"] if milestone is None else a["fields"].get("name", milestone["name"])
         raise await _already_exists(ctx, project["id"], name, exc) from None
+    directory.for_client(ctx.client).invalidate("milestones", project["id"])
     return {"ok": True, "milestone_id": made["id"], "name": made.get("name"),
             "target_date": made.get("target_date"), "created": milestone is None}
 
