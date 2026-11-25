@@ -62,6 +62,8 @@ Usage::
   document title or link URL is accepted; a duplicate milestone name on create raises
   Linear's ``INPUT_ERROR`` "name not unique" with its ``userPresentableMessage`` as
   ``detail``. ``project_update_create`` sets the project's health when given.
+  ``milestone_update`` as probed (RET-166): ``targetDate: null`` clears, ``description``
+  null or ``""`` leaves the description unchanged.
 
 Later tasks extend it; keep each addition small and listed here.
 """
@@ -606,7 +608,10 @@ class FakeWorkspace:
                                                         "targetDate": None})
         if "name" in fields:
             m["name"] = fields["name"]
-        meta.update({k: fields[k] for k in ("description", "targetDate") if k in fields})
+        if "targetDate" in fields:  # null clears (RET-166 probe)
+            meta["targetDate"] = fields["targetDate"]
+        if fields.get("description"):  # null or "" leaves it unchanged (RET-166 probe)
+            meta["description"] = fields["description"]
         return self._milestone_out(m)
 
     async def project_link_create(self, project_id: str, url: str, label: str | None) -> dict:

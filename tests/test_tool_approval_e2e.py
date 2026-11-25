@@ -528,6 +528,52 @@ async def test_e2e_project_coerced_args_one_prompt(e2e, monkeypatch):
     assert len(h.notified) == 1 and store.request(SK, d) is None
 
 
+async def test_e2e_milestone_null_target_date_one_prompt(e2e, monkeypatch):
+    """RET-166 (Ruling 3): a milestone update with the raw model arg ``target_date: "null"``.
+    Hermes coerces it to ``None`` for the ``["string", "null"]`` schema; the hook's digest of
+    the raw args equals the handler's of the coerced ones, so the session ticket's own
+    project gives exactly one card (``- project "Hermes"``), and after "Allow once" the
+    identical re-call writes once, with ``targetDate: None``. Seams as
+    ``test_e2e_project_coerced_args_one_prompt``: the registry schema lookup patched to the
+    plugin's schema for ``coerce_tool_args``; the rest is ``e2e``'s."""
+    import copy
+
+    from fake_workspace import PROJECT
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry
+
+    h, a, client, gw, store, ws, config = e2e
+    tool = "linear_project"
+    real_get_schema = registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(
+        agent_tools.TOOL_SCHEMAS[name]) if name == tool else real_get_schema(name))
+    pid = PROJECT["id"]
+    ws.milestones_rows[pid] = [{"id": "ms-beta", "name": "Beta"}]
+    ws.milestone_meta["ms-beta"] = {"project": pid, "description": None,
+                                    "targetDate": "2026-12-31"}
+
+    raw = {"action": "milestone", "milestone": "Beta", "target_date": "null"}
+    coerced = coerce_tool_args(tool, copy.deepcopy(raw))
+    assert coerced == {"action": "milestone", "milestone": "Beta", "target_date": None}
+    d = tool_approval.digest(tool, raw)
+    assert d == tool_approval.digest(tool, coerced)
+    first = await h.run(tool, raw, cid="c-first", coerced=coerced)
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert ws.writes() == [] and store.request(SK, d).targets == [pid]
+    task = asyncio.create_task(h.run(tool, raw, cid="c-again", coerced=coerced))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert '\n- project "Hermes"\n' in data["description"]
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out == {"ok": True, "milestone_id": "ms-beta", "name": "Beta",
+                   "target_date": None, "created": False}, out
+    assert ws.writes() == [("milestone_update", ("ms-beta", {"targetDate": None}))]
+    assert len(h.notified) == 1 and store.request(SK, d) is None
+
+
 # ------------------------------------------- outside a Linear session (RET-148, Task 1)
 
 SLACK_SK = "agent:main:slack:dm:C0E2E:1700000000.0001"

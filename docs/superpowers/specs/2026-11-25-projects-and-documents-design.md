@@ -107,8 +107,10 @@ refetches once and then answers `PROJECT_NOT_FOUND` with `candidates`.
   `milestone` it creates one: `name` is required (else `BAD_ARGS`). With `milestone` (a
   name or UUID, resolved in the project through the directory `milestones` kind; a miss is
   `MILESTONE_NOT_FOUND` with `candidates`) it updates that milestone, and at least one of
-  `name`, `description` and `target_date` is required. `description: null` and
-  `target_date: null` clear the field on update. `target_date` is `YYYY-MM-DD` (the same
+  `name`, `description` and `target_date` is required. `target_date: null` clears the
+  date on update. Linear can't clear a milestone description (null and `""` leave it
+  unchanged, §7), so `description: null` or a blank one on update is `BAD_ARGS` with a
+  message, and nothing is written. `target_date` is `YYYY-MM-DD` (the same
   grammar C uses for `due_date`). Linear's duplicate-name refusal becomes
   `ALREADY_EXISTS` with Linear's message. Returns `milestone_id`, `name`,
   `target_date`, and `created: true | false`.
@@ -366,6 +368,17 @@ sync tools change to match.
   `health`: the project read `onTrack` and so did both updates. `projectUpdates(first: N,
   orderBy: createdAt)` returns the newest first (`first: 1` gave the second update), so
   `get` reads the newest N.
+- Settled (RET-166 probe on the test project's "ret-122 probe" milestone
+  `83641dcd-213d-4bfe-b442-9e500ec6d07c`, 2026-11-25): **`targetDate: null` clears the
+  date; `description: null` does not clear the description.** Before: description `null`,
+  targetDate `2026-12-31`. `projectMilestoneUpdate(id, input: {description: "x"})` →
+  description `"x"`. Then `input: {description: null, targetDate: null}` → description
+  still `"x"`, targetDate `null` (read back the same, updatedAt 22:06:17Z). Linear's own
+  schema says so: `ProjectMilestoneUpdateInput.description` is "An empty string or null
+  leaves the description unchanged", `targetDate` is "Null clears the target date". So
+  §1.1 was amended (controller ruling, 2026-11-25): the tool answers `description: null` (or blank) on update with `BAD_ARGS` and
+  a message, rather than a success that changed nothing. The probe milestone now has
+  description `"x"` and no target date.
 - The `Project` fields the `get` query reads (`status { name }`, `lead`, `targetDate`,
   `externalLinks`, `documents`, `projectMilestones`, `projectUpdates`): one live
   `linear_query` of the real `QUERY_*` constant before the task is marked done.

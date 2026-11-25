@@ -1,5 +1,5 @@
-"""linear_project ``get`` / ``post_update`` (RET-122 spec §1.1, §2, §3; RET-165) through the
-real registry.
+"""linear_project (RET-122 spec §1.1, §2, §3; RET-165 ``get`` / ``post_update``, RET-166
+``milestone`` / ``link``) through the real registry.
 
 ``FakeWorkspace`` (``ws``): RET-1 is the session issue SELF (project ``Hermes``,
 ``PROJECT``), RET-2 (``CHILD``) its child, OTH-9 (``OTHER``) unrelated and without a
@@ -322,6 +322,330 @@ def test_post_update_linear_failure_keeps_code_and_message(pin_ctx, ws, adapter,
     assert out == {"ok": False, "error": "INVALID_INPUT", "message": "body too long"}
 
 
+# -- milestone
+
+
+def _seed_milestones(ws, *names, project=PID):
+    rows = ws.milestones_rows.setdefault(project, [])
+    for n in names:
+        mid = f"ms-{n.lower()}"
+        rows.append({"id": mid, "name": n})
+        ws.milestone_meta[mid] = {"project": project, "description": None,
+                                  "targetDate": "2026-12-31"}
+
+
+def test_milestone_create_asks_then_creates(pin_ctx, ws, adapter):
+    """Q3: a milestone always asks, the session ticket's own project included; the first
+    pass writes nothing; the approved re-call creates once."""
+    args = {"action": "milestone", "name": " Beta ", "description": "Second cut",
+            "target_date": "2026-12-01"}
+    out = linear_project(dict(args))
+    assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED", out
+    assert _calls(ws, "milestone_create") == [] and ws.writes() == []
+    req = _request(adapter, args)
+    assert req.targets == [PID] and '\n- project "Hermes"\n' in req.message
+    out = _approve_and_rerun(adapter, args)
+    mid = ws.milestones_rows[PID][-1]["id"]
+    assert out == {"ok": True, "milestone_id": mid, "name": "Beta",
+                   "target_date": "2026-12-01", "created": True}
+    assert ws.writes() == [("milestone_create", (PID, "Beta", "Second cut", "2026-12-01"))]
+    # on create a null (or blank) description / target_date is simply left out
+    _settings(adapter, out_of_scope_writes="allow")
+    out = linear_project({"action": "milestone", "name": "Gamma", "description": None,
+                          "target_date": None})
+    assert out["ok"] is True and out["target_date"] is None, out
+    assert _calls(ws, "milestone_create")[-1] == (PID, "Gamma", None, None)
+    assert linear_project({"action": "milestone", "name": "Delta", "description": "  ",
+                           "target_date": ""})["ok"] is True
+    assert _calls(ws, "milestone_create")[-1] == (PID, "Delta", None, None)
+
+
+def test_milestone_new_name_resolves_after_create(pin_ctx, ws, adapter):
+    """The directory has no invalidate API: a name made after the project's milestones were
+    cached resolves through the directory's refetch-once on a miss."""
+    _seed_milestones(ws, "Alpha")
+    _settings(adapter, out_of_scope_writes="allow")
+    assert linear_project({"action": "milestone", "milestone": "Alpha",
+                           "name": "Alpha"})["ok"] is True  # caches [Alpha]
+    assert linear_project({"action": "milestone", "name": "Beta"})["created"] is True
+    out = linear_project({"action": "milestone", "milestone": "Beta",
+                          "target_date": "2027-01-15"})
+    assert out == {"ok": True, "milestone_id": ws.milestones_rows[PID][-1]["id"],
+                   "name": "Beta", "target_date": "2027-01-15", "created": False}
+    assert _calls(ws, "milestones") == [PID, PID]  # the miss refetched once
+    # a rename resolves by its new name the same way
+    assert linear_project({"action": "milestone", "milestone": "Alpha",
+                           "name": "Alpha 2"})["ok"] is True
+    assert linear_project({"action": "milestone", "milestone": "Alpha 2",
+                           "description": "d"})["ok"] is True
+
+
+@pytest.mark.parametrize("extra", [{}, {"name": ""}, {"name": "  "}, {"name": None},
+                                   {"name": 5}, {"description": "only a description"},
+                                   {"target_date": "2026-12-01"}])
+def test_milestone_create_requires_name(pin_ctx, ws, adapter, extra):
+    out = linear_project({"action": "milestone", **extra})
+    assert out == {"ok": False, "error": "BAD_ARGS"}
+    assert ws.calls == [] and _requests(adapter) == 0
+
+
+def test_milestone_update_by_name_and_uuid(pin_ctx, ws, adapter):
+    _seed_milestones(ws, "Alpha", "Beta")
+    args = {"action": "milestone", "milestone": "alpha", "name": "Alpha v2"}
+    out = linear_project(dict(args))
+    assert out["error"] == "APPROVAL_REQUIRED" and ws.writes() == []
+    assert _request(adapter, args).targets == [PID]
+    out = _approve_and_rerun(adapter, args)
+    assert out == {"ok": True, "milestone_id": "ms-alpha", "name": "Alpha v2",
+                   "target_date": "2026-12-31", "created": False}
+    _settings(adapter, out_of_scope_writes="allow")
+    out = linear_project({"action": "milestone", "milestone": " ms-beta ",
+                          "description": "Beta notes", "target_date": "2027-02-01"})
+    assert out["ok"] is True and out["milestone_id"] == "ms-beta", out
+    assert ws.writes() == [
+        ("milestone_update", ("ms-alpha", {"name": "Alpha v2"})),
+        ("milestone_update", ("ms-beta", {"description": "Beta notes",
+                                          "targetDate": "2027-02-01"}))]
+    # in another project, given by name
+    ws.add_project("proj-2", "Orion")
+    ws.milestones_rows["proj-2"] = [{"id": "ms-orion-alpha", "name": "Alpha"}]
+    ws.milestone_meta["ms-orion-alpha"] = {"project": "proj-2", "description": None,
+                                           "targetDate": None}
+    out = linear_project({"action": "milestone", "project": "Orion", "milestone": "Alpha",
+                          "name": "Orion Alpha"})
+    assert out["milestone_id"] == "ms-orion-alpha", out
+
+
+@pytest.mark.parametrize("extra", [{}, {"name": None}, {"name": ""}, {"name": "  "},
+                                   {"name": 3}, {"description": 3}, {"target_date": 3}])
+def test_milestone_update_needs_a_field(pin_ctx, ws, adapter, extra):
+    _seed_milestones(ws, "Alpha")
+    out = linear_project({"action": "milestone", "milestone": "Alpha", **extra})
+    assert out == {"ok": False, "error": "BAD_ARGS"}
+    assert ws.calls == [] and _requests(adapter) == 0
+
+
+@pytest.mark.parametrize("ref", ["", "  ", 5])
+def test_milestone_bad_ref(pin_ctx, ws, adapter, ref):
+    out = linear_project({"action": "milestone", "milestone": ref, "name": "x"})
+    assert out == {"ok": False, "error": "BAD_ARGS"}
+    assert ws.calls == []
+
+
+def test_milestone_update_null_clears(pin_ctx, ws, adapter, monkeypatch):
+    """``target_date: null`` (or the raw ``"null"`` Hermes coerces to ``None``) clears the
+    date: ``targetDate: None`` is sent. ``description: null`` can't clear: Linear leaves a
+    description unchanged on null or "" (RET-166 probe, spec §7), so it is ``BAD_ARGS``
+    with a message instead of a success that changed nothing."""
+    import copy
+
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry
+
+    _seed_milestones(ws, "Alpha")
+    _settings(adapter, out_of_scope_writes="allow")
+    real_get_schema = registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(
+        TOOL_SCHEMAS[name]) if name == TOOL else real_get_schema(name))
+    raw = {"action": "milestone", "milestone": "Alpha", "target_date": "null"}
+    coerced = coerce_tool_args(TOOL, copy.deepcopy(raw))
+    assert coerced["target_date"] is None
+    assert digest(TOOL, raw) == digest(TOOL, coerced)
+    out = linear_project(coerced)
+    assert out == {"ok": True, "milestone_id": "ms-alpha", "name": "Alpha",
+                   "target_date": None, "created": False}
+    assert ws.writes() == [("milestone_update", ("ms-alpha", {"targetDate": None}))]
+    assert ws.milestone_meta["ms-alpha"]["targetDate"] is None
+    for desc in (None, "", "  "):
+        out = linear_project({"action": "milestone", "milestone": "Alpha",
+                              "description": desc, "name": "Alpha"})
+        assert out["ok"] is False and out["error"] == "BAD_ARGS", desc
+        assert "description" in out["message"]
+    assert len(ws.writes()) == 1
+
+
+def test_milestone_not_found_candidates(pin_ctx, ws, adapter):
+    _seed_milestones(ws, "Alpha", "Beta")
+    out = linear_project({"action": "milestone", "milestone": "Gamma", "name": "x"})
+    assert out == {"ok": False, "error": "MILESTONE_NOT_FOUND",
+                   "candidates": [{"id": "ms-alpha", "name": "Alpha"},
+                                  {"id": "ms-beta", "name": "Beta"}]}
+    assert _calls(ws, "milestones") == [PID]  # fetched by this call, so no second fetch
+    # scoped to the project: Orion's milestones are not Hermes's
+    ws.add_project("proj-2", "Orion")
+    out = linear_project({"action": "milestone", "project": "Orion", "milestone": "Alpha",
+                          "name": "x"})
+    assert out == {"ok": False, "error": "MILESTONE_NOT_FOUND", "candidates": []}
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+@pytest.mark.parametrize("date", ["2026-W05-1", "2026-13-01", "2026-02-30", "20261201",
+                                  "2026-1-1", "2026-12-01T00:00", 20261201, True])
+def test_milestone_bad_target_date(pin_ctx, ws, adapter, date):
+    _seed_milestones(ws, "Alpha")
+    for args in ({"action": "milestone", "name": "New", "target_date": date},
+                 {"action": "milestone", "milestone": "Alpha", "target_date": date}):
+        assert linear_project(args) == {"ok": False, "error": "BAD_ARGS"}, args
+    assert ws.calls == [] and _requests(adapter) == 0
+
+
+def test_milestone_duplicate_name_already_exists(pin_ctx, ws, adapter, monkeypatch):
+    """Linear refuses a duplicate name only on write (after the gate): ``ALREADY_EXISTS``
+    with Linear's userPresentableMessage and the existing milestone's id."""
+    _seed_milestones(ws, "Alpha")
+    args = {"action": "milestone", "name": "Alpha"}
+    assert linear_project(dict(args))["error"] == "APPROVAL_REQUIRED"
+    out = _approve_and_rerun(adapter, args)
+    assert out == {"ok": False, "error": "ALREADY_EXISTS", "milestone_id": "ms-alpha",
+                   "message": "A project milestone called 'Alpha' already exists on this "
+                              "project."}
+    assert len(ws.milestones_rows[PID]) == 1
+    # a rename onto a taken name answers the same; without a detail, Linear's message
+    _settings(adapter, out_of_scope_writes="allow")
+    _seed_milestones(ws, "Beta")
+
+    async def taken(*a, **k):
+        raise LinearError("name not unique", code="INPUT_ERROR")
+
+    monkeypatch.setattr(ws, "milestone_update", taken)
+    out = linear_project({"action": "milestone", "milestone": "Beta", "name": "Alpha"})
+    assert out == {"ok": False, "error": "ALREADY_EXISTS", "milestone_id": "ms-alpha",
+                   "message": "name not unique"}
+
+    # any other Linear failure keeps its code and message
+    async def other(*a, **k):
+        raise LinearError("bad date", code="INPUT_ERROR", detail="Target date is invalid.")
+
+    monkeypatch.setattr(ws, "milestone_update", other)
+    out = linear_project({"action": "milestone", "milestone": "Beta", "name": "B"})
+    assert out == {"ok": False, "error": "INPUT_ERROR", "message": "Target date is invalid."}
+
+
+def test_milestone_and_link_outside(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    _settings(adapter, default_team="RET", default_project="Hermes",
+              outside_session_writes="deny")
+    for args in ({"action": "milestone", "name": "M"},
+                 {"action": "link", "url": "https://example.test/repo"}):
+        assert linear_project(dict(args)) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert ws.calls == [] and _requests(adapter) == 0
+    _settings(adapter, outside_session_writes="approve")
+    for args in ({"action": "milestone", "name": "M"},
+                 {"action": "link", "url": "https://example.test/repo"}):
+        assert linear_project(dict(args))["error"] == "APPROVAL_REQUIRED"
+        assert _request(adapter, args).targets == [PID]
+        assert _approve_and_rerun(adapter, args)["ok"] is True
+    assert [w[0] for w in ws.writes()] == ["milestone_create", "project_link_create"]
+    # a Linear call without its ticket is refused as post_update is
+    pin_ctx(issue=None)
+    for args in ({"action": "milestone", "name": "N", "project": "Hermes"},
+                 {"action": "link", "url": "https://x.test", "project": "Hermes"}):
+        assert linear_project(args) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+
+
+# -- link
+
+
+def test_link_asks_then_links(pin_ctx, ws, adapter):
+    args = {"action": "link", "url": " https://github.com/masha256/hermes-linear ",
+            "label": "repo"}
+    out = linear_project(dict(args))
+    assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED", out
+    assert _calls(ws, "project_link_create") == [] and ws.writes() == []
+    req = _request(adapter, args)
+    assert req.targets == [PID] and '\n- project "Hermes"\n' in req.message
+    out = _approve_and_rerun(adapter, args)
+    lid = ws.project_links[PID][-1]["id"]
+    assert out == {"ok": True, "link_id": lid}
+    assert ws.writes() == [("project_link_create",
+                            (PID, "https://github.com/masha256/hermes-linear", "repo"))]
+    # without a label (or a blank one) the client sends the URL as the label
+    _settings(adapter, out_of_scope_writes="allow")
+    for i, label in enumerate((None, "  ")):
+        url = f"http://example.test/other/{i}"
+        assert linear_project({"action": "link", "url": url, "label": label})["ok"] is True
+        assert _calls(ws, "project_link_create")[-1] == (PID, url, None)
+        assert ws.project_links[PID][-1]["label"] == url
+
+
+def test_link_duplicate_url_whitespace(pin_ctx, ws, adapter):
+    """Review Focus 4: a link with the same URL (both sides stripped, compared exactly) is
+    ``ALREADY_LINKED`` with its ``link_id`` before the gate: no request, no card, no write."""
+    ws.project_links[PID].append({"id": "link-ws", "label": "padded",
+                                  "url": "  https://example.test/padded\n"})
+    for url, lid in (("https://example.test/spec", "link-0"),
+                     ("\t https://example.test/spec \n", "link-0"),
+                     ("https://example.test/padded", "link-ws")):
+        out = linear_project({"action": "link", "url": url, "label": "again"})
+        assert out == {"ok": False, "error": "ALREADY_LINKED", "link_id": lid}, url
+    assert _requests(adapter) == 0 and ws.writes() == []
+    # outside, approve mode: still no card for a duplicate
+    pin_ctx(linear=False)
+    _settings(adapter, default_team="RET", default_project="Hermes",
+              outside_session_writes="approve")
+    out = linear_project({"action": "link", "url": "https://example.test/spec"})
+    assert out["error"] == "ALREADY_LINKED" and _requests(adapter) == 0
+    # exact: another case or a trailing slash is a different URL, which asks
+    pin_ctx()
+    for url in ("https://example.test/Spec", "https://example.test/spec/"):
+        assert linear_project({"action": "link", "url": url})["error"] == "APPROVAL_REQUIRED"
+    assert ws.writes() == []
+
+
+@pytest.mark.parametrize("url", ["javascript:x", "ftp://x", "http://", "https://",
+                                 "https://a b", "example.com", "mailto:a@b.test",
+                                 "", "  ", None, 5, "HTTPS://x.test"])
+def test_link_rejects_non_http(pin_ctx, ws, adapter, url):
+    out = linear_project({"action": "link", "url": url})
+    assert out == {"ok": False, "error": "BAD_ARGS"}
+    assert ws.calls == [] and _requests(adapter) == 0
+
+
+@pytest.mark.parametrize("label", [5, True, ["a"]])
+def test_link_bad_label(pin_ctx, ws, adapter, label):
+    out = linear_project({"action": "link", "url": "https://x.test", "label": label})
+    assert out == {"ok": False, "error": "BAD_ARGS"} and ws.calls == []
+
+
+def test_link_never_sends_initiative_or_release(pin_ctx, ws, adapter):
+    from hermes_linear import linear_client
+
+    _settings(adapter, out_of_scope_writes="allow")
+    assert linear_project({"action": "link", "url": "https://x.test/a",
+                           "label": "a"})["ok"] is True
+    assert _calls(ws, "project_link_create") == [(PID, "https://x.test/a", "a")]
+    q = linear_client.MUTATION_PROJECT_LINK_CREATE
+    assert "initiativeId" not in q and "releaseId" not in q
+    # neither is an argument of the tool, so neither can reach the client
+    props = TOOL_SCHEMAS[TOOL]["parameters"]["properties"]
+    assert not {"initiative", "initiativeId", "release", "releaseId"} & set(props)
+    for extra in ({"initiativeId": "i-1"}, {"release": "r-1"}):
+        out = linear_project({"action": "link", "url": "https://x.test/b", **extra})
+        assert out == {"ok": False, "error": "BAD_ARGS"}
+    assert len(_calls(ws, "project_link_create")) == 1
+
+
+def test_link_linear_failure_keeps_code_and_message(pin_ctx, ws, adapter, monkeypatch):
+    async def boom(*a, **k):
+        raise LinearError("url invalid", code="INVALID_INPUT", detail="URL is invalid.")
+
+    monkeypatch.setattr(ws, "project_link_create", boom)
+    _settings(adapter, out_of_scope_writes="allow")
+    out = linear_project({"action": "link", "url": "https://x.test/c"})
+    assert out == {"ok": False, "error": "INVALID_INPUT", "message": "URL is invalid."}
+
+
+def test_schema_describes_milestone_and_link():
+    """Task 3 review: the "not available yet" sentence is gone; milestone and link are
+    described with their refusals and the label default."""
+    s = TOOL_SCHEMAS[TOOL]["description"]
+    assert "not available yet" not in s
+    for want in ("milestone", "ALREADY_EXISTS", "MILESTONE_NOT_FOUND", "link",
+                 "ALREADY_LINKED", "label defaults to the URL", "YYYY-MM-DD"):
+        assert want in s, want
+    assert not hasattr(tools_project, "_NOT_YET")
+
+
 # -- argument shape
 
 
@@ -337,9 +661,15 @@ def test_post_update_linear_failure_keeps_code_and_message(pin_ctx, ws, adapter,
     {"action": "post_update", "body": "b", "updates": 3},
     {"action": "post_update", "body": "b", "name": "x"},
     {"action": "post_update", "body": "b", "target_date": "2026-12-01"},
-    # Task 4 implements these; until then they are BAD_ARGS
-    {"action": "milestone", "name": "M1"},
-    {"action": "link", "url": "https://example.test/repo"},
+    {"action": "milestone", "name": "M1", "body": "x"},
+    {"action": "milestone", "name": "M1", "url": "https://example.test/repo"},
+    {"action": "milestone", "name": "M1", "updates": 3},
+    {"action": "milestone", "name": "M1", "health": "on_track"},
+    {"action": "link", "url": "https://example.test/repo", "name": "repo"},
+    {"action": "link", "url": "https://example.test/repo", "target_date": "2026-12-01"},
+    {"action": "link", "url": "https://example.test/repo", "milestone": "Alpha"},
+    {"action": "link", "url": "https://example.test/repo", "initiative": "i-1"},
+    {"action": "link", "url": "https://example.test/repo", "releaseId": "r-1"},
 ])
 def test_foreign_arg_bad_args(pin_ctx, ws, adapter, args):
     assert linear_project(args) == {"ok": False, "error": "BAD_ARGS"}
@@ -349,6 +679,8 @@ def test_foreign_arg_bad_args(pin_ctx, ws, adapter, args):
 def test_null_foreign_arg_counts_as_absent(pin_ctx, ws):
     """As ``linear_document``: a null argument carries no input, so it is not foreign."""
     assert linear_project({"action": "get", "body": None, "target_date": None})["ok"] is True
+    assert linear_project({"action": "link", "url": "https://example.test/spec",
+                           "name": None, "target_date": None})["error"] == "ALREADY_LINKED"
 
 
 @pytest.mark.parametrize("args", [None, [], "get", 3])
