@@ -11,9 +11,12 @@ threads). No Hermes imports and no direct ``os.environ`` reads here.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 DEFAULT_LISTENER_HOST = "127.0.0.1"
 DEFAULT_LISTENER_PORT = 8650
@@ -155,6 +158,11 @@ def load_settings(
             f"invalid value for setting 'outside_session_writes': {raw_outside!r} "
             f"(expected one of {', '.join(OUTSIDE_MODES)})"
         )
+    default_team = _as_str(get_config("default_team", ""))
+    default_project = _as_str(get_config("default_project", ""))
+    if default_project and not default_team:
+        log.warning("linear: setting 'default_project' is ignored without 'default_team' "
+                    "(the project belongs to the default team)")
 
     return Settings(
         client_id=client_id,
@@ -169,8 +177,8 @@ def load_settings(
         listener_port=listener_port,
         out_of_scope_writes=out_of_scope_writes,
         outside_session_writes=outside_session_writes,
-        default_team=_as_str(get_config("default_team", "")),
-        default_project=_as_str(get_config("default_project", "")),
+        default_team=default_team,
+        default_project=default_project,
     )
 
 

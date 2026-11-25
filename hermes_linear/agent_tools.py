@@ -38,7 +38,6 @@ from .linear_client import LinearError
 
 log = logging.getLogger(__name__)
 
-PLATFORM = "linear"
 SCOPE_PARENT_DEPTH = 5  # parent levels walked by check_write_scope
 CYCLE_WALK_DEPTH = 50  # ancestor levels walked before a reparent; deeper fails closed
 RESOLVE_TIMEOUT_S = 5.0  # per-adapter turn lookup (pure in-memory/store work on the loop)
@@ -546,10 +545,17 @@ def _gated(tool: str, args: dict, ctx: ToolContext,
     store.put_request(ctx.session_key, dg, tool, [t["id"] for t in targets],
                       tool_approval.approval_message(tool, targets, args, dg,
                                                      outside=ctx.outside))
-    names = ", ".join(str(t.get("identifier") or t["id"]) for t in targets)
+    names = ", ".join(_target_name(t) for t in targets)
     text = tool_approval.REQUIRED_TEXT_OUTSIDE if ctx.outside else tool_approval.REQUIRED_TEXT
     return {"ok": False, "error": "APPROVAL_REQUIRED",
             "message": text.format(tool=tool, targets=names)}
+
+
+def _target_name(target: dict) -> str:
+    """A target as the ``APPROVAL_REQUIRED`` text names it: an issue by its identifier, a
+    destination as ``destination RET / Hermes`` or ``destination RET, no project``."""
+    name = str(target.get("identifier") or target["id"])
+    return f"destination {name}" if target.get("kind") == "destination" else name
 
 
 def _sealed(result: dict) -> dict:
@@ -721,21 +727,48 @@ def _parse_create(args: dict) -> dict:
 async def _outside_base(ctx: ToolContext, fields: dict) -> tuple[str, str | None]:
     """The base team and project of a create from outside a Linear session without a
     parent (RET-148 spec §3): ``default_team`` / ``default_project`` resolved through the
-    directory (misses refuse with candidates). Without ``default_team`` there is no base:
-    the ``team`` arg is required (``BAD_ARGS`` before any I/O) and ``default_project``,
-    which belongs to the default team, is not used."""
+    directory, each only when the create uses it. Without ``default_team`` there is no
+    base: the ``team`` arg is required (``BAD_ARGS`` before any I/O) and
+    ``default_project``, which belongs to the default team, is not used.
+
+    An explicit ``team`` arg wins: a ``default_team`` that resolves to nothing is then no
+    base (``("", None)``; the arg can't equal it, so R8 drops the project). The default
+    project is resolved only when the resulting team is the base and there is no
+    ``project`` arg. A default that is used and misses refuses with the directory's code
+    and candidates plus a ``message`` naming the setting."""
     settings = getattr(ctx.adapter, "_settings", None)
     team_ref = (getattr(settings, "default_team", "") or "").strip()
     project_ref = (getattr(settings, "default_project", "") or "").strip()
+    explicit_team = fields.get("team") is not None
     if not team_ref:
-        if fields.get("team") is None:
+        if not explicit_team:
             raise _Refusal("BAD_ARGS")
         return "", None  # the team arg replaces it; R8 then drops any base project
     names = directory.for_client(ctx.client)
-    team = await names.resolve("teams", "", team_ref, issue_fields._by_team)
-    project = (await names.resolve("projects", "", project_ref, issue_fields._by_name)
-               if project_ref else None)
-    return team["id"], project["id"] if project else None
+    try:
+        team = await names.resolve("teams", "", team_ref, issue_fields._by_team)
+    except _Refusal as exc:
+        if explicit_team:
+            return "", None  # never the base; the arg's own miss is blamed on the arg
+        raise _setting_miss(exc, "default_team", team_ref) from None
+    if not project_ref or "project" in fields:
+        return team["id"], None  # a project arg replaces the base project
+    if explicit_team:
+        arg = await names.resolve("teams", "", fields["team"], issue_fields._by_team)
+        if arg["id"] != team["id"]:
+            return team["id"], None  # R8: another team drops the base project
+    try:
+        project = await names.resolve("projects", "", project_ref, issue_fields._by_name)
+    except _Refusal as exc:
+        raise _setting_miss(exc, "default_project", project_ref) from None
+    return team["id"], project["id"]
+
+
+def _setting_miss(exc: _Refusal, setting: str, ref: str) -> _Refusal:
+    """A directory refusal for a configured default, its ``message`` naming the setting
+    (the agent passed nothing wrong)."""
+    what = "is ambiguous" if exc.code == "AMBIGUOUS" else "not found"
+    return _Refusal(exc.code, {**exc.extra, "message": f'{setting} "{ref}" {what}'})
 
 
 async def _outside_destination(ctx: ToolContext, team_id: str, project_id: str | None) -> None:
@@ -758,7 +791,7 @@ async def _outside_destination(ctx: ToolContext, team_id: str, project_id: str |
 
     where = await label("teams", team_id, "key")
     where += f" / {await label('projects', project_id, 'name')}" if project_id \
-        else " (no project)"
+        else ", no project"
     gate.record_target(tid, "destination", where)
 
 

@@ -577,7 +577,7 @@ async def test_e2e_outside_create_approve_writes_once(e2e_outside):
     assert len(h.notified) == 1
     desc = h.notified[0]["description"]
     assert desc.splitlines()[0] == f"Approve `{tool}` from outside a Linear session?"
-    assert '- destination "RET (no project)"' in desc and desc.endswith(f"digest: {d}")
+    assert '- destination "RET, no project"' in desc and desc.endswith(f"digest: {d}")
     assert store.request(SLACK_SK, d) is None
 
 

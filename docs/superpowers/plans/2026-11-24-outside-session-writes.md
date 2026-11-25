@@ -1,5 +1,7 @@
 # Writes from outside a Linear session — Implementation Plan
 
+> **Superseded at the rebase onto main (RET-121):** outside create now uses RET-121's base/directory (`team` / `project`, `issue_fields`); see the spec §3.
+
 Linear: RET-148
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

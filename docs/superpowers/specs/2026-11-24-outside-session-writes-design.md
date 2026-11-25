@@ -39,8 +39,8 @@ dataclass, validated in `load_settings` like `out_of_scope_writes`):
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `outside_session_writes` | string | `approve` | `approve`: every write from a non-Linear session asks a human in that chat first. `deny`: refuse (`NOT_LINEAR_SESSION`, today's behaviour). `allow`: write without asking. Case-insensitive; any other value is a `SettingsError`. |
-| `default_team` | string | `""` | Base team for `linear_issue_create` outside a session without a `parent`: UUID, key (`RET`) or name, resolved like RET-121's `team`. Empty: the call must pass `team`. |
-| `default_project` | string | `""` | Base project for the same case: UUID or name. Used only with `default_team` (it is that team's project; RET-121's R8 drops it when `team` names another team). Empty = no project. |
+| `default_team` | string | `""` | Base team for `linear_issue_create` outside a session without a `parent`: UUID, key (`RET`) or name, resolved like RET-121's `team`. Empty: the call must pass `team`. An explicit `team` arg wins; a bad value only matters when it is used (§3). |
+| `default_project` | string | `""` | Base project for the same case: UUID or name. Used only with `default_team` (it is that team's project; RET-121's R8 drops it when `team` names another team; set alone it is ignored with a logged warning). A `project` arg wins; a bad value only matters when it is used (§3). Empty = no project. |
 
 `out_of_scope_writes` keeps its meaning and only ever applies inside Linear sessions.
 
@@ -62,9 +62,10 @@ with these changes:
    nothing when team and project equal the base; outside, the base itself must be
    approved). `_create` records ONE target per create, `{"id":
    "destination:<team uuid>/<project uuid or ->", "kind": "destination", "identifier":
-   "<team key> / <project name>" or "<team key> (no project)"}`, rendered by RET-121's
+   "<team key> / <project name>" or "<team key>, no project"}`, rendered by RET-121's
    kind line as `- destination "RET / <project>"`, so the card names where the issue
-   lands. It covers the resulting team AND project, so an approved re-run whose
+   lands (the `APPROVAL_REQUIRED` text names it `destination RET, no project`, no nested
+   parentheses). It covers the resulting team AND project, so an approved re-run whose
    destination changed (a default moved, a project dropped) is `OUT_OF_SCOPE` with no
    write. With a `parent`, the parent issue and the destination are both targets.
 3. **Mode:** `_gated` reads `outside_session_writes` when `ctx.outside`, else
@@ -114,6 +115,14 @@ Outside, in order (one body, `agent_tools._create`):
    `AMBIGUOUS`). No `default_team` and no `team` arg → `BAD_ARGS` before any I/O. No
    `default_team` with a `team` arg: no base (so no project unless `project` is given;
    `default_project` belongs to the default team and is not used).
+   Each default is resolved only when it is used (review fix after the rebase): an
+   explicit `team` arg wins, so a `default_team` that resolves to nothing is then no base
+   (the arg can't equal it; R8 drops the project); `default_project` is resolved only when
+   there is no `project` arg and the resulting team is the default team. A default that
+   is used and misses refuses with the directory's code and `candidates` plus `message`
+   naming the setting (`default_team "NOPE" not found`). `project: null` on create is
+   absent (RET-121's parse), so it does use the default project. `load_settings` logs a
+   warning when `default_project` is set without `default_team`.
 3. `issue_fields.resolve` over the args against that base: `team` / `project` and every
    other RET-121 field (`assignee`, `delegate`, `priority`, `estimate`, `due_date`,
    `cycle`, `milestone`), with RET-121's refusals (`SELF_DELEGATION`, `ASSIGNEE_IS_APP`,
@@ -165,7 +174,8 @@ or session wrote; a footer there would stack on every edit).
 | `approve`, no session key | `OUT_OF_SCOPE` |
 | Approved create re-run whose destination changed | `OUT_OF_SCOPE`, nothing written |
 | Create: no parent, no `team`, no `default_team` | `BAD_ARGS` |
-| Create: unknown team / project (arg or default) | `TEAM_NOT_FOUND` / `PROJECT_NOT_FOUND` with `candidates` (RET-121) |
+| Create: unknown team / project arg | `TEAM_NOT_FOUND` / `PROJECT_NOT_FOUND` with `candidates` (RET-121) |
+| Create: unknown `default_team` / `default_project`, when used | the same code and `candidates`, plus `message` naming the setting (`default_team "NOPE" not found`). An explicit `team` / `project` arg wins, so a bad default only matters when the create uses it |
 | Create / update: `delegate` = this app, app `assignee` | `SELF_DELEGATION` / `ASSIGNEE_IS_APP`, no write, no request |
 | Session-only tool | `NOT_LINEAR_SESSION` |
 | Profile has no adapter | `NOT_CONNECTED` (unchanged) |

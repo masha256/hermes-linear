@@ -325,6 +325,7 @@ def test_outside_create_request_names_destination(pin_ctx, ws, adapter):
     out = linear_issue_create(dict(args))
     assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED", out
     assert "outside a Linear session" in out["message"] and "RET / Hermes" in out["message"]
+    assert "approval (destination RET / Hermes)." in out["message"]
     assert ws.writes() == [] and _requests(adapter) == 1
     req = adapter._store.request("sk", digest("linear_issue_create", args))
     assert req.targets == [f"destination:{TEAM}/{PROJECT['id']}"]
@@ -339,10 +340,12 @@ def test_outside_create_request_names_destination(pin_ctx, ws, adapter):
     assert adapter._store.request("sk", req.digest) is None  # consumed
     # without a project the destination is the team alone
     _outside_dest(adapter)
-    assert linear_issue_create({"title": "Loose"})["error"] == "APPROVAL_REQUIRED"
+    out = linear_issue_create({"title": "Loose"})
+    assert out["error"] == "APPROVAL_REQUIRED"
+    assert "approval (destination RET, no project)." in out["message"]  # no nested parens
     req = adapter._store.request("sk", digest("linear_issue_create", {"title": "Loose"}))
     assert req.targets == [f"destination:{TEAM}/-"]
-    assert '- destination "RET (no project)"' in req.message
+    assert '- destination "RET, no project"' in req.message
 
 
 def test_outside_create_base_destination_is_a_target(pin_ctx, ws, adapter):

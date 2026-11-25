@@ -50,7 +50,6 @@ from .questions import APPROVAL_PENDING_TEXT, PENDING_NOTICE
 
 log = logging.getLogger(__name__)
 
-PLATFORM = "linear"
 _SILENT_TOOLS = frozenset({"clarify"})  # rendered as an elicitation by outbound.clarify
 _BRIDGE_TOOL = "tool_call"  # tools/tool_search_catalog.py TOOL_CALL_NAME
 

@@ -385,10 +385,61 @@ def test_outside_create_unknown_project_or_default_refused_with_candidates(pin_c
         out = linear_issue_create({"title": "x", "team": "RET", "project": "No such project"})
         assert out["error"] == "PROJECT_NOT_FOUND" and out["candidates"], (mode, out)
     outside(adapter, "approve", default_team="RET", default_project="Nowhere")
-    assert linear_issue_create({"title": "x"})["error"] == "PROJECT_NOT_FOUND"
+    out = linear_issue_create({"title": "x"})
+    assert out["error"] == "PROJECT_NOT_FOUND" and out["candidates"]
+    assert out["message"] == 'default_project "Nowhere" not found'  # the setting is named
+    # the base team named explicitly: the bad default project is still the base's
+    out = linear_issue_create({"title": "x", "team": "RET"})
+    assert out["error"] == "PROJECT_NOT_FOUND"
+    assert out["message"] == 'default_project "Nowhere" not found'
     outside(adapter, "approve", default_team="NOPE")
     out = linear_issue_create({"title": "x"})
     assert out["error"] == "TEAM_NOT_FOUND" and out["candidates"]
+    assert out["message"] == 'default_team "NOPE" not found'
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_outside_create_explicit_team_wins_over_bad_default_team(pin_ctx, ws, adapter,
+                                                                 origin):
+    """Review fix: a default_team that resolves to nothing only matters when it is used.
+    With a ``team`` arg it is never the base, so the create goes ahead (R8: no project)."""
+    pin_ctx(linear=False)
+    outside(adapter, default_team="NOPE", default_project="Nowhere")
+    out = linear_issue_create({"title": "x", "team": "RET"})
+    assert out["ok"] is True, out
+    stored = ws.issues[out["issue"]["id"]]
+    assert stored["team"] == TEAM and stored["project"] is None
+    out = linear_issue_create({"title": "y", "team": "OTH", "project": "Elsewhere"})
+    assert out["ok"] is True, out
+    assert ws.issues[out["issue"]["id"]]["project"] == OTHER_PROJECT
+    # the agent's own bad team is still blamed on the arg, without a setting message
+    miss = linear_issue_create({"title": "z", "team": "ALSO-NOPE"})
+    assert miss["error"] == "TEAM_NOT_FOUND" and "message" not in miss
+
+
+@pytest.mark.parametrize("args", [{"team": "OTH"}, {"project": "Elsewhere"}])
+def test_outside_create_bad_default_project_unused_when_overridden(pin_ctx, ws, adapter,
+                                                                    origin, args):
+    """Review fix: default_project is resolved only when the result keeps the base team
+    and no ``project`` arg: another team drops it (R8), a ``project`` arg replaces it."""
+    pin_ctx(linear=False)
+    outside(adapter, default_team="RET", default_project="Nowhere")
+    out = linear_issue_create({"title": "x", **args})
+    assert out["ok"] is True, out
+    stored = ws.issues[out["issue"]["id"]]
+    want_team = OTHER_TEAM if args.get("team") == "OTH" else TEAM
+    want_project = OTHER_PROJECT if args.get("project") == "Elsewhere" else None
+    assert stored["team"] == want_team and stored["project"] == want_project
+
+
+def test_outside_create_project_null_uses_default_project(pin_ctx, ws, adapter):
+    """``project: null`` on create is absent (``issue_fields.parse`` drops it, RET-121), so
+    the default project IS used: a bad one refuses naming the setting, nothing written."""
+    pin_ctx(linear=False)
+    outside(adapter, "approve", default_team="RET", default_project="Nowhere")
+    out = linear_issue_create({"title": "x", "project": None})
+    assert out["error"] == "PROJECT_NOT_FOUND" and out["candidates"]
+    assert out["message"] == 'default_project "Nowhere" not found'
     assert ws.writes() == [] and _requests(adapter) == 0
 
 

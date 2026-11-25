@@ -118,6 +118,24 @@ def test_default_team_and_project_stripped_default_empty():
     assert s.default_project == "hermes linear test project"
 
 
+def test_default_project_without_default_team_warns(caplog):
+    """RET-148 review minor 3: default_project alone is never used (it belongs to the
+    default team), so loading warns once naming both settings, and does not fail."""
+    get_config, get_secret = _getters({**REQUIRED_CONFIG, "default_project": "Hermes"})
+    with caplog.at_level("WARNING", logger="hermes_linear.settings"):
+        s = load_settings(get_config, get_secret, {})
+    assert s.default_project == "Hermes" and s.default_team == ""
+    [rec] = [r for r in caplog.records if r.name == "hermes_linear.settings"]
+    assert rec.levelname == "WARNING"
+    assert "default_project" in rec.getMessage() and "default_team" in rec.getMessage()
+    caplog.clear()
+    get_config, get_secret = _getters({**REQUIRED_CONFIG, "default_team": "RET",
+                                       "default_project": "Hermes"})
+    with caplog.at_level("WARNING", logger="hermes_linear.settings"):
+        load_settings(get_config, get_secret, {})
+    assert not [r for r in caplog.records if r.name == "hermes_linear.settings"]
+
+
 def test_load_settings_explicit_values():
     get_config, get_secret = _getters(
         config={
