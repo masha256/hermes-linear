@@ -248,8 +248,10 @@ the test project, plus the live test's own objects.
 - The `Project` fields the `get` query reads (`status { name }`, `lead`, `targetDate`,
   `externalLinks`, `documents`, `projectMilestones`, `projectUpdates`): one live
   `linear_query` of the real `QUERY_*` constant before the task is marked done.
-- `documents(filter: {slugId: {eq: …}})` (or `document(id:)` with a slugId) resolves a
-  slug id: probe before the `get` parser is written.
+- Settled in the brainstorm: `document(id:)` accepts a slug id as well as a UUID (probed:
+  `document(id: "dd7c3ea51183")` returns the probe document), so `get` / `update` pass
+  the UUID or the URL's last `-` segment straight to it. `Project.status { name }`,
+  `lead`, `targetDate`, `health` and `documents` read fine as the app.
 
 ## Out of scope
 
