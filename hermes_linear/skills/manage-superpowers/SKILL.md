@@ -31,7 +31,7 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The fi
 - `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`, `remove_labels?`,
   `parent?`, `project?`, create's others but `team`): `null` clears; `parent: ""` detaches.
 - `linear_comment` (`id`, `body`, `edit_marker?`, `reply_to?`: a comment UUID's thread, `resolve?`).
-- `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
+- `linear_sync_spec` (`path`, `summary`), `linear_sync_plan` (`path`, `summary`): `path` ABSOLUTE.
 - `linear_task_state` (`id`, `state`, `summary?`, `question?`, `blocked_by?`): states in SDD below.
 - `linear_query` (`query`, `variables?`): read-only GraphQL; a result over 50,000 chars is refused.
 - `linear_attach` (`id` + `path` or `url`, `title?`; or `path` + `embed: true` → `markdown`).
@@ -71,15 +71,14 @@ session (Slack, CLI, cron) these follow `outside_session_writes` and ask in that
 
 1. `linear_issue_get` the session ticket: its identifier, team (key: `RET-81` → `RET`), project.
 2. Framework: select via `clarify`; the only choice is `superpowers`.
-3. Repo: a GitHub link among the project's links (`externalLinks`, step 1) is a candidate;
-   the link labelled `repo` wins among several. Offer the result as a select (one repo is
-   still confirmed). With no GitHub link, ask in the ticket (select of known local clones plus
-   "Other"), then add it as a project link labelled `repo` with `linear_project` `link` (asks once).
+3. Repo: a GitHub link among the project's links (`externalLinks`, step 1) is a candidate; the
+   link labelled `repo` wins among several. Offer it as a select (one repo is still confirmed).
+   With no GitHub link, ask in the ticket (select of known local clones plus "Other"), then add
+   its https URL as a project link labelled `repo` (`linear_project` `link`, asks once).
 4. Find a clone whose `origin` matches (workspace, then `~/git/*`); else clone to `~/git/<name>`.
 5. Branch `<identifier lowercase>-<slug>` (e.g. `ret-95-secret-reload`), worked in
    `.worktrees/<branch>`; load `superpowers:using-git-worktrees` for the mechanics.
 6. Commit `.hermes-linear.yaml` at the repo root with real values:
-
    ```yaml
    framework: superpowers
    linear:
@@ -87,7 +86,6 @@ session (Slack, CLI, cron) these follow `outside_session_writes` and ask in that
      project: <project name>
    repo: <GitHub URL chosen in step 3>
    ```
-
    It holds only what the documents do not record; it never changes as work goes on. Later
    sessions on a repo with the file skip setup but still make the sub-project branch and worktree.
 
@@ -97,16 +95,18 @@ session (Slack, CLI, cron) these follow `outside_session_writes` and ask in that
 choices and design-section approvals are selects. No visual companion (it can't work in Linear).
 
 **Spec.** Header line `Linear: <session ticket ID>` (before the first `## ` heading). Commit, then
-`linear_sync_spec` (absolute path). Review gate: a select; each change: edit → commit → sync.
+`linear_sync_spec` (absolute path; `summary`, a few sentences for the description: what it builds
+and the key decisions). Review gate: a select; review reads the `Spec:` document, but answers stay in
+the ticket thread (comments on documents don't reach the session). Each change: edit → commit → sync.
 
-**Plan.** Load `superpowers:writing-plans`. Header line `Linear: <ID>`; tasks keep the heading form
-`### Task N: <name>`. Commit, then `linear_sync_plan` (absolute path). It writes the plan comment
-(header and task list) and one `T<n> · <name>` sub-ticket per task (description: the whole task
-section), and writes the IDs back into the headings (`### Task N: <name> — <ID>`). Humans' and Done
-tickets are untouched. By result: `file_changed: true` → commit the plan (the IDs are now in the
-headings); `file_conflict: true` → the file changed during the sync, re-read and sync again;
-`file_error` → IDs not written, fix and re-sync. Plan approval is one select that includes the
-execution method (subagent-driven or inline). A later plan change: edit, commit, re-sync, commit again.
+**Plan.** Load `superpowers:writing-plans`. Header `Linear: <ID>`; task headings `### Task N: <name>`.
+Commit, then `linear_sync_plan` (absolute path; `summary` as for the spec, plus the task count and
+execution method). It makes a `T<n> · <name>` sub-ticket per task (description: its section), puts
+the file in a `Plan:` document, the task list under the description's `---` bar and the IDs into the
+headings (`### Task N: <name> — <ID>`); humans' and Done tickets are untouched. By result:
+`file_changed: true` → commit the plan; `file_conflict: true` → changed mid-sync: re-read, re-sync;
+`file_error` → IDs not written, fix and re-sync. Approval: one select (review reads the `Plan:`
+document) with the execution method (subagent-driven or inline). Later: edit, commit, re-sync, commit.
 
 **Implementation.** Load `superpowers:subagent-driven-development`. Ledger line 1 stays its identity
 line, line 2 is `Linear: <ID>`; each task's entry names its sub-ticket, and commit messages carry the
@@ -138,11 +138,11 @@ umbrella to delegate it to the app (never via other Linear tools or MCP servers;
 
 ## Rules
 
-- Ticket descriptions and the plan comment are written only by the sync tools: fix, commit, re-sync.
-- On a sync failure, keep working (git holds everything). Mark the step `unsynced
-  (<code>)` (in the thread before the ledger exists, then in the ledger); retry at the next
-  sync point and before any approval. Never ask to approve an unsynced spec or plan; ask
-  (select) "Linear sync failed (<code>); retry now or approve from the file link?".
+- Ticket descriptions and the `Spec:` / `Plan:` documents are written only by the sync tools: fix, commit, re-sync.
+- On a sync failure, keep working (git holds everything). Mark the step `unsynced (<code>)` (in the
+  thread before the ledger exists, then in the ledger); retry at the next sync point and before any
+  approval. Never ask to approve an unsynced spec or plan; ask (select) "Linear sync failed
+  (<code>); retry now or approve from the file link?".
 - Edits made in Linear are not synced back. A deleted or canceled sub-ticket whose
   task is still in the plan is recreated on the next plan sync; ask whether to drop it.
 - `T<n> · <name>` task sub-tickets are never delegated (the plugin declines): all SDD work

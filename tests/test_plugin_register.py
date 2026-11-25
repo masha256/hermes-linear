@@ -414,6 +414,25 @@ def test_skill_has_a_fallback_when_superpowers_is_missing():
     assert text.index("**Without superpowers**") < text.index("## Calling the tools")
 
 
+def test_skill_sync_stages_pass_summary_and_read_documents():
+    """RET-169 (spec §6.6): both sync stages pass `summary`; review reads the documents but
+    answers stay in the ticket thread; the plan comment is gone from the skill."""
+    text = SKILL_MD.read_text()
+    spec = text.partition("**Spec.**")[2].split("\n\n", 1)[0]
+    plan = text.partition("**Plan.**")[2].split("\n\n", 1)[0]
+    for stage in (spec, plan):
+        assert "summary" in stage
+    assert "`Spec:`" in spec and "`Plan:`" in plan
+    assert "task count" in plan and "execution method" in plan
+    assert "thread" in spec or "thread" in plan
+    assert "plan comment" not in text
+    assert "`linear_sync_spec` (`path`, `summary`)" in text
+    assert "`linear_sync_plan` (`path`, `summary`)" in text
+    assert ("Ticket descriptions and the `Spec:` / `Plan:` documents are written only by the "
+            "sync tools: fix, commit, re-sync.") in text
+    assert "https" in text.partition("## Setup")[2].split("\n4. ", 1)[0]  # step 3
+
+
 def test_skill_finish_links_pr():
     text = SKILL_MD.read_text()
     _, _, rest = text.partition("**Finish.**")

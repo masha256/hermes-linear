@@ -364,6 +364,15 @@ sync tools change to match.
 
 ## 7. Verify during implementation
 
+- Settled (RET-169, Task 7): the plan sync's order of writes. The document lookup (and so
+  `AMBIGUOUS`) runs before any write; the `Plan:` document is then written **after** the
+  sub-tickets, not first as §6.5 lists it, because its content is the file with every ticket
+  ID written back, and on a first sync new tasks have no ID until their sub-ticket exists.
+  Writing it first would leave the IDs out and rewrite it on the next identical run. Order:
+  lookup, sub-tickets, document, description, old comment. A failure after the sub-tickets
+  returns `document_id` (when written) with `tasks` and `created`; a re-run adopts the
+  sub-tickets by title and finishes. The description cut (§6.3) keeps whole task lines and
+  ends the list with `- … <k> more tasks in the plan document`; only then is the summary cut.
 - Settled (RET-165 probe in the test project, 2026-11-25): a `projectUpdateCreate` without
   `health` keeps the project's current health, and the new update itself reads back with
   that health. An update with `onTrack` on a project with no health, then one without
