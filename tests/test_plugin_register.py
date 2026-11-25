@@ -130,6 +130,42 @@ def test_register_platform_kwargs(ctx):
     assert entry.name == "linear"
 
 
+def test_register_platform_dashboard_card(ctx):
+    """Channels-page card metadata (web dashboard + Desktop): RET-114."""
+    kw = ctx.platforms[0]
+    assert kw["dashboard_env_vars"] == ("LINEAR_CLIENT_SECRET", "LINEAR_WEBHOOK_SECRET",
+                                        "LINEAR_ALLOWED_USERS")
+    assert kw["docs_url"] == "https://github.com/masha256/hermes-linear#web-dashboard"
+    desc = kw["dashboard_description"]
+    # client_id is a plugin setting, not an env var: the card must say where it goes.
+    assert "client_id" in desc and "plugins.entries.linear.settings" in desc
+    assert "hermes linear setup" in desc
+    # The card's "configured" verdict stays on the two required secrets.
+    assert "dashboard_required_env" not in kw
+
+
+def test_dashboard_card_through_real_catalog_builder(ctx):
+    """The card Hermes builds from our PlatformEntry. Known coupling: calls Hermes's private
+    ``hermes_cli.web_server_messaging._build_catalog_entry`` (the one function the Channels
+    page catalog runs per platform); update here if Hermes renames it."""
+    builder = pytest.importorskip("hermes_cli.web_server_messaging")._build_catalog_entry
+    entry = PlatformEntry(source="plugin", plugin_name="linear", **ctx.platforms[0])
+    card = builder("linear", entry)
+    assert card["name"] == "Linear"
+    assert card["description"] == plugin.DASHBOARD_DESCRIPTION
+    assert card["docs_url"] == plugin.DOCS_URL
+    assert card["env_vars"][:3] == plugin.DASHBOARD_ENV_VARS
+    # Hermes hides *_ALLOW_ALL_USERS from setup forms; the card must not offer it.
+    assert "LINEAR_ALLOW_ALL_USERS" not in card["env_vars"]
+    assert card["required_env"] == ("LINEAR_CLIENT_SECRET", "LINEAR_WEBHOOK_SECRET")
+
+
+def test_readme_has_web_dashboard_section():
+    """``DOCS_URL`` points at this README anchor."""
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "\n## Web dashboard\n" in text
+
+
 def test_linear_tool_progress_defaults_off_real_resolver(ctx):
     from gateway.display_config import resolve_display_setting
 
@@ -343,6 +379,20 @@ def test_skill_body_is_a_short_overlay_naming_every_tool():
     assert "tool_describe" in text and "tool_call" in text
     for stage in ("brainstorming", "writing-plans", "subagent-driven-development"):
         assert f"superpowers:{stage}" in text, stage
+
+
+def test_skill_has_a_fallback_when_superpowers_is_missing():
+    """RET-130: superpowers is optional. When a stage skill isn't found the overlay must say
+    what to do (tell the thread, skip the spec/plan/SDD stages, work with the tools) instead
+    of leaving the agent to improvise."""
+    text = SKILL_MD.read_text()
+    _, marker, rest = text.partition("**Without superpowers**")
+    assert marker, "no **Without superpowers** paragraph"
+    para = rest.split("\n\n", 1)[0]
+    assert "not found" in para
+    assert "Setup" in para and "Per-stage" in para
+    assert "Questions and approvals" in para
+    assert text.index("**Without superpowers**") < text.index("## Calling the tools")
 
 
 def test_skill_finish_links_pr():

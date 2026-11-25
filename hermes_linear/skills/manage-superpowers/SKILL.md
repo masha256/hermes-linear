@@ -5,12 +5,15 @@ description: Use when a repo has .hermes-linear.yaml or ticket says so.
 
 # Manage with hermes-linear (superpowers through Linear)
 
-Load this when a delegated Linear ticket says "manage with hermes-linear", or when the
-repo you work in has `.hermes-linear.yaml` at its root. It runs the superpowers workflow
-(brainstorm → spec → plan → subagent-driven development) inside the ticket. It is an
-overlay: at each stage, load `superpowers:<stage>` and follow it, then apply the differences
-below. Never restate or edit superpowers itself. Git is the source of truth; Linear holds
-rendered copies that link back to the committed files.
+Load this when a delegated Linear ticket says "manage with hermes-linear", or when the repo you
+work in has `.hermes-linear.yaml` at its root. It runs the superpowers workflow (brainstorm →
+spec → plan → subagent-driven development) inside the ticket. It is an overlay: at each stage,
+load `superpowers:<stage>` and follow it, then apply the differences below. Never restate or edit
+superpowers itself. Git is the source of truth; Linear holds rendered copies of the files.
+
+**Without superpowers** (`superpowers:<stage>` not found): say once in the thread that it isn't
+installed (install it for the full flow): no spec → plan → SDD, no task sub-tickets. Skip Setup and
+Per-stage differences; work the ticket directly with the tools, per Questions and approvals.
 
 ## Calling the tools
 
@@ -29,8 +32,7 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The th
   `parent?`, `project?`, create's others but `team`): `null` clears; `parent: ""` detaches.
 - `linear_comment` (`id`, `body`, `edit_marker?`, `reply_to?`: a comment UUID's thread, `resolve?`).
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
-- `linear_task_state` (`id`, `state`, `summary?`, `question?`, `blocked_by?`); `state` is one of
-  `in_progress|in_review|done|blocked|unblocked`.
+- `linear_task_state` (`id`, `state`, `summary?`, `question?`, `blocked_by?`): states in SDD below.
 - `linear_query` (`query`, `variables?`): read-only GraphQL; a result over 50,000 chars is refused.
 - `linear_attach` (`id` + `path` or `url`, `title?`; or `path` + `embed: true` → `markdown`).
 - `linear_session_link` (`url`, `label?`): show a link (the PR) on this turn's agent session.
@@ -59,8 +61,7 @@ that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `line
   same turn (its pre-approval ends with it, no second prompt); on `: denied` don't run it.
 - Out-of-scope write `BLOCKED: …`: timed out → pending in Linear, end the turn; denied: no retry.
   On ``Answer to approval for `<tool>` call <digest>: approved`` re-run the identical call now.
-- Answers count only when given in the ticket thread. An answer from Slack, the CLI or
-  any other channel does not approve or unblock anything; ask again in the ticket.
+- Answers count only in the ticket thread; one from Slack, the CLI etc. approves or unblocks nothing.
 
 ## Setup (first session on a repo, or no `.hermes-linear.yaml` yet)
 
@@ -88,8 +89,8 @@ that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `line
 
 ## Per-stage differences
 
-**Brainstorm.** Load `superpowers:brainstorming`; no visual companion (it can't run in Linear).
-One question per thread turn; multiple-choice questions and design-section approvals are selects.
+**Brainstorm.** Load `superpowers:brainstorming`. Each question is a turn in the ticket thread;
+choices and design-section approvals are selects. No visual companion (it can't work in Linear).
 
 **Spec.** Put a whole line `Linear: <session ticket ID>` in the spec's header (before
 the first `## ` heading). Commit, then `linear_sync_spec` with the spec's absolute
@@ -99,10 +100,9 @@ path. The spec review gate is a select. Each requested change: edit → commit �
 heading form `### Task N: <name>`. Commit, then `linear_sync_plan` (absolute path). It
 writes the plan comment (header and task list) and one `T<n> · <name>` sub-ticket per
 task (description: the whole task section), and writes the IDs back into the headings
-(`### Task N: <name> — <ID>`). Humans' and Done tickets are untouched. By result:
-- `file_changed: true`: commit the plan (the IDs are now in the headings);
-- `file_conflict: true`: the file changed during the sync; re-read and sync again;
-- `file_error`: the IDs were not written; fix the cause and sync again.
+(`### Task N: <name> — <ID>`). Humans' and Done tickets are untouched. By result: `file_changed:
+true` → commit the plan (the IDs are now in the headings); `file_conflict: true` → the file
+changed during the sync, re-read and sync again; `file_error` → IDs not written, fix and re-sync.
 
 Plan approval is one select that includes the execution method (subagent-driven or
 inline). A later plan change: edit, commit, `linear_sync_plan`, commit again.
@@ -113,9 +113,9 @@ names its sub-ticket, and commit messages carry the sub-ticket ID. Task progress
 on the sub-tickets; the project thread gets only stage changes, stop points and
 questions (a turn that only moves a task along ends with a one-line reply). Then:
 - dispatching a task's implementer: `linear_task_state(id, "in_progress")`; its review: `in_review`;
-- a fix round: back to `in_progress` (then `in_review`); `linear_comment` findings on the sub-ticket;
-- the clean review: `done` with `summary` (commits, test result, review verdict, number
-  of fix rounds, deferred minors as a `- [ ]` checklist);
+- a fix round: back to `in_progress` (then `in_review`), plus a `linear_comment` on the sub-ticket
+  with the findings being fixed; the clean review: `done` with `summary` (commits, test result,
+  review verdict, number of fix rounds, deferred minors as a `- [ ]` checklist);
 - anything that needs the user: `blocked` with `question` (it posts the question; don't repeat
   it through `clarify`), then end the turn or go on only with tasks that don't depend on the
   answer; when it arrives in the thread: `unblocked`. A task waiting on another task: `blocked`
@@ -138,7 +138,7 @@ umbrella to delegate it to the app (never via other Linear tools or MCP servers;
 
 ## Rules
 
-- Ticket descriptions and the plan comment are written only by the syncs: fix the file, commit, sync.
+- Ticket descriptions and the plan comment are written only by the sync tools: fix, commit, re-sync.
 - On a sync failure, keep working (git holds everything). Mark the step `unsynced
   (<code>)` (in the thread before the ledger exists, then in the ledger); retry at the next
   sync point and before any approval. Never ask to approve an unsynced spec or plan; ask
