@@ -39,7 +39,7 @@ Linear: RET-122
 
 ---
 
-### Task 1: Client calls, `created_documents`, `documents` on `linear_issue_get`
+### Task 1: Client calls, `created_documents`, `documents` on `linear_issue_get` — RET-163
 
 **Files:**
 - Modify: `hermes_linear/linear_client.py` (new queries/mutations; `QUERY_ISSUE_DETAILS` gains `documents { nodes { id title url } }`)
@@ -67,7 +67,7 @@ Linear: RET-122
 - [ ] **Step 4: Run** the full suite — expected: all pass.
 - [ ] **Step 5: Commit** `feat: client calls for documents and projects, created_documents store (<sub-ticket>)`.
 
-### Task 2: `linear_document`
+### Task 2: `linear_document` — RET-164
 
 **Files:**
 - Create: `hermes_linear/tools_document.py`
@@ -86,7 +86,7 @@ Linear: RET-122
 - [ ] **Step 4: Run** the full suite and `hermes plugins validate .` — expected: all pass, private-import list unchanged.
 - [ ] **Step 5: Commit** `feat: linear_document tool (<sub-ticket>)`.
 
-### Task 3: `linear_project` — `get` and `post_update`
+### Task 3: `linear_project` — `get` and `post_update` — RET-165
 
 **Files:**
 - Create: `hermes_linear/tools_project.py`
@@ -104,7 +104,7 @@ Linear: RET-122
 - [ ] **Step 4: Run** the full suite and `hermes plugins validate .` — expected: pass.
 - [ ] **Step 5: Commit** `feat: linear_project get and post_update (<sub-ticket>)`.
 
-### Task 4: `linear_project` — `milestone` and `link`
+### Task 4: `linear_project` — `milestone` and `link` — RET-166
 
 **Files:**
 - Modify: `hermes_linear/tools_project.py`
@@ -120,7 +120,7 @@ Linear: RET-122
 - [ ] **Step 4: Run** the full suite — expected: pass.
 - [ ] **Step 5: Commit** `feat: linear_project milestones and links (<sub-ticket>)`.
 
-### Task 5: README, skill text, final checks
+### Task 5: README, skill text, final checks — RET-167
 
 **Files:**
 - Modify: `README.md` (tool table rows; behaviour table: document scope, project writes always ask, `created_documents`), `hermes_linear/skills/manage-superpowers/SKILL.md` (tool count "fifteen"; out-of-scope sentence names `linear_document` and says `linear_project` writes always ask; re-run note: `post_update` posts again; setup step 3: "add it with `linear_project` `link` (asks once)" replaces "tools can't edit projects"), the spec's "verify during implementation" §6 (mark each item settled with its evidence)
