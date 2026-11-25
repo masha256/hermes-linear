@@ -135,7 +135,7 @@ Linear: RET-122
 - [ ] **Step 2: Run** `.venv/bin/pytest -q` and `hermes plugins validate .` — expected: all pass; report the counts.
 - [ ] **Step 3: Commit** `docs: projects and documents in README and skill (<sub-ticket>)`.
 
-### Task 6: `linear_sync_spec` writes a `Spec:` document and the spec part of the description
+### Task 6: `linear_sync_spec` writes a `Spec:` document and the spec part of the description — RET-168
 
 **Files:**
 - Modify: `hermes_linear/sync.py` (document and description rendering), `hermes_linear/agent_tools.py` (`_parse_sync_spec`, `_sync_spec`, the `linear_sync_spec` schema), `hermes_linear/linear_client.py` (`documents_on` rows gain `creator_id`; `QUERY_ISSUE_GET` untouched — read the description through the existing `issue_get` result)
@@ -159,7 +159,7 @@ Linear: RET-122
 - [ ] **Step 4: Run** the full suite — expected: pass.
 - [ ] **Step 5: Commit** `feat: linear_sync_spec writes a Spec document and a summary description (<sub-ticket>)`.
 
-### Task 7: `linear_sync_plan` writes a `Plan:` document and the plan part; plan comment migrated; docs
+### Task 7: `linear_sync_plan` writes a `Plan:` document and the plan part; plan comment migrated; docs — RET-169
 
 **Files:**
 - Modify: `hermes_linear/sync.py` (`plan_part`; `plan_comment` removed), `hermes_linear/agent_tools.py` (`_parse_sync_plan`, `_sync_plan`, schema), `README.md`, `hermes_linear/skills/manage-superpowers/SKILL.md` (Spec and Plan stages pass `summary`; review reads the documents; the Rules line), `docs/superpowers/specs/2026-11-25-projects-and-documents-design.md` §7 (mark settled items)
