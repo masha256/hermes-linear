@@ -3,6 +3,8 @@
 Linear: RET-122
 
 Status: approved in the RET-122 thread (Q1–Q4 and design sections 1–2), 2026-11-25.
+Amended the same day: Q2 reopened during implementation (Q2', Q2a, Q2b and design
+section 3, all approved), which adds §6.
 Sub-project D, the last one, of the RET-118 umbrella. It builds on A's approval path (RET-119,
 `docs/superpowers/specs/2026-11-23-out-of-scope-approval-design.md`), B's tool modules
 (RET-120), C's directory and destination targets (RET-121,
@@ -18,6 +20,8 @@ in-scope issue runs with no prompt. Every project-level write asks through A's A
 
 Success: none of these needs `linear_query` plus a raw API call any more, and the
 manage-superpowers setup can add the project's `repo` link itself, with one approval click.
+Specs and plans read as Linear documents on their ticket, and the description is a short
+summary linking to them (§6).
 
 Constraints: public Hermes plugin API only, no core changes; tools never raise; every
 write is attributed to the app.
@@ -27,7 +31,9 @@ write is attributed to the app.
 | # | Question | Decision |
 |---|----------|----------|
 | Q1 | Ship `linear_mutate`? | **No.** D ships typed tools; `linear_query` stays the generic read. A typed tool is added when a real gap shows up. |
-| Q2 | Can `linear_sync_spec` write to a Linear document? | **No.** The spec stays in the ticket description. `linear_document` is a plain tool for documents the agent writes on purpose. The sync tools do not change. |
+| Q2 | Can `linear_sync_spec` write to a Linear document? | First answered **No**; **reopened by Mike after reviewing on web (Q2')**: spec and plan each sync to a document on the header ticket, the description becomes a summary plus links with the plan part after a `---` bar, and the plan comment is dropped. Folded into D (§6). |
+| Q2a | Where the description's summary comes from | **Agent-written**: both sync tools take a required `summary` argument, used as given. |
+| Q2b | Document titles and re-sync lookup | `Spec: <H1>` / `Plan: <H1>`, found by the `Spec:` / `Plan:` prefix among the **app's own** documents on the header ticket; a changed H1 retitles the same document; two matches → `AMBIGUOUS`, nothing written. |
 | Q3 | Which project and document writes run without asking | A **document follows issue scope**: it runs with no prompt when it is attached to an in-scope issue or the session ticket's tools created it. **Project updates, milestones, project links and project documents always ask**, the session ticket's own project included. |
 | Q4 | Can `linear_project` add project links? | **Yes, add only**, always behind approval. No link edit or removal. |
 
@@ -48,7 +54,13 @@ Facts from the brainstorm that shape these (all probed as the app):
 - `documentUpdate` edits `title` and `content` in place; it also takes `issueId`,
   `projectId`, `trashed` and `hiddenAt`, which the tool never sends.
 - The router handles only issue comments and agent-session events, so comments on a
-  document never reach a session (part of Q2).
+  document never reach a session: review stays in the ticket thread (§6.6).
+- **Document content is limited to 250,000 characters** (probed: larger is
+  `INVALID_INPUT`, "content must be shorter than or equal to 250000 characters").
+- `EntityExternalLinkCreateInput.label` is **required** by Linear: `link` without `label`
+  sends the URL as the label (Task 1 probe).
+- Linear refuses `projectUpdates(first: 0)`: `get` with `updates: 0` skips the list
+  (`@include`), checked live in Task 1.
 - Specs so far are 16–25 KB and the description limit is 200,000 characters, so every
   spec has synced inline.
 - `projectUpdateCreate(input: {projectId, body, health})`, where `health` is the enum
@@ -234,14 +246,118 @@ In project **hermes linear test project**, after `deploy-live` and a gateway res
 5. `post_update` (`health: at_risk`), `milestone` (create), `link`: one card each;
    approved writes appear in the project, and the project's health is At risk.
 6. `link` with the same URL again: `ALREADY_LINKED`, no card, no second link.
-7. Should NOT happen: any prompt in steps 1–2; any write after a Deny; any second link
+7. Re-sync this ticket's (RET-122) spec and plan with the deployed build: a `Spec:` and a
+   `Plan:` document appear on RET-122, the description is the two summaries split by a
+   `---` bar with the task list, the old plan comment now points to the plan document,
+   and a second identical re-sync writes nothing (`document_skipped: true`, no issue
+   update).
+8. Should NOT happen: any prompt in steps 1–2; any write after a Deny; any second link
    or document.
 
 Afterwards, as the app, remove the brainstorm probe leftovers: the two "RET-122 probe doc"
 documents on RET-161, the two `ret-122 probe` links and the "ret-122 probe" milestone in
 the test project, plus the live test's own objects.
 
-## 6. Verify during implementation
+## 6. Spec and plan as documents (Q2')
+
+`linear_sync_spec` and `linear_sync_plan` write the whole file to a Linear document on the
+header ticket (the `Linear:` header), and the ticket description becomes an agent-written
+summary with a link to each document. The plan comment is no longer written.
+
+### 6.1 Arguments
+
+`linear_sync_spec(path, summary)` and `linear_sync_plan(path, summary)`. `summary` is
+required: a non-empty string (after `strip()`) of at most `SYNC_SUMMARY_MAX = 5_000`
+characters, else `BAD_ARGS`. It goes into the description as given (stripped). The target
+and its scope rule are unchanged: the header ticket must be in the session tree, else
+`OUT_OF_SCOPE`; the sync tools stay ungated (no approval path).
+
+### 6.2 The document
+
+- **Title:** `Spec: <H1>` / `Plan: <H1>`, where `<H1>` is the file's first `# ` heading
+  (stripped), or the file name without extension when there is none.
+- **Lookup:** the header ticket's documents (`documents_on(issue_id=…)`, which gains
+  `creator_id`) whose creator is the app (`viewer_id`) and whose title starts with
+  `Spec:` / `Plan:`. None → `document_create(title, content, issue_id=<header>)` and
+  `store.record_document(<session ticket>, id)` when in a Linear session. One →
+  `document_update(id, {title, content})`, title included only when it differs. Two or
+  more → `AMBIGUOUS` with `documents: [{id, title, url}]`, and nothing is written
+  (description and sub-tickets included).
+- **Content:** the file text, then `\n\n---\n<footer>` (today's `sync.footer(path,
+  commit)`), then the hash marker (`sync.with_desc_hash`). A document whose stored
+  content's hash marker equals the new one is not rewritten (`document_skipped: true`).
+- **Size:** Linear refuses document content over **250,000 characters** (probed:
+  `INVALID_INPUT`, "content must be shorter than or equal to 250000 characters").
+  `SYNC_DOCUMENT_MAX = 250_000`, in UTF-16 units like the other limits. A longer file is cut
+  with `TRUNCATED` and followed by `Full file (too long to show here): <link>` before the
+  footer; the result says `inline: false`.
+
+### 6.3 The description
+
+Two parts, each owned by one tool, separated by hidden markers (HTML comments survive
+Linear's markdown normalization, probe P8):
+
+```
+<spec summary>
+
+**Spec:** [Spec: <H1>](<doc url>) · source [<path> @ <commit>](<link>)
+<!-- hermes-linear:spec -->
+
+---
+<!-- hermes-linear:plan -->
+<plan summary>
+
+**Plan:** [Plan: <H1>](<doc url>) · source [<path> @ <commit>](<link>)
+
+**Tasks:**
+- T1 · <name> — RET-n
+- …
+```
+
+`<commit>` is `uncommitted` when `source_info` has none (as the footer says today).
+
+- **Spec sync:** the new spec part, followed by the plan part from the current
+  description (from the line `---` directly before `<!-- hermes-linear:plan -->` to the
+  end) when there is one. Everything else is replaced, so the first spec sync replaces
+  the brief (it stays in the description history).
+- **Plan sync:** the current description up to (excluding) its plan part, `rstrip()`ed;
+  with no plan part yet, the whole current description. Then `\n\n` and the new plan part.
+  Task lines are written after the sub-tickets exist, so they carry the IDs.
+- A description that would exceed `SPEC_INLINE_MAX` (200,000) cuts the task list first,
+  then the summary, the same way `plan_comment` cuts today.
+- The description is written only when it changed (compared after the same
+  normalization the hash uses), so a no-op re-sync makes no issue update.
+
+### 6.4 The plan comment
+
+`linear_sync_plan` no longer posts or edits a plan comment. When the header ticket has an
+old plan comment (found by `PLAN_MARKER`, as today), it is edited once to
+`Plan moved to [Plan: <H1>](<doc url>).` plus the marker; a comment already in that form is
+left alone. The task sub-tickets are unchanged: one `T<n> · <name>` per task, its whole
+section as the description, adopted by title, canceled when removed.
+
+### 6.5 Order of writes and results
+
+Document first, then (plan only) sub-tickets, then the description, then (plan only) the
+old comment. A failure part-way returns Linear's code and what was written so far
+(`document_id` when the document exists); a re-run finds the document and finishes. Nothing
+is created twice.
+
+Results: spec `{ok, issue, url, document_id, document_url, document_created,
+document_skipped, inline}`; plan the same plus today's `tasks`, `created`, `canceled`,
+`recreated`, `unmanaged`, `errors`, `file_changed`, `file_conflict` (`comment` and
+`comment_inline` are gone; `comment_migrated: true` when an old plan comment was edited).
+
+### 6.6 Skill and README
+
+The manage-superpowers Spec and Plan stages pass `summary` (a few sentences: what it builds
+and the key decisions; the plan's adds the task count and execution method), say the
+review reads the `Spec:` / `Plan:` documents on the ticket, and keep review in the ticket
+thread (comments on documents don't reach the session). Rules: "Ticket descriptions and
+the `Spec:` / `Plan:` documents are written only by the sync tools". README rows for both
+sync tools change to match.
+
+## 7. Verify during implementation
 
 - What a `projectUpdateCreate` without `health` does to the project's health (probe once
   in the test project; record the answer here).
@@ -255,7 +371,8 @@ the test project, plus the live test's own objects.
 
 ## Out of scope
 
-- `linear_mutate` (Q1), document sync for specs (Q2).
+- `linear_mutate` (Q1).
+- Syncing comments made on documents back into the session.
 - Editing a project itself (name, description, status, dates, lead), and editing or
   removing project links.
 - Archiving, trashing, hiding or deleting anything; moving documents.

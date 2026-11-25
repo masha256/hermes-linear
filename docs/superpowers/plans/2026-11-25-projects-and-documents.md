@@ -4,7 +4,7 @@ Linear: RET-122
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** The agent reads projects and documents, creates and edits documents (no prompt on in-scope issues), and posts project updates with health, creates/edits milestones and adds project links (always one Allow once), all as the app through two new typed tools.
+**Goal:** The agent reads projects and documents, creates and edits documents (no prompt on in-scope issues), and posts project updates with health, creates/edits milestones and adds project links (always one Allow once), all as the app through two new typed tools. Spec and plan syncs write `Spec:` / `Plan:` documents on the ticket and an agent-written summary description (spec §6).
 
 **Architecture:** Two new self-registering tool modules, `tools_document.py` and `tools_project.py`, on `agent_tools._tool(..., gated=...)` and A's `Gate`. New `LinearClient` calls for documents, project detail, project updates, milestones and project links. A new `created_documents` store table extends "made by this ticket" scope to documents. `linear_issue_get` gains `documents` through B's `QUERY_ISSUE_DETAILS`.
 
@@ -27,6 +27,8 @@ Linear: RET-122
 - Schema types: nullable fields as `"type": ["string", "null"]` only (no `nullable`, no `anyOf`).
 - Tests run from `.worktrees/ret122`: `.venv/bin/pytest -q` (baseline 1521 passed). Commit messages carry the task's sub-ticket ID.
 - Edit files with `write_file` / `patch`, never shell heredocs, `python -c` or `sed -i`.
+- Sync (spec §6): `SYNC_SUMMARY_MAX = 5_000`; `SYNC_DOCUMENT_MAX = 250_000` (Linear's document limit, probed); titles `Spec: <H1>` / `Plan: <H1>`; lookup among the app's own documents on the header ticket by prefix; two → `AMBIGUOUS`, nothing written; description markers `<!-- hermes-linear:spec -->` / `<!-- hermes-linear:plan -->`, plan part after a `---` line; no plan comment is created.
+- `link` without `label` sends the URL as the label (Linear requires it; Task 1).
 - Live probes as the app: `python3 ~/.hermes/profiles/neo/skills/software-development/hermes-linear-dev/scripts/linear-query.py '<graphql>'`. Write probes touch **only RET-161** and the project **hermes linear test project** (`d984ad14-969e-4d89-9538-14285b5e1743`); the task report lists everything created.
 
 ## Review Focus
@@ -132,3 +134,47 @@ Linear: RET-122
 - [ ] **Step 1: Update** the README and skill text; keep the skill ≤ 150 lines.
 - [ ] **Step 2: Run** `.venv/bin/pytest -q` and `hermes plugins validate .` — expected: all pass; report the counts.
 - [ ] **Step 3: Commit** `docs: projects and documents in README and skill (<sub-ticket>)`.
+
+### Task 6: `linear_sync_spec` writes a `Spec:` document and the spec part of the description
+
+**Files:**
+- Modify: `hermes_linear/sync.py` (document and description rendering), `hermes_linear/agent_tools.py` (`_parse_sync_spec`, `_sync_spec`, the `linear_sync_spec` schema), `hermes_linear/linear_client.py` (`documents_on` rows gain `creator_id`; `QUERY_ISSUE_GET` untouched — read the description through the existing `issue_get` result)
+- Test: `tests/test_sync_spec.py`, `tests/test_linear_client.py`
+
+**Interfaces:**
+- Consumes: Task 1 `documents_on`, `document_create`, `document_update`, `document_get` (for the stored content's hash), `Store.record_document`; existing `sync.footer`, `sync.with_desc_hash` / `read_desc_hash` / `desc_hash`, `sync.utf16_len` / `utf16_truncate`, `TRUNCATED`, `SPEC_INLINE_MAX`, `client.viewer_id()`, `_writable`.
+- Produces in `sync.py` (Task 7 reuses all of them):
+  - `SYNC_SUMMARY_MAX = 5_000`; `SYNC_DOCUMENT_MAX = 250_000`; `SPEC_PART_MARKER = "<!-- hermes-linear:spec -->"`; `PLAN_PART_MARKER = "<!-- hermes-linear:plan -->"`.
+  - `doc_title(kind: str, text: str, path: str) -> str` — `kind` is `"Spec"` / `"Plan"`; `f"{kind}: {h1}"`, h1 = first `^# ` line stripped, else the file stem.
+  - `document_content(text: str, info: SourceInfo) -> tuple[str, bool]` — file text + `\n\n---\n` + `footer(...)`, then the hash marker; cut to `SYNC_DOCUMENT_MAX` with `TRUNCATED` and `Full file (too long to show here): <link>` before the footer when needed; bool = inline.
+  - `source_line(kind: str, title: str, doc_url: str, info: SourceInfo) -> str` — `**Spec:** [<title>](<doc_url>) · source [<path> @ <commit or UNCOMMITTED>](<link>)`.
+  - `split_plan_part(description: str | None) -> tuple[str, str | None]` — `(before, plan_part)`; `plan_part` starts at the `---` line directly preceding `PLAN_PART_MARKER` (or at the marker if no bar precedes it) and runs to the end; `None` when there is no marker.
+  - `spec_part(summary: str, source: str) -> str` — `f"{summary}\n\n{source}\n{SPEC_PART_MARKER}"`.
+- Produces: `agent_tools._sync_document(ctx, issue: dict, kind: str, title: str, content: str) -> dict` — the lookup/create/update of §6.2: returns `{document_id, document_url, document_created, document_skipped}`; raises `_Refusal("AMBIGUOUS", extra={"documents": [...]})` before any write. Task 7 calls it with `kind="Plan"`.
+- `linear_sync_spec` schema: `path` and `summary` both required; result keys per spec §6.5.
+
+- [ ] **Step 1: Write the failing tests** (`tests/test_sync_spec.py`, rewriting the old full-description expectations): `test_summary_required` (missing, `"   "`, 5,001 chars → `BAD_ARGS`, nothing written), `test_first_sync_creates_doc_and_replaces_description` (description == `spec_part`, document title `Spec: <H1>`, content ends in footer + hash, `document_created: true`, recorded in `created_documents`), `test_resync_updates_same_doc` (one document after two syncs with different text; title retitled when H1 changed), `test_resync_unchanged_skips` (`document_skipped: true`, zero `documentUpdate` and zero `issueUpdate` calls), `test_human_spec_doc_ignored` (a human's `Spec: x` document is never touched; the app creates its own), `test_two_app_spec_docs_ambiguous` (nothing written), `test_keeps_plan_part` (an existing description with `---`+`PLAN_PART_MARKER` part keeps it byte for byte after the spec part), `test_out_of_tree_refused` (`OUT_OF_SCOPE`, no document), `test_oversize_file_cut` (260,000-char file → content ≤ 250,000 UTF-16 units, `inline: false`), `test_uncommitted_source_line`. Unit tests for `doc_title` (no H1 → stem), `split_plan_part` (no marker; marker with bar; marker without bar), `source_line`.
+- [ ] **Step 2: Run** `.venv/bin/pytest -q tests/test_sync_spec.py tests/test_linear_client.py` — expected: FAIL.
+- [ ] **Step 3: Implement.** The spec-description helpers `spec_description` / `render_spec` / `spec_summary` go if nothing else uses them (grep). Order of writes: document, then description (only when it differs from the current one).
+- [ ] **Step 4: Run** the full suite — expected: pass.
+- [ ] **Step 5: Commit** `feat: linear_sync_spec writes a Spec document and a summary description (<sub-ticket>)`.
+
+### Task 7: `linear_sync_plan` writes a `Plan:` document and the plan part; plan comment migrated; docs
+
+**Files:**
+- Modify: `hermes_linear/sync.py` (`plan_part`; `plan_comment` removed), `hermes_linear/agent_tools.py` (`_parse_sync_plan`, `_sync_plan`, schema), `README.md`, `hermes_linear/skills/manage-superpowers/SKILL.md` (Spec and Plan stages pass `summary`; review reads the documents; the Rules line), `docs/superpowers/specs/2026-11-25-projects-and-documents-design.md` §7 (mark settled items)
+- Test: `tests/test_sync_plan.py`, `tests/test_plugin_register.py` (skill ≤ 150 lines)
+
+**Interfaces:**
+- Consumes: Task 6's `sync` helpers and `agent_tools._sync_document`; existing `_resolve_tasks`, task create/update/cancel loop, `_marker_tag(PLAN_MARKER)`, `client.app_comments`, `comment_update`, `write_ticket_ids`, `ANY_MARKER_RE`.
+- Produces: `sync.plan_part(summary: str, source: str, tasks: list[PlanTask], tickets: dict[int, str]) -> str` — `"---\n" + PLAN_PART_MARKER + "\n" + summary + "\n\n" + source + "\n\n**Tasks:**\n\n" + "- T<n> · <name> — <ID>" lines`.
+- The plan document's content is the plan text **with the IDs written back** and markers stripped (as the comment used to be), so a re-run on the written file is `document_skipped`.
+- Description = `split_plan_part(current)[0].rstrip() + "\n\n" + plan_part(...)`, cut to `SPEC_INLINE_MAX` by trimming the task lines first, then the summary; written only when different.
+- Old comment: the app's comment carrying the plan marker tag whose body is not already `Plan moved to [<title>](<url>).\n\n<tag>` is edited to exactly that; `comment_migrated: true`. No plan comment is ever created.
+- Order: document, sub-tickets, description, old comment. Result keys per spec §6.5.
+
+- [ ] **Step 1: Write the failing tests** (`tests/test_sync_plan.py`, rewriting the comment expectations): `test_summary_required`, `test_plan_doc_created_and_part_appended` (spec part kept above `---`; task lines carry the new IDs), `test_plan_resync_replaces_only_plan_part`, `test_plan_resync_unchanged_no_writes` (no document, issue or comment write on the second identical run over the written-back file), `test_no_plan_comment_created`, `test_old_plan_comment_migrated_once` (second run leaves it), `test_human_comment_with_marker_untouched`, `test_plan_without_spec_part_appends_under_brief`, `test_two_app_plan_docs_ambiguous` (no sub-ticket, description or comment write), and the existing sub-ticket tests unchanged. Skill: line cap and that the Spec/Plan stage text names `summary`.
+- [ ] **Step 2: Run** `.venv/bin/pytest -q tests/test_sync_plan.py tests/test_plugin_register.py` — expected: FAIL.
+- [ ] **Step 3: Implement**, then the README rows and skill text (per spec §6.6; keep the skill ≤ 150 lines).
+- [ ] **Step 4: Run** the full suite and `hermes plugins validate .` — expected: pass.
+- [ ] **Step 5: Commit** `feat: linear_sync_plan writes a Plan document; plan comment retired (<sub-ticket>)`.
