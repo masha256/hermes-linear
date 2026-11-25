@@ -692,9 +692,6 @@ def _project_of(issue: dict | None) -> str | None:
 
 # -- linear_issue_create
 
-#: A Linear UUID (team, project); anything else is a key or a name.
-_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
-                      r"-[0-9a-fA-F]{12}$")
 #: A trailing origin footer (``_origin_footer``), stripped so a re-edit never stacks two.
 _FOOTER_RE = re.compile(r"\n*---\n_Filed by [^\n]* via [^\n]*_\s*$")
 
@@ -721,80 +718,87 @@ def _parse_create(args: dict) -> dict:
             "fields": issue_fields.parse(args, update=False), "footer": _origin_footer()}
 
 
-async def _team(ctx: ToolContext, ref: str) -> dict:
-    """The team ``ref`` names: UUID, then key, then name (case-insensitive; a name two
-    teams share names none). ``TEAM_NOT_FOUND`` otherwise."""
-    teams = await ctx.client.teams()
-    want = ref.casefold()
-    for match in (lambda t: (t.get("id") or "").casefold() == want,
-                  lambda t: (t.get("key") or "").casefold() == want):
-        found = [t for t in teams if match(t)]
-        if found:
-            return found[0]
-    named = [t for t in teams if (t.get("name") or "").casefold() == want]
-    if len(named) != 1:
-        raise _Refusal("TEAM_NOT_FOUND")
-    return named[0]
+async def _outside_base(ctx: ToolContext, fields: dict) -> tuple[str, str | None]:
+    """The base team and project of a create from outside a Linear session without a
+    parent (RET-148 spec §3): ``default_team`` / ``default_project`` resolved through the
+    directory (misses refuse with candidates). Without ``default_team`` there is no base:
+    the ``team`` arg is required (``BAD_ARGS`` before any I/O) and ``default_project``,
+    which belongs to the default team, is not used."""
+    settings = getattr(ctx.adapter, "_settings", None)
+    team_ref = (getattr(settings, "default_team", "") or "").strip()
+    project_ref = (getattr(settings, "default_project", "") or "").strip()
+    if not team_ref:
+        if fields.get("team") is None:
+            raise _Refusal("BAD_ARGS")
+        return "", None  # the team arg replaces it; R8 then drops any base project
+    names = directory.for_client(ctx.client)
+    team = await names.resolve("teams", "", team_ref, issue_fields._by_team)
+    project = (await names.resolve("projects", "", project_ref, issue_fields._by_name)
+               if project_ref else None)
+    return team["id"], project["id"] if project else None
 
 
-async def _projects(ctx: ToolContext, ref: str) -> list[dict]:
-    """The projects ``ref`` may name: by id if it is UUID-shaped and exists, else by name."""
-    if _UUID_RE.match(ref):
-        p = await ctx.client.project(ref)
-        if p is not None:
-            return [p]
-    return await ctx.client.projects_named(ref)
+async def _outside_destination(ctx: ToolContext, team_id: str, project_id: str | None) -> None:
+    """Outside a Linear session every create asks, base or not (RET-148 spec §2 item 2): the
+    resulting team and project are ONE target ``destination:<team>/<project or ->``, shown
+    as ``- destination "<key> / <project>"``. An approved pass for another destination (a
+    default changed meanwhile, a project dropped) is ``OUT_OF_SCOPE``."""
+    gate = ctx.gate
+    tid = f"destination:{team_id}/{project_id or '-'}"
+    if gate is None or tid in gate.approved:
+        return
+    if gate.approved:
+        raise _Refusal("OUT_OF_SCOPE")
+    names = directory.for_client(ctx.client)
 
+    async def label(kind: str, row_id: str, key: str) -> str:
+        rows = await names.rows(kind, "")
+        return str(next((r.get(key) for r in rows if r.get("id") == row_id and r.get(key)),
+                        row_id))
 
-async def _destination(ctx: ToolContext, team_ref: str,
-                       project_ref: str | None) -> tuple[dict, dict | None]:
-    """Team ``{id, key, name}`` and project ``{id, name, team_ids}`` (or ``None``) for a new
-    issue. ``BAD_ARGS`` without a team; ``TEAM_NOT_FOUND``; ``PROJECT_NOT_FOUND`` unless
-    exactly one project of that reference is in the team. Reads only."""
-    if not (team_ref or "").strip():
-        raise _Refusal("BAD_ARGS")
-    team = await _team(ctx, team_ref.strip())
-    pref = (project_ref or "").strip()
-    if not pref:
-        return team, None
-    found = {p["id"]: p for p in await _projects(ctx, pref)
-             if team["id"] in (p.get("team_ids") or [])}
-    if len(found) != 1:
-        raise _Refusal("PROJECT_NOT_FOUND")
-    return team, next(iter(found.values()))
-
-
-def _destination_target(team: dict, project: dict | None) -> dict:
-    """The gate's pseudo-target for a new issue in ``team`` / ``project`` (spec §2 item 2)."""
-    key = team.get("key") or team["id"]
-    return {"id": f"team:{team['id']}" + (f"/project:{project['id']}" if project else ""),
-            "identifier": key,
-            "title": f"new issue in {key}" + (f" / {project['name']}" if project else "")}
+    where = await label("teams", team_id, "key")
+    where += f" / {await label('projects', project_id, 'name')}" if project_id \
+        else " (no project)"
+    gate.record_target(tid, "destination", where)
 
 
 async def _create(ctx: ToolContext, a: dict) -> dict:
     """Base team and project (RET-121 spec §1.2): the parent's with ``parent``, else the
-    session ticket's. An explicit team / project other than the base is a target."""
+    session ticket's, or outside a Linear session ``default_team`` / ``default_project``
+    (RET-148 spec §3). Inside, an explicit team / project other than the base is a target;
+    outside, the resulting destination always is. Outside the description carries the
+    origin footer and nothing is recorded in ``created_issues``."""
     if ctx.outside:
-        return await _create_outside(ctx, a)
-    if not ctx.is_linear or not ctx.session_issue_id:
+        if ctx.gate is None:  # only ever run through _gated
+            raise _Refusal("NOT_LINEAR_SESSION")
+    elif not ctx.is_linear or not ctx.session_issue_id:
         raise _Refusal("NOT_LINEAR_SESSION")
     parent = None
     if a["parent"] and a["parent"].strip():
         parent = await _writable(ctx, a["parent"].strip())
-    base = parent if parent is not None else await ctx.client.issue_get(ctx.session_issue_id)
-    base_team, base_project = _team_of(base), _project_of(base)
+    if parent is not None:
+        base_team, base_project = _team_of(parent), _project_of(parent)
+    elif ctx.outside:
+        base_team, base_project = await _outside_base(ctx, a["fields"])
+    else:
+        home = await ctx.client.issue_get(ctx.session_issue_id)
+        base_team, base_project = _team_of(home), _project_of(home)
     r = await issue_fields.resolve(ctx, a["fields"], team_id=base_team,
                                    project_id=base_project)
-    if r.team is not None and r.team["id"] != base_team:
-        _scope_target(ctx, r.team, "team")
-    if r.project is not None and r.project["id"] != base_project:
-        _scope_target(ctx, r.project, "project")
+    if ctx.outside:
+        await _outside_destination(ctx, r.team_id, r.project_id)
+    else:
+        if r.team is not None and r.team["id"] != base_team:
+            _scope_target(ctx, r.team, "team")
+        if r.project is not None and r.project["id"] != base_project:
+            _scope_target(ctx, r.project, "project")
     team = r.team_id
     inp: dict[str, Any] = {"teamId": team, "title": a["title"]}
     if r.project_id:
         inp["projectId"] = r.project_id
-    if a["description"] is not None:
+    if ctx.outside:
+        inp["description"] = _with_footer(a["description"], a["footer"])
+    elif a["description"] is not None:
         inp["description"] = a["description"]
     if parent is not None:
         inp["parentId"] = parent["id"]
@@ -806,40 +810,9 @@ async def _create(ctx: ToolContext, a: dict) -> dict:
     inp.update({k: v for k, v in r.input.items() if k not in ("teamId", "projectId")})
     _check_gate(ctx)
     issue = await ctx.client.issue_create(inp)
-    _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
+    if not ctx.outside:  # no session ticket to key it by (RET-148 Q2.6)
+        _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
     return {"ok": True, "issue": issue}
-
-
-async def _create_outside(ctx: ToolContext, a: dict) -> dict:
-    """A create from a non-Linear session (RET-148 spec §3): ``team``/``project`` or the
-    configured defaults; the destination is a gate target, then the parent if any. The
-    description carries the origin footer; nothing is recorded in ``created_issues``."""
-    gate = ctx.gate
-    if gate is None:  # only ever run through _gated
-        raise _Refusal("NOT_LINEAR_SESSION")
-    settings = getattr(ctx.adapter, "_settings", None)
-    team_ref = a["fields"].get("team") or (getattr(settings, "default_team", "") or "").strip()
-    project_ref = a["fields"].get("project") or (
-        getattr(settings, "default_project", "") or "").strip()
-    team, project = await _destination(ctx, team_ref, project_ref or None)
-    dest = _destination_target(team, project)
-    if dest["id"] not in gate.approved:
-        if gate.approved:  # approved for another destination (e.g. a default changed)
-            raise _Refusal("OUT_OF_SCOPE")
-        gate.record(dest)
-    inp: dict[str, Any] = {"teamId": team["id"], "title": a["title"],
-                           "description": _with_footer(a["description"], a["footer"])}
-    if project is not None:
-        inp["projectId"] = project["id"]
-    if a["parent"] and a["parent"].strip():
-        inp["parentId"] = (await _writable(ctx, a["parent"].strip()))["id"]
-    if a["state"] is not None:
-        inp["stateId"] = await _state_id(ctx, team["id"], a["state"])
-    labels = await _label_ids(ctx, team["id"], a["labels"])
-    if labels:
-        inp["labelIds"] = labels
-    _check_gate(ctx)
-    return {"ok": True, "issue": await ctx.client.issue_create(inp)}
 
 
 # -- linear_issue_update
@@ -918,7 +891,9 @@ async def _project_in_scope(ctx: ToolContext, issue: dict, parent_arg: str | Non
     issue's current parent. Reads only as far as needed."""
     if project_id == _project_of(issue):
         return True
-    if project_id == _project_of(await ctx.client.issue_get(ctx.session_issue_id or "")):
+    # Outside a Linear session there is no session ticket (RET-148): skip that rule.
+    if ctx.session_issue_id and project_id == _project_of(
+            await ctx.client.issue_get(ctx.session_issue_id)):
         return True
     if parent_arg is not None:  # the parent changes in this call
         return new_parent is not None and project_id == _project_of(new_parent)

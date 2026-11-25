@@ -258,17 +258,6 @@ MUTATION_RELATION_CREATE = """mutation IssueRelationCreate($input: IssueRelation
   issueRelationCreate(input: $input) { success issueRelation { id } }
 }"""
 
-# Projects by name, case-insensitive, with their teams (RET-148; probed as the app).
-QUERY_PROJECTS_BY_NAME = """query ProjectsByName($name: String!) {
-  projects(filter: { name: { eqIgnoreCase: $name } }, first: 10) {
-    nodes { id name teams { nodes { id } } }
-  }
-}"""
-
-QUERY_PROJECT = """query Project($id: String!) {
-  project(id: $id) { id name teams { nodes { id } } }
-}"""
-
 MUTATION_FILE_UPLOAD = """mutation FileUpload($size: Int!, $filename: String!, $contentType: String!) {
   fileUpload(size: $size, filename: $filename, contentType: $contentType) {
     success uploadFile { uploadUrl assetUrl headers { key value } }
@@ -812,28 +801,6 @@ class LinearClient:
         nodes = await self._paged(QUERY_PROJECT_MILESTONES, {"projectId": project_id},
                                   lambda d: (d.get("project") or {}).get("projectMilestones"))
         return [{"id": m["id"], "name": m.get("name") or ""} for m in nodes]
-
-    @classmethod
-    def _project(cls, p: dict) -> dict:
-        return {"id": p["id"], "name": p.get("name") or "",
-                "team_ids": [t["id"] for t in cls._nodes(p.get("teams")) if t.get("id")]}
-
-    async def projects_named(self, name: str) -> list[dict]:
-        """``[{id, name, team_ids}]``: the projects named ``name`` (case-insensitive)."""
-        data = await self.gql(QUERY_PROJECTS_BY_NAME, {"name": name})
-        return [self._project(p) for p in self._nodes(data.get("projects"))
-                if isinstance(p, dict) and p.get("id")]
-
-    async def project(self, ref: str) -> dict | None:
-        """``{id, name, team_ids}`` of project ``ref`` (a UUID), ``None`` if there is none."""
-        try:
-            data = await self.gql(QUERY_PROJECT, {"id": ref})
-        except LinearError as exc:
-            if exc.code == "NOT_FOUND":
-                return None
-            raise
-        p = data.get("project")
-        return self._project(p) if isinstance(p, dict) and p.get("id") else None
 
     # -- uploads and attachments (RET-120) ---------------------------------
 

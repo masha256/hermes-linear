@@ -27,7 +27,7 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The th
   find issues (rows + `next_cursor`); complex filters go through `linear_query`.
 - `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`, `team?`,
   `project?`, `assignee?`, `delegate?`, `priority?`, `estimate?`, `due_date?`, `cycle?`,
-  `milestone?`): in the parent's (else the session's) team and project; another one asks.
+  `milestone?`): parent's, else session's (outside: `default_*` settings) team/project; others ask.
 - `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`, `remove_labels?`,
   `parent?`, `project?`, create's others but `team`): `null` clears; `parent: ""` detaches.
 - `linear_comment` (`id`, `body`, `edit_marker?`, `reply_to?`: a comment UUID's thread, `resolve?`).

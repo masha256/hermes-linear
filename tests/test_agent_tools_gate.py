@@ -324,13 +324,13 @@ def test_outside_create_request_names_destination(pin_ctx, ws, adapter):
     args = {"title": "From Slack"}
     out = linear_issue_create(dict(args))
     assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED", out
-    assert "outside a Linear session" in out["message"] and "RET" in out["message"]
+    assert "outside a Linear session" in out["message"] and "RET / Hermes" in out["message"]
     assert ws.writes() == [] and _requests(adapter) == 1
     req = adapter._store.request("sk", digest("linear_issue_create", args))
-    assert req.targets == [f"team:{TEAM}/project:{PROJECT['id']}"]
+    assert req.targets == [f"destination:{TEAM}/{PROJECT['id']}"]
     assert req.message.splitlines()[0] == (
         "Approve `linear_issue_create` from outside a Linear session?")
-    assert '- RET "new issue in RET / Hermes"' in req.message
+    assert '- destination "RET / Hermes"' in req.message
     adapter._store.arm_request("sk", req.digest)
     done = linear_issue_create(dict(args))
     assert done["ok"] is True, done
@@ -341,34 +341,51 @@ def test_outside_create_request_names_destination(pin_ctx, ws, adapter):
     _outside_dest(adapter)
     assert linear_issue_create({"title": "Loose"})["error"] == "APPROVAL_REQUIRED"
     req = adapter._store.request("sk", digest("linear_issue_create", {"title": "Loose"}))
-    assert req.targets == [f"team:{TEAM}"] and '- RET "new issue in RET"' in req.message
+    assert req.targets == [f"destination:{TEAM}/-"]
+    assert '- destination "RET (no project)"' in req.message
+
+
+def test_outside_create_base_destination_is_a_target(pin_ctx, ws, adapter):
+    """Ruling 3: outside, team/project EQUAL to the base still need approval (RET-121 records
+    no target for them inside a session); one destination target names both."""
+    pin_ctx(linear=False)
+    _outside_dest(adapter, project=PROJECT["name"])
+    args = {"title": "x", "team": "RET", "project": "Hermes"}
+    assert linear_issue_create(dict(args))["error"] == "APPROVAL_REQUIRED"
+    req = adapter._store.request("sk", digest("linear_issue_create", args))
+    assert req.targets == [f"destination:{TEAM}/{PROJECT['id']}"]
+    assert ws.writes() == []
 
 
 def test_outside_create_with_parent_two_targets(pin_ctx, ws, adapter):
     pin_ctx(linear=False)
-    _outside_dest(adapter)
+    _outside_dest(adapter, team="")  # with a parent no default team is needed
     args = {"title": "Sub", "parent": "RET-2"}
     out = linear_issue_create(dict(args))
     assert out["error"] == "APPROVAL_REQUIRED"
-    assert "RET-2" in out["message"] and "RET" in out["message"]
+    assert "RET-2" in out["message"] and "RET / Hermes" in out["message"]
     req = adapter._store.request("sk", digest("linear_issue_create", args))
-    assert req.targets == [f"team:{TEAM}", "uuid-child"]
+    assert req.targets == ["uuid-child", f"destination:{TEAM}/{PROJECT['id']}"]
     assert ws.writes() == []
     adapter._store.arm_request("sk", req.digest)
     done = linear_issue_create(dict(args))
     assert done["ok"] is True, done
     assert ws.issues[done["issue"]["id"]]["parent"] == "uuid-child"
+    assert ws.issues[done["issue"]["id"]]["project"] == PROJECT  # the parent's project
     assert adapter._store.created_by(SELF) == set()
 
 
-def test_outside_create_destination_changed_refused(pin_ctx, ws, adapter):
+@pytest.mark.parametrize("team,project", [("OTH", ""), ("RET", "Elsewhere"), ("RET", "")])
+def test_outside_create_destination_changed_refused(pin_ctx, ws, adapter, team, project):
+    """An approved re-run bound to its destination: a default team or project that moved
+    (or a project dropped) between approval and re-run is OUT_OF_SCOPE, nothing written."""
     pin_ctx(linear=False)
     seed_other_team(ws)
-    _outside_dest(adapter)
+    _outside_dest(adapter, project=PROJECT["name"])
     args = {"title": "x"}
     assert linear_issue_create(dict(args))["error"] == "APPROVAL_REQUIRED"
     adapter._store.arm_request("sk", digest("linear_issue_create", args))
-    _outside_dest(adapter, team="OTH")  # the default moved between the two calls
+    _outside_dest(adapter, team=team, project=project)  # the defaults moved meanwhile
     assert linear_issue_create(dict(args)) == {"ok": False, "error": "OUT_OF_SCOPE"}
     assert ws.writes() == [] and _requests(adapter) == 0  # taken, nothing new stored
 

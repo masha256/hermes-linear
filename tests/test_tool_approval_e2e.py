@@ -557,14 +557,14 @@ async def test_e2e_outside_create_approve_writes_once(e2e_outside):
     a._settings = dataclasses.replace(a._settings, default_team="RET")
     h = make("once")
     tool = "linear_issue_create"
-    raw, coerced = {"title": "From Slack", "labels": "bug"}, \
-        {"title": "From Slack", "labels": ["bug"]}
+    raw, coerced = {"title": "From Slack", "labels": "bug", "estimate": "2"}, \
+        {"title": "From Slack", "labels": ["bug"], "estimate": 2}
     first = await h.run(tool, raw, cid="c-first", coerced=coerced)
     assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
     assert "outside a Linear session" in first["message"] and "RET" in first["message"]
     d = tool_approval.digest(tool, raw)
     assert d == tool_approval.digest(tool, coerced)
-    assert store.request(SLACK_SK, d).targets == [f"team:{TEAM}"]
+    assert store.request(SLACK_SK, d).targets == [f"destination:{TEAM}/-"]
     assert ws.writes() == []
     out = await h.run(tool, raw, cid="c-again", coerced=coerced)
     assert out["ok"] is True, out
@@ -572,11 +572,12 @@ async def test_e2e_outside_create_approve_writes_once(e2e_outside):
     assert ws.writes() == [create]
     stored = ws.issues[out["issue"]["id"]]
     assert stored["team"] == TEAM and stored["labels"] == ["lb-bug"]
+    assert stored["fields"] == {"estimate": 2}  # a RET-121 field, coerced as Hermes does
     assert stored["description"] == SLACK_FOOTER.lstrip("\n")
     assert len(h.notified) == 1
     desc = h.notified[0]["description"]
     assert desc.splitlines()[0] == f"Approve `{tool}` from outside a Linear session?"
-    assert '- RET "new issue in RET"' in desc and desc.endswith(f"digest: {d}")
+    assert '- destination "RET (no project)"' in desc and desc.endswith(f"digest: {d}")
     assert store.request(SLACK_SK, d) is None
 
 
