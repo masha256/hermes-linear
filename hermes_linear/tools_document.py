@@ -214,8 +214,8 @@ SCHEMAS: dict[str, dict] = {
             "most one; neither: the session ticket): a document with the same title there "
             "is ALREADY_EXISTS with its document_id and url, and nothing is written. update "
             "(id; title and/or content): edits in place, never moves or deletes. A document "
-            "on an in-scope issue, or one created from this ticket, needs no approval; one "
-            "on a project always does. DOCUMENT_NOT_FOUND for an unknown id. "
+            "on an in-scope issue, or one created from this ticket, needs no approval; "
+            "creating one on a project always does. DOCUMENT_NOT_FOUND for an unknown id. "
             + agent_tools._GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": list(ACTIONS),

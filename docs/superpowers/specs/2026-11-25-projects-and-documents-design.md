@@ -379,9 +379,15 @@ sync tools change to match.
   §1.1 was amended (controller ruling, 2026-11-25): the tool answers `description: null` (or blank) on update with `BAD_ARGS` and
   a message, rather than a success that changed nothing. The probe milestone now has
   description `"x"` and no target date.
-- The `Project` fields the `get` query reads (`status { name }`, `lead`, `targetDate`,
-  `externalLinks`, `documents`, `projectMilestones`, `projectUpdates`): one live
-  `linear_query` of the real `QUERY_*` constant before the task is marked done.
+- Settled (RET-163 probes on the test project `d984ad14-969e-4d89-9538-14285b5e1743`,
+  2026-11-25; Task 1 report, live probes 4, 5 and 8): the `Project`
+  fields the `get` query reads (`status { name }`, `lead`, `targetDate`, `externalLinks`,
+  `documents`, `projectMilestones`, `projectUpdates`) read fine as the app. The module's
+  real `QUERY_PROJECT_DETAIL` ran live with real variables in both variants
+  (`withUpdates` true and false) and returned `data` in the expected shape.
+  `projectUpdates(first: 0)` is refused (`INVALID_INPUT` "first must not be less than 1"),
+  so `updates: 0` sends `first: 1` with `withUpdates: false` and drops the connection
+  (`@include`).
 - Settled in the brainstorm: `document(id:)` accepts a slug id as well as a UUID (probed:
   `document(id: "dd7c3ea51183")` returns the probe document), so `get` / `update` pass
   the UUID or the URL's last `-` segment straight to it. `Project.status { name }`,

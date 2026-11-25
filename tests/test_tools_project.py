@@ -140,6 +140,24 @@ def test_get_outside_uses_default_project(pin_ctx, ws, adapter):
     assert ws.writes() == [] and _requests(adapter) == 0
 
 
+def test_outside_default_project_without_default_team(pin_ctx, ws, adapter):
+    """Ruling 6: a project read or write needs no team, so outside a Linear session
+    ``default_project`` is used even when ``default_team`` is empty (only
+    linear_issue_create ignores it then; settings.py's warning says so)."""
+    ws.add_project("proj-2", "Orion")
+    pin_ctx(linear=False)
+    _settings(adapter, default_team="", default_project="Orion",
+              outside_session_writes="approve")
+    out = linear_project({"action": "get"})
+    assert out["ok"] is True and out["project"]["id"] == "proj-2", out
+    assert _calls(ws, "issue_get") == []
+    # a write targets the same default project (and asks, as every outside write)
+    args = {"action": "post_update", "body": "from Slack"}
+    out = linear_project(dict(args))
+    assert out["error"] == "APPROVAL_REQUIRED" and ws.writes() == []
+    assert _request(adapter, args).targets == ["proj-2"]
+
+
 def test_get_no_project_not_found_with_candidates(pin_ctx, ws, adapter):
     for n in range(25):
         ws.add_project(f"proj-x{n}", f"Extra {n}")

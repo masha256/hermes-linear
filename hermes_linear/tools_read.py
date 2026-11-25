@@ -234,7 +234,8 @@ SCHEMAS: dict[str, dict] = {
         "name": "linear_issue_get",
         "description": ("Read a Linear issue as the Linear app: state, team, project and links, "
                         "parent, labels, sub-issues, assignee, delegate, priority, estimate, "
-                        "due date, cycle, milestone, relations and attachments."),
+                        "due date, cycle, milestone, relations, attachments and documents "
+                        "(id, title, url; read one with linear_document)."),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "comments": {"type": "integer", "minimum": 0, "maximum": COMMENTS_MAX,
