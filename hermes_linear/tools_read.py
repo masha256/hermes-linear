@@ -91,17 +91,20 @@ def shape_threads(nodes: list[dict], app_id: str) -> list[dict]:
     return out
 
 
-def trim(result: dict, limit: int = ISSUE_GET_MAX_CHARS) -> dict:
+def trim(result: dict, limit: int = ISSUE_GET_MAX_CHARS, *, node: str = "issue",
+         items: str = "comments", flag: str = "comments_truncated") -> dict:
     """Drop the oldest threads (the end of ``issue.comments``) while ``result`` serializes
     to more than ``limit`` chars, setting ``comments_truncated``. Without threads left, a
-    large result is returned as it is."""
-    issue = result.get("issue") or {}
-    threads = issue.get("comments")
+    large result is returned as it is. ``node`` / ``items`` / ``flag`` name another
+    newest-first list the same way (``linear_project``: ``project.updates``,
+    ``updates_truncated``)."""
+    issue = result.get(node) or {}
+    threads = issue.get(items)
     if not isinstance(threads, list):
         return result
     while threads and len(json.dumps(result, ensure_ascii=False, default=str)) > limit:
         threads.pop()
-        issue["comments_truncated"] = True
+        issue[flag] = True
     return result
 
 

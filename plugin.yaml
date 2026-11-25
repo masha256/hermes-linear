@@ -21,6 +21,7 @@ provides_tools:
   - linear_session_link
   - linear_relation
   - linear_lookup
+  - linear_project
   - linear_document
 provides_hooks:
   - pre_tool_call

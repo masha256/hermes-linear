@@ -1652,6 +1652,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_session_link": {},
     "linear_relation": {},
     "linear_lookup": {},
+    "linear_project": {},
     "linear_document": {},
 }
 
@@ -1669,6 +1670,7 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_session_link": None,  # type: ignore[dict-item]  # registered by tools_attach
     "linear_relation": None,  # type: ignore[dict-item]  # registered by tools_relation
     "linear_lookup": None,  # type: ignore[dict-item]  # registered by tools_lookup
+    "linear_project": None,  # type: ignore[dict-item]  # registered by tools_project
     "linear_document": None,  # type: ignore[dict-item]  # registered by tools_document
 }
 
@@ -1676,7 +1678,8 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_attach", "linear_comment", "linear_document", "linear_issue_create",
            "linear_issue_get",
-           "linear_issue_update", "linear_lookup", "linear_query", "linear_relation",
+           "linear_issue_update", "linear_lookup", "linear_project", "linear_query",
+           "linear_relation",
            "linear_search",
            "linear_session_link",
            "linear_sync_plan", "linear_sync_spec", "linear_task_state", "resolve_context",
@@ -1690,4 +1693,5 @@ from . import tools_read  # noqa: E402,F401
 from . import tools_attach  # noqa: E402,F401
 from . import tools_relation  # noqa: E402,F401
 from . import tools_lookup  # noqa: E402,F401
+from . import tools_project  # noqa: E402,F401
 from . import tools_document  # noqa: E402,F401

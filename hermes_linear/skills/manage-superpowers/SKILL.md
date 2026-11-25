@@ -20,7 +20,7 @@ Per-stage differences; work the ticket directly with the tools, per Questions an
 The `linear_*` tools are deferred behind tool search: load a schema with `tool_describe` (exact
 names), then always call via `tool_call`, one entry per call (a batch of plugin tools is
 rejected): `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])`. A
-direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The fourteen tools:
+direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The fifteen tools:
 
 - `linear_issue_get` (`id`, `comments?`: newest N threads): fields, relations, attachments, children.
 - `linear_search` (`text?`, `team?`, `project?`, `state?`, `assignee?`, `label?`, `parent?`, …):
@@ -38,6 +38,8 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The fo
 - `linear_session_link` (`url`, `label?`): show a link (the PR) on this turn's agent session.
 - `linear_relation` (`id`, `type`: `blocks|blocked_by|related|duplicate_of`, `other`).
 - `linear_lookup` (`kind`, `team?`, `project?`, `query?`): the names (and ids) write tools accept.
+- `linear_project` (`action`: `get|post_update|milestone|link`, `project?`, …): project read;
+  writes always ask.
 - `linear_document` (`action`: `get|create|update`, `id?`, `title?`, `content?`, `issue?`|`project?`):
   docs; on an in-scope issue no prompt.
 
@@ -54,10 +56,9 @@ Linear session (Slack, CLI, cron) those five follow `outside_session_writes` and
 - Every multiple-choice question and approval (**Approve** / **Request changes**) is a
   `clarify` with `choices` (a Linear select), one per call, all needed to answer inside
   the question text (Linear hides the message before it). Open-ended: thread replies.
-- A reply while the select is live answers it in the turn. Otherwise `clarify` returns
-  `outcome: pending`: end the turn now, never assume an answer, don't restate the
-  question (the plugin re-posts it after your final reply). The plugin adds and removes
-  `Blocked` for a pending question itself: no `linear_task_state` `unblocked` for it.
+- A reply while the select is live answers it in the turn. Otherwise `clarify` returns `outcome:
+  pending`: end the turn now, never assume an answer, don't restate the question (the plugin re-posts
+  it after your final reply and sets and clears `Blocked` for it: no `linear_task_state` `unblocked`).
   The answer comes later (restarts too) as the next turn: `Answer to "<question>": <value>`.
 - `Command not run: approval is pending in Linear…`: end the turn. On a later ``Answer to
   approval for `<cmd>`: approved (<choice>)`` re-run exactly `<cmd>` byte for byte in that
@@ -107,11 +108,10 @@ headings); `file_conflict: true` → the file changed during the sync, re-read a
 `file_error` → IDs not written, fix and re-sync. Plan approval is one select that includes the
 execution method (subagent-driven or inline). A later plan change: edit, commit, re-sync, commit again.
 
-**Implementation.** Load `superpowers:subagent-driven-development`. The ledger's
-line 1 stays its identity line; line 2 is `Linear: <ID>`. Each task's ledger entry
-names its sub-ticket, and commit messages carry the sub-ticket ID. Task progress goes
-on the sub-tickets; the project thread gets only stage changes, stop points and
-questions (a turn that only moves a task along ends with a one-line reply). Then:
+**Implementation.** Load `superpowers:subagent-driven-development`. Ledger line 1 stays its identity
+line, line 2 is `Linear: <ID>`; each task's entry names its sub-ticket, and commit messages carry the
+sub-ticket ID. Task progress goes on the sub-tickets; the project thread gets only stage changes, stop
+points and questions (a turn that only moves a task along ends with a one-line reply). Then:
 - dispatching a task's implementer: `linear_task_state(id, "in_progress")`; its review: `in_review`;
 - a fix round: back to `in_progress` (then `in_review`), plus a `linear_comment` on the sub-ticket
   with the findings being fixed; the clean review: `done` with `summary` (commits, test result,

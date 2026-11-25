@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import importlib
 import importlib.metadata
+import itertools
 import json
 import os
 import tempfile
@@ -52,7 +53,7 @@ SKILL_MD = REPO_ROOT / "hermes_linear" / "skills" / "manage-superpowers" / "SKIL
 TOOL_NAMES = ["linear_issue_get", "linear_issue_create", "linear_issue_update", "linear_comment",
               "linear_sync_spec", "linear_sync_plan", "linear_task_state", "linear_query",
               "linear_search", "linear_attach", "linear_session_link", "linear_relation",
-              "linear_lookup", "linear_document"]
+              "linear_lookup", "linear_project", "linear_document"]
 
 
 class FakeCtx:
@@ -319,24 +320,31 @@ def test_registered_handlers_return_json_strings_real_registry(monkeypatch):
         assert _json.loads(raw)["ok"] is False
 
 
-@pytest.mark.parametrize("first", ["hermes_linear.tools_lookup", "hermes_linear.tools_relation",
-                                   "hermes_linear.tools_document"])
+_SELF_REGISTERING = ("hermes_linear.tools_relation", "hermes_linear.tools_document",
+                     "hermes_linear.tools_project")
+
+
+@pytest.mark.parametrize("first", [
+    ("hermes_linear.tools_lookup",),
+    *itertools.permutations(_SELF_REGISTERING)])
 def test_import_order_fresh_interpreter(first):
-    """A tool module imported first in a fresh interpreter still yields the full roster,
-    every slot filled, and ``agent_tools`` reaches the sibling modules' helpers."""
+    """Tool modules imported first, in any order, in a fresh interpreter still yield the full
+    roster, every slot filled, and ``agent_tools`` reaches the sibling modules' helpers."""
     import subprocess
     import sys
 
-    code = (f"import {first}; from hermes_linear import agent_tools as a; "
+    imports = "; ".join(f"import {m}" for m in first)
+    code = (f"{imports}; from hermes_linear import agent_tools as a; "
             "print(','.join(a.TOOL_SCHEMAS), ','.join(a.TOOL_HANDLERS), "
             "all(a.TOOL_SCHEMAS.values()), all(callable(h) for h in a.TOOL_HANDLERS.values()), "
             "all(getattr(a, n) is a.TOOL_HANDLERS[n] for n in a.TOOL_HANDLERS), "
-            "callable(a.tools_relation.check_relation), callable(a.tools_document.doc_ref))")
+            "callable(a.tools_relation.check_relation), callable(a.tools_document.doc_ref), "
+            "callable(a.tools_project._project))")
     proc = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT,
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     roster = ",".join(TOOL_NAMES)
-    assert proc.stdout.split() == [roster, roster, "True", "True", "True", "True", "True"]
+    assert proc.stdout.split() == [roster, roster] + ["True"] * 6
 
 
 def test_manifest_declares_every_tool():

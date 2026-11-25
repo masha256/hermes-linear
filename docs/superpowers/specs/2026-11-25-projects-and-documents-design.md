@@ -100,7 +100,8 @@ refetches once and then answers `PROJECT_NOT_FOUND` with `candidates`.
   records a target and never asks.
 - **`post_update`** (`body`: required, non-empty string; `health?`). `health` takes
   `on_track | at_risk | off_track` or Linear's own `onTrack | atRisk | offTrack`; anything
-  else is `BAD_ARGS`. Without `health`, the input omits it (what Linear then shows is checked live, §6).
+  else is `BAD_ARGS`. Without `health`, the input omits it, and Linear keeps the project's
+  current health (probed, §7).
   Returns `update_id` and `url`. **Not idempotent**: a re-run posts a second update.
 - **`milestone`** (`milestone?`, `name?`, `description?`, `target_date?`). Without
   `milestone` it creates one: `name` is required (else `BAD_ARGS`). With `milestone` (a
@@ -209,7 +210,7 @@ Tools never raise; failures are `{"ok": false, "error": <code>, ...}`.
 - `plugin.yaml` `provides_tools`, `TOOL_SCHEMAS`, `TOOL_HANDLERS` and `__all__` gain
   both tools in one commit with the skill bullets.
 - `hermes_linear/skills/manage-superpowers/SKILL.md`: two tool bullets, the tool count
-  becomes fourteen, the out-of-scope list names both tools, and the re-run note gains
+  becomes fifteen, the out-of-scope list names both tools, and the re-run note gains
   "`post_update` posts again". The file stays at or under its 150-line cap.
 - The setup step 3 note "tools can't edit projects" becomes "add it with
   `linear_project` `link` (asks once)".
@@ -359,8 +360,12 @@ sync tools change to match.
 
 ## 7. Verify during implementation
 
-- What a `projectUpdateCreate` without `health` does to the project's health (probe once
-  in the test project; record the answer here).
+- Settled (RET-165 probe in the test project, 2026-11-25): a `projectUpdateCreate` without
+  `health` keeps the project's current health, and the new update itself reads back with
+  that health. An update with `onTrack` on a project with no health, then one without
+  `health`: the project read `onTrack` and so did both updates. `projectUpdates(first: N,
+  orderBy: createdAt)` returns the newest first (`first: 1` gave the second update), so
+  `get` reads the newest N.
 - The `Project` fields the `get` query reads (`status { name }`, `lead`, `targetDate`,
   `externalLinks`, `documents`, `projectMilestones`, `projectUpdates`): one live
   `linear_query` of the real `QUERY_*` constant before the task is marked done.

@@ -563,10 +563,13 @@ class FakeWorkspace:
         pid = self._proj(project_id)["id"]
         uid = f"pu-{next(self._ids)}"
         rows = self.project_updates.setdefault(pid, [])
+        # Live probe (RET-165): an update without health takes the project's current health
+        # (the update reads it back too); the project's health stays as it was.
+        if health is None:
+            health = self._meta(pid)["health"]
         rows.append({"id": uid, "created_at": f"2026-11-25T00:00:{len(rows):02d}.000Z",
                      "author": self._user_name(VIEWER), "health": health, "body": body})
-        if health is not None:
-            self._meta(pid)["health"] = health
+        self._meta(pid)["health"] = health
         return {"id": uid, "url": f"https://linear.app/x/project/{pid}/updates#{uid}"}
 
     @staticmethod

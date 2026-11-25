@@ -473,6 +473,61 @@ async def test_e2e_document_one_prompt(e2e, monkeypatch):
     assert len(h.notified) == 1 and len(ws.writes()) == 1
 
 
+async def test_e2e_project_coerced_args_one_prompt(e2e, monkeypatch):
+    """RET-165 (Review Focus 1): ``linear_project`` with raw model args. A ``get`` with
+    ``updates: "5"`` (Hermes coerces it to ``5`` for the integer schema) reads and never
+    asks. A ``post_update`` on the session ticket's own project, with ``health`` a raw
+    string, gives one card (``- project "Hermes"``); after "Allow once" the identical
+    re-call posts exactly once. The hook digests the raw args, the handler gets the real
+    ``coerce_tool_args`` output for the plugin's registered schema."""
+    import copy
+
+    from fake_workspace import PROJECT
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry
+
+    h, a, client, gw, store, ws, config = e2e
+    tool = "linear_project"
+    real_get_schema = registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(
+        agent_tools.TOOL_SCHEMAS[name]) if name == tool else real_get_schema(name))
+    ws.project_updates[PROJECT["id"]] = [
+        {"id": f"pu-{i}", "created_at": f"2026-11-0{i + 1}T00:00:00.000Z", "author": "Neo",
+         "health": None, "body": f"u{i}"} for i in range(7)]
+    raw_get = {"action": "get", "updates": "5"}
+    coerced_get = coerce_tool_args(tool, copy.deepcopy(raw_get))
+    assert coerced_get == {"action": "get", "updates": 5}
+    assert tool_approval.digest(tool, raw_get) == tool_approval.digest(tool, coerced_get)
+    got = await h.run(tool, raw_get, cid="c-get", coerced=coerced_get)
+    assert got["ok"] is True, got
+    assert [u["id"] for u in got["project"]["updates"]] == ["pu-6", "pu-5", "pu-4", "pu-3",
+                                                            "pu-2"]
+    assert h.notified == [] and ws.writes() == []
+
+    raw = {"action": "post_update", "body": "Weekly: slipping", "health": "at_risk"}
+    coerced = coerce_tool_args(tool, copy.deepcopy(raw))
+    assert coerced == raw  # strings: Hermes hands them on unchanged
+    first = await h.run(tool, raw, cid="c-first", coerced=coerced)
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert ws.writes() == []
+    d = tool_approval.digest(tool, raw)
+    assert d == tool_approval.digest(tool, coerced)
+    assert store.request(SK, d).targets == [PROJECT["id"]]
+    task = asyncio.create_task(h.run(tool, raw, cid="c-again", coerced=coerced))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert data["command"] == f"<{tool}> (plugin approval rule)"
+    assert '\n- project "Hermes"\n' in data["description"]
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out["ok"] is True and out["update_id"], out
+    assert ws.writes() == [("project_update_create",
+                            (PROJECT["id"], "Weekly: slipping", "atRisk"))]
+    assert len(h.notified) == 1 and store.request(SK, d) is None
+
+
 # ------------------------------------------- outside a Linear session (RET-148, Task 1)
 
 SLACK_SK = "agent:main:slack:dm:C0E2E:1700000000.0001"
