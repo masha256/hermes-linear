@@ -34,15 +34,18 @@ write is attributed to the app.
 |---|----------|----------|
 | Q1 | Where an issue's team and project come from, and what needs approval | Create's base is the **parent's** team and project when `parent` is given, else the session ticket's. Explicit `team` / `project` equal to the base run with no prompt; a different one is an **approval target**. Update gets `project` (no prompt for the session ticket's project or the issue's parent's project, else approval) but **no `team`**. |
 | Q2 | How `blocked` sets a relation; relation removal | `linear_task_state` gains `blocked_by: <issue>`: it also creates `<issue> blocks <task>`, and `question` becomes optional with it. Tree-only like the rest of the tool. **C deletes no relations**: `unblocked` removes only the label. |
-| Q3 | What `delegate` accepts | Any agent (app) user, **this app included**. Self-delegation runs and the result carries `starts_session: false` plus a warning that a human must delegate for a session to start. `""` / `null` clears. |
+| Q3 | What `delegate` accepts | **Amended after the live test (RET-154): Q3' = A.** Any agent (app) user **except this app**. `delegate` set to this app is refused before any write with `SELF_DELEGATION`. `assignee` set to any app user is refused with `ASSIGNEE_IS_APP`, because Linear turns an app assignee into a delegation. `""` / `null` clears. (The original Q3 = B, which allowed self-delegation with a `starts_session: false` warning, assumed Linear opens no session. It does.) |
 | Q4 | Lookup and name-resolution caching | One shared directory (`hermes_linear/directory.py`): a per-client cache entry per kind and team/project with a **300 s TTL**; a resolution miss **refetches once** before failing. `team_states` moves into it. |
 
 Facts from the brainstorm that shape these:
 
-- The router ignores a delegation the app sets (fail-closed actor check: an app-set
-  `delegateId` is a "denied delegator"), so self-delegation marks the ticket delegated in
-  Linear but starts no session (Q3). Making it start work needs a human authorization the
-  plugin records; that is a separate design, not C.
+- A delegation to this app, made by the app itself, **does** open a Linear agent session,
+  with `creator: null` (live test RET-154). The router has no actor to check, so it
+  refuses: it posts the allowlist refusal on the issue and the session ends in `error`.
+  Linear also turns `assigneeId: <an app user>` into a delegation (assignee stays null). The
+  app can't close a session without posting a visible activity (`AgentSessionUpdateInput`
+  has no `status`). Hence Q3' = A. Self-delegation that starts work would need a human
+  authorization the plugin records; that is a separate design, not C.
 - A delegate must be an app user. This workspace has one human (Mike) and one app (Neo).
 - Linear relation types are `blocks`, `duplicate`, `related` and `similar`. Blocked-by is
   `blocks` with the ends swapped. Linear clears the "blocked" flag when the blocker
@@ -72,9 +75,11 @@ Facts from the brainstorm that shape these:
   `AMBIGUOUS`. Both carry `candidates` (`[{id, name, displayName, app}]`, at most 20,
   closest substring matches first).
   - A `delegate` that is not an app user: `DELEGATE_NOT_AGENT`.
-  - A `delegate` equal to the app: the write runs and the result adds
-    `starts_session: false` and
-    `warnings: ["Delegated to this app: no session starts until a human delegates the issue."]`.
+  - A `delegate` equal to this app (`me`, its name or UUID): `SELF_DELEGATION`, no write,
+    with `message: "Only a human can delegate to this app; ask in the thread."`.
+  - An `assignee` that is an app user (this app or another): `ASSIGNEE_IS_APP`, no write,
+    with `message: "Linear turns an app assignee into a delegation; use delegate (another
+    agent) or ask a human."`. So `assignee: me` is always refused.
 - `priority`: `none|urgent|high|medium|low` (case-insensitive) or `0`–`4` (Linear's
   numbers: 0 none, 1 urgent, 2 high, 3 medium, 4 low). Anything else: `BAD_ARGS`.
 - `estimate`: an integer ≥ 0. Linear stores it even when the team doesn't use estimates
@@ -112,7 +117,7 @@ New args: `team`, `project`, `assignee`, `delegate`, `priority`, `estimate`, `du
   human approved the team (Ruling R8, from the RET-140 review).
 - State, labels and cycle resolve in the resulting team; the milestone in the resulting
   project.
-- Result as today (`{ok, issue}`) plus `starts_session` / `warnings` for self-delegation.
+- Result as today (`{ok, issue}`).
 
 ### 1.3 `linear_issue_update`
 
@@ -278,7 +283,8 @@ registers its schemas and handlers at its own end; `agent_tools.py` ends with ba
   tools do.
 - New plugin codes: `STATE_NOT_FOUND`, `USER_NOT_FOUND`, `AMBIGUOUS`, `DELEGATE_NOT_AGENT`,
   `CYCLE_NOT_FOUND`, `MILESTONE_NOT_FOUND`, `PROJECT_NOT_FOUND`, `TEAM_NOT_FOUND`,
-  `ALREADY_RELATED`, `COMMENT_NOT_ON_ISSUE`, `RELATION_CONFLICT`.
+  `ALREADY_RELATED`, `COMMENT_NOT_ON_ISSUE`, `RELATION_CONFLICT`, `SELF_DELEGATION`,
+  `ASSIGNEE_IS_APP`.
 - `linear_task_state`'s own "the team has no such state" (`_target_state`) stays `BAD_ARGS`:
   that is not a name the agent supplied.
 
@@ -291,7 +297,7 @@ Rewrite first the tests that pin old behaviour (a bad state's `BAD_ARGS` on crea
 for the right reason, then implement. All tool tests go through the real registry.
 
 - `issue_fields`: each field's parse (good and bad values), every miss code with
-  candidates, `me`, self-delegation's `starts_session` / warning, `DELEGATE_NOT_AGENT`,
+  candidates, `me`, `SELF_DELEGATION`, `ASSIGNEE_IS_APP`, `DELEGATE_NOT_AGENT`,
   `AMBIGUOUS`, clearing on update, `null` on create.
 - Create base: with and without a parent; `team` / `project` equal to the base (no
   target) and different (target; `APPROVAL_REQUIRED`; approved re-call writes with the
@@ -322,7 +328,8 @@ for the right reason, then implement. All tool tests go through the real registr
   `linear_relation` and `linear_lookup` and the new args (tool count wording updated),
   staying at or under the 150-line cap by reflowing existing text. The SDD `blocked` bullet
   mentions `blocked_by`. The Large-projects line "The tools cannot set a delegate" becomes:
-  the tools can set one, but a delegation by the app starts no session, so ask the user.
+  the tools can set another agent as delegate, but never this app (`SELF_DELEGATION`), so ask
+  the user to delegate.
 - The neo `linear-agent-sessions` skill ("What the app can't do", rule 4b's list of gated
   tools) is edited after `deploy-live` and Mike's restart.
 
@@ -353,12 +360,12 @@ the report lists what each probe created.
 In `hermes linear test project`, from a delegated test ticket, after `deploy-live` and a
 restart:
 
-1. Create a sub-issue with assignee `me`, priority `high`, due date, milestone: runs with
-   no prompt, fields set.
+1. Create a sub-issue with priority `high`, due date, milestone: runs with no prompt,
+   fields set.
 2. Create with `project` = another project: Allow once card shows `project "<name>"`;
    approve; the re-call creates it there. A second, identical call prompts again.
-3. Update the sub-issue's assignee, priority and due date; then `delegate: me`: the result
-   says `starts_session: false` with the warning, and no session starts in Linear.
+3. Update the sub-issue's priority and due date; then `delegate: me` → `SELF_DELEGATION`
+   and `assignee: me` → `ASSIGNEE_IS_APP`, neither writes, and no agent session opens.
 4. A bad state name and an unknown label: `STATE_NOT_FOUND` / `LABEL_MISSING` with
    candidates; `linear_lookup states` / `labels` shows the same.
 5. `linear_relation` between two in-tree issues (`blocks`), repeat → `ALREADY_RELATED`;
