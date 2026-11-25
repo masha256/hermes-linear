@@ -1348,7 +1348,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
         "description": ("Create a Linear issue as the Linear app, in the parent's team and "
                         "project (with parent: a sub-issue), else the session issue's. A "
                         "team or project other than that needs a human's approval. "
-                        "Delegating to this app starts no session. " + _GATED_NOTE),
+                        "Delegating to this app is refused (SELF_DELEGATION). " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "title": {"type": "string"},
             "description": {"type": "string", "description": "Markdown."},
