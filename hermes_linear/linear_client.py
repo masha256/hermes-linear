@@ -299,11 +299,11 @@ QUERY_DOCUMENT_GET = """query DocumentGet($id: String!) {
 }"""
 
 QUERY_ISSUE_DOCUMENTS = """query IssueDocuments($id: String!) {
-  issue(id: $id) { documents(first: 250) { nodes { id title url } } }
+  issue(id: $id) { documents(first: 250) { nodes { id title url creator { id } } } }
 }"""
 
 QUERY_PROJECT_DOCUMENTS = """query ProjectDocuments($id: String!) {
-  project(id: $id) { documents(first: 250) { nodes { id title url } } }
+  project(id: $id) { documents(first: 250) { nodes { id title url creator { id } } } }
 }"""
 
 MUTATION_DOCUMENT_CREATE = """mutation DocumentCreate($input: DocumentCreateInput!) {
@@ -996,8 +996,9 @@ class LinearClient:
 
     async def documents_on(self, issue_id: str | None = None,
                            project_id: str | None = None) -> list[dict]:
-        """``[{id, title, url}]``: the first 250 documents of exactly one of an issue or a
-        project. A null issue/project is ``NOT_FOUND``."""
+        """``[{id, title, url, creator_id}]``: the first 250 documents of exactly one of an
+        issue or a project (``creator_id`` is ``None`` without a creator, e.g. a deleted
+        user). A null issue/project is ``NOT_FOUND``."""
         if (issue_id is None) == (project_id is None):
             raise ValueError("documents_on needs exactly one of issue_id and project_id")
         query, key, ref = ((QUERY_ISSUE_DOCUMENTS, "issue", issue_id) if issue_id is not None
@@ -1005,7 +1006,9 @@ class LinearClient:
         node = (await self.gql(query, {"id": ref})).get(key)
         if not isinstance(node, dict):
             raise LinearError(f"{key} not found", code="NOT_FOUND")
-        return self._doc_rows(node.get("documents"))
+        conn = node.get("documents")
+        return [{**row, "creator_id": (d.get("creator") or {}).get("id")}
+                for row, d in zip(self._doc_rows(conn), self._nodes(conn))]
 
     async def document_create(self, title: str, content: str, *, issue_id: str | None,
                               project_id: str | None) -> dict:

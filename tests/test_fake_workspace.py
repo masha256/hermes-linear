@@ -20,7 +20,10 @@ def test_documents_roundtrip():
     iid = ws.add_issue("RET-1", title="T")
     made = run(ws.document_create("Spec", "# s", issue_id=iid, project_id=None))
     assert run(ws.documents_on(issue_id="RET-1")) == [
-        {"id": made["id"], "title": "Spec", "url": made["url"]}]
+        {"id": made["id"], "title": "Spec", "url": made["url"], "creator_id": "app-user"}]
+    human = ws.add_document("Notes", issue=iid, creator="human-1")
+    assert run(ws.documents_on(issue_id=iid))[-1]["creator_id"] == "human-1"
+    del ws.documents[human]
     slug = ws.documents[made["id"]]["slugId"]
     got = run(ws.document_get(slug))
     assert got["issue"] == {"id": iid, "identifier": "RET-1", "title": "T"}

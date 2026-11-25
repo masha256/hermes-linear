@@ -1091,19 +1091,19 @@ async def test_document_get_other_errors_raise(fake, client):
 
 
 async def test_documents_on_issue_and_project(fake, client):
-    docs = [{"id": "d1", "title": "Spec", "url": "https://e.test/d1"},
-            {"id": "d2", "title": None, "url": "https://e.test/d2"}]
+    docs = [{"id": "d1", "title": "Spec", "url": "https://e.test/d1", "creator": {"id": "u1"}},
+            {"id": "d2", "title": None, "url": "https://e.test/d2", "creator": None}]
     fake.on("IssueDocuments", {"data": {"issue": {"documents": {"nodes": docs}}}})
     fake.on("ProjectDocuments", {"data": {"project": {"documents": {"nodes": docs[:1]}}}})
+    row1 = {"id": "d1", "title": "Spec", "url": "https://e.test/d1", "creator_id": "u1"}
     assert await client.documents_on(issue_id="i-1") == [
-        {"id": "d1", "title": "Spec", "url": "https://e.test/d1"},
-        {"id": "d2", "title": "", "url": "https://e.test/d2"}]
-    assert await client.documents_on(project_id="p-1") == [docs[0]]
+        row1, {"id": "d2", "title": "", "url": "https://e.test/d2", "creator_id": None}]
+    assert await client.documents_on(project_id="p-1") == [row1]
     (ic,) = fake.gql_calls("IssueDocuments")
     (pc,) = fake.gql_calls("ProjectDocuments")
     assert ic.variables == {"id": "i-1"} and pc.variables == {"id": "p-1"}
-    assert "documents(first: 250) { nodes { id title url } }" in _q(ic)
-    assert "documents(first: 250) { nodes { id title url } }" in _q(pc)
+    assert "documents(first: 250) { nodes { id title url creator { id } } }" in _q(ic)
+    assert "documents(first: 250) { nodes { id title url creator { id } } }" in _q(pc)
 
 
 async def test_documents_on_needs_exactly_one_target(fake, client):

@@ -54,7 +54,8 @@ Usage::
 
 - documents and projects (RET-163): ``documents`` (id -> ``{id, slugId, title, content,
   url, issue, project, creator, updated_at}``; ``add_document`` seeds one) behind
-  ``document_get`` (UUID or slugId; unknown is ``None``) / ``documents_on`` /
+  ``document_get`` (UUID or slugId; unknown is ``None``) / ``documents_on`` (rows carry
+  ``creator_id``) /
   ``document_create`` / ``document_update`` (``title``/``content`` only, else
   ``AssertionError``); ``issue_details`` lists the issue's documents. ``project_detail``
   reads ``project_meta`` (status, health, lead, target date per project), ``project_links``,
@@ -517,7 +518,8 @@ class FakeWorkspace:
             key, ref = "issue", self.issue(issue_id)["id"]
         else:
             key, ref = "project", self._proj(project_id)["id"]
-        return [self._doc_row(d) for d in self.documents.values() if d[key] == ref]
+        return [{**self._doc_row(d), "creator_id": d["creator"]}
+                for d in self.documents.values() if d[key] == ref]
 
     async def document_create(self, title: str, content: str, *, issue_id: str | None,
                               project_id: str | None) -> dict:

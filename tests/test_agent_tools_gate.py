@@ -302,7 +302,8 @@ def test_session_only_tools_refuse_outside(pin_ctx, ws, adapter, tmp_path):
         "ok": False, "error": "NOT_LINEAR_SESSION"}
     spec = tmp_path / "spec.md"
     spec.write_text("# Spec\n\nLinear: RET-1\n", encoding="utf-8")
-    assert linear_sync_spec({"path": str(spec)}) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert linear_sync_spec({"path": str(spec), "summary": "S."}) == {
+        "ok": False, "error": "NOT_LINEAR_SESSION"}
     plan = tmp_path / "plan.md"
     plan.write_text("# Plan\n\nLinear: RET-1\n\n### Task 1: Alpha\n\nDo it.\n",
                     encoding="utf-8")

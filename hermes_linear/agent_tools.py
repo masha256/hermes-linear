@@ -1042,7 +1042,7 @@ async def _comment(ctx: ToolContext, a: dict) -> dict:
     return done(await ctx.client.comment_create(issue["id"], text), False)
 
 
-# -- linear_sync_spec (RET-77)
+# -- linear_sync_spec (RET-77; RET-168 spec §6)
 
 
 def _read_source(args: dict, key: str = "path") -> tuple[Path, str]:
@@ -1059,21 +1059,99 @@ def _read_source(args: dict, key: str = "path") -> tuple[Path, str]:
     return p, text
 
 
+def _sync_summary(args: dict) -> str:
+    """The required ``summary`` (spec §6.1): stripped, non-empty, at most
+    ``SYNC_SUMMARY_MAX`` UTF-16 units, else BAD_ARGS. hermes-linear markers are dropped
+    first: a part marker in the summary would split the description on the next sync."""
+    raw = args.get("summary")
+    if not isinstance(raw, str):
+        raise _Refusal("BAD_ARGS")
+    summary = ANY_MARKER_RE.sub("", raw).strip()
+    if not summary or sync.utf16_len(summary) > sync.SYNC_SUMMARY_MAX:
+        raise _Refusal("BAD_ARGS")
+    return summary
+
+
 def _parse_sync_spec(args: dict) -> dict:
-    """In the tool thread, off the loop: read the file, its header, and git (sync.py)."""
+    """In the tool thread, off the loop: the summary, then the file, its header and git."""
+    summary = _sync_summary(args)
     p, text = _read_source(args)
     ticket = sync.read_linear_header(text)
     if ticket is None:
         raise _Refusal("NO_LINEAR_HEADER")
-    description, inline = sync.spec_description(text, sync.source_info(p))
-    return {"ticket": ticket, "description": description, "inline": inline}
+    info = sync.source_info(p)
+    content, inline = sync.document_content(text, info)
+    return {"ticket": ticket, "summary": summary, "info": info, "inline": inline,
+            "title": sync.doc_title("Spec", text, str(p)), "content": content}
+
+
+def _doc_ref(d: dict) -> dict:
+    return {"id": d.get("id"), "title": d.get("title"), "url": d.get("url")}
+
+
+async def _sync_document(ctx: ToolContext, issue: dict, kind: str, title: str,
+                         content: str) -> dict:
+    """Create or update the app's ``<kind>: …`` document on ``issue`` (spec §6.2).
+
+    Candidates are the issue's documents the app created (``creator_id`` = the viewer)
+    whose title starts with ``<kind>:``; a human's document is never read or touched. None:
+    ``document_create`` (recorded for the session ticket in a Linear session). One: a
+    ``document_update`` of the title (only when it differs) and the content (only when
+    its stored hash marker differs from ``content``'s); neither -> ``document_skipped``.
+    Two or more: ``AMBIGUOUS`` with their ``{id, title, url}``, before any write.
+    Returns ``{document_id, document_url, document_created, document_skipped}``.
+    """
+    client = ctx.client
+    me = await client.viewer_id()
+    prefix = f"{kind}:"
+    mine = [d for d in await client.documents_on(issue_id=issue["id"])
+            if d.get("creator_id") == me and (d.get("title") or "").startswith(prefix)]
+    if len(mine) > 1:
+        raise _Refusal("AMBIGUOUS", extra={"documents": [_doc_ref(d) for d in mine]})
+    if not mine:
+        made = await client.document_create(title, content, issue_id=issue["id"],
+                                            project_id=None)
+        store = getattr(ctx.adapter, "_store", None)
+        if ctx.session_issue_id and not ctx.outside and store is not None:
+            store.record_document(ctx.session_issue_id, made["id"])
+        return {"document_id": made["id"], "document_url": made.get("url"),
+                "document_created": True, "document_skipped": False}
+    doc = mine[0]
+    fields: dict[str, str] = {}
+    if doc.get("title") != title:
+        fields["title"] = title
+    stored = await client.document_get(doc["id"])
+    # Linear may normalize stored markdown: compare the hash marker, never the text.
+    if stored is None or sync.read_desc_hash(stored.get("content")) \
+            != sync.read_desc_hash(content):
+        fields["content"] = content
+    url = doc.get("url")
+    if fields:
+        url = (await client.document_update(doc["id"], fields)).get("url") or url
+    return {"document_id": doc["id"], "document_url": url, "document_created": False,
+            "document_skipped": not fields}
 
 
 async def _sync_spec(ctx: ToolContext, a: dict) -> dict:
     issue = await _writable(ctx, a["ticket"])
-    out = await ctx.client.issue_update(issue["id"], {"description": a["description"]})
-    return {"ok": True, "issue": out.get("identifier") or issue.get("identifier"),
-            "url": out.get("url") or issue.get("url"), "inline": a["inline"]}
+    doc = await _sync_document(ctx, issue, "Spec", a["title"], a["content"])
+    current = issue.get("description")
+    source = sync.source_line("Spec", a["title"], doc["document_url"] or "", a["info"])
+    new = sync.spec_part(a["summary"], source)
+    _before, plan_part = sync.split_plan_part(current)
+    if plan_part is not None:
+        new = f"{new}\n\n{plan_part}"
+    url = issue.get("url")
+    if not sync.same_description(current, new):
+        try:
+            out = await ctx.client.issue_update(issue["id"], {"description": new})
+        except LinearError as exc:  # §6.5: say what was written so far
+            return {"ok": False, "error": exc.code or "LINEAR_ERROR",
+                    "message": exc.detail or str(exc), "document_id": doc["document_id"],
+                    "document_url": doc["document_url"]}
+        url = out.get("url") or url
+    return {"ok": True, "issue": issue.get("identifier"), "url": url, **doc,
+            "inline": a["inline"]}
 
 
 # -- linear_sync_plan (RET-78)
@@ -1582,14 +1660,25 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_sync_spec": {
         "name": "linear_sync_spec",
         "description": ("Mirror a committed spec file onto the Linear ticket named by its "
-                        "'Linear: <ID>' header, as the Linear app: overwrites the ticket "
-                        "description with the file plus a source footer (only section 1 and "
-                        "a link if the spec is over 200,000 chars). Commit the file first; "
-                        "uncommitted edits are marked as such."),
+                        "'Linear: <ID>' header, as the Linear app. The whole file plus a "
+                        "source footer goes to a 'Spec: <H1>' document on that ticket, found "
+                        "again by the 'Spec:' title prefix among the app's own documents "
+                        "(a changed H1 retitles it; a human's document is never touched; "
+                        "an unchanged file is not rewritten; over 250,000 chars the file is "
+                        "cut with a link, inline: false). The ticket description becomes "
+                        "your summary plus a link line to the document and the source; "
+                        "the plan part after it (written by linear_sync_plan) is kept. Two "
+                        "app documents with the prefix -> AMBIGUOUS with their ids, nothing "
+                        "written. Commit the file first; uncommitted edits are marked as "
+                        "such."),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string",
                      "description": "Absolute path to the spec file."},
-        }, "required": ["path"]},
+            "summary": {"type": "string",
+                        "description": ("Required: a few sentences on what the spec builds "
+                                        "and its key decisions, written into the ticket "
+                                        "description as given (at most 5,000 chars).")},
+        }, "required": ["path", "summary"]},
     },
     "linear_sync_plan": {
         "name": "linear_sync_plan",
