@@ -24,6 +24,14 @@ REQUIRED_TEXT = (
     "call is then pre-approved once."
 )
 
+#: ``APPROVAL_REQUIRED`` text for a gated call from a non-Linear session (RET-148 spec §2.1).
+#: Never deferred: the approval is asked in the calling chat and ends there.
+REQUIRED_TEXT_OUTSIDE = (
+    "Not run: writing to Linear from outside a Linear session needs a human's approval "
+    "({targets}). Call {tool} again with identical arguments to ask in this chat. If it "
+    "is denied or times out, do not retry."
+)
+
 _PREVIEW_MAX = 1500
 _RULE_COMMAND_RE = re.compile(r"^<(linear_[a-z_]+)> \(plugin approval rule\)$")
 _DIGEST_LINE_RE = re.compile(r"^digest: ([0-9a-f]{16})$")
@@ -131,8 +139,24 @@ def digest(tool: str, args: Any) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def rule_key(tool: str, digest: str) -> str:
-    return f"{tool}:{digest}"
+def rule_key(tool: str, digest: str, outside: bool = False) -> str:
+    """Hermes's ``[a]lways`` allowlist grain for a gated call (``plugin_rule:<key>`` in core).
+
+    In a Linear session it is ``<tool>:<digest>`` (unchanged, so existing grants keep
+    working); from outside one it is ``<tool>:outside:<digest>``, so a permanent off-Linear
+    grant never pre-approves the identical call in a Linear session, nor the reverse."""
+    return f"{tool}:outside:{digest}" if outside else f"{tool}:{digest}"
+
+
+#: ``HERMES_SESSION_PLATFORM`` of a Linear session.
+LINEAR_PLATFORM = "linear"
+
+
+def is_linear_platform(platform: str | None) -> bool:
+    """Whether a bound ``HERMES_SESSION_PLATFORM`` is a Linear session. The ONE predicate
+    for "inside vs outside": anything else, an unbound platform included (a script, a
+    thread without session variables), is outside a Linear session."""
+    return platform == LINEAR_PLATFORM
 
 
 def _cut(value: Any) -> Any:
@@ -152,12 +176,16 @@ def _one_line(value: object) -> str:
     return str(value or "").replace("\r", " ").replace("\n", " ")
 
 
-def approval_message(tool: str, targets: list[dict], args: dict, digest: str) -> str:
+def approval_message(tool: str, targets: list[dict], args: dict, digest: str,
+                     outside: bool = False) -> str:
     """Human-facing approval description; its last line carries the digest.
 
     An issue target is ``- RET-n "title"``; a team or project target (one with ``kind``)
-    is ``- project "<name>"`` / ``- team "<key>"``, its name in ``identifier``."""
-    lines = [f"Approve `{tool}` outside this session's tickets?"]
+    is ``- project "<name>"`` / ``- team "<key>"``, its name in ``identifier``.
+    ``outside``: the call comes from a non-Linear session (RET-148), so the first line says
+    so instead of naming the session's tickets."""
+    lines = [f"Approve `{tool}` from outside a Linear session?" if outside
+             else f"Approve `{tool}` outside this session's tickets?"]
     for target in targets:
         identifier = _one_line(target.get("identifier", ""))
         if target.get("kind"):

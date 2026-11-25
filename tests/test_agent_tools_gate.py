@@ -12,12 +12,15 @@ import dataclasses
 
 import pytest
 
-from test_agent_tools_generic import SELF, adapter, loop, pin_ctx, ws  # noqa: F401 - fixtures
+from test_agent_tools_generic import (FOOTER, SELF, adapter, loop, origin,  # noqa: F401
+                                      pin_ctx, seed_other_team, ws)
+from fake_workspace import PROJECT, TEAM
 
 from hermes_linear.linear_client import LinearError
 from hermes_linear.tool_approval import digest
 from hermes_linear.agent_tools import (TOOL_SCHEMAS, linear_comment, linear_issue_create,
-                                       linear_issue_update, linear_task_state)
+                                       linear_issue_update, linear_sync_plan,
+                                       linear_sync_spec, linear_task_state)
 
 
 def _mode(adapter, mode):
@@ -195,10 +198,223 @@ def test_undigestable_args_refused_without_request(pin_ctx, ws, adapter):
     assert ws.writes() == [] and _requests(adapter) == 0
 
 
-def test_not_linear_session_never_gated(pin_ctx, ws, adapter):
+# ----------------------------------------------------- outside a Linear session (RET-148)
+
+
+def _outside(adapter, mode):
+    adapter._settings = dataclasses.replace(adapter._settings, outside_session_writes=mode)
+
+
+IN_TREE = {"id": "RET-2", "body": "hi"}  # in scope inside RET-1's session
+
+
+def test_outside_comment_first_call_requires_approval(pin_ctx, ws, adapter):
     pin_ctx(linear=False)
-    assert linear_comment(dict(COMMENT)) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    out = linear_comment(dict(IN_TREE))  # outside, every target is out of scope
+    assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED"
+    assert "outside a Linear session" in out["message"] and "RET-2" in out["message"]
+    assert "linear_comment" in out["message"]
+    assert ws.writes() == [] and _requests(adapter) == 1
+    req = adapter._store.request("sk", digest("linear_comment", IN_TREE))
+    assert req.targets == ["uuid-child"] and req.tool == "linear_comment"
+    assert req.message.splitlines()[0] == (
+        "Approve `linear_comment` from outside a Linear session?")
+
+
+def test_outside_armed_request_writes_once(pin_ctx, ws, adapter, origin):
+    pin_ctx(linear=False)
+    dg = digest("linear_comment", IN_TREE)
+    assert linear_comment(dict(IN_TREE))["error"] == "APPROVAL_REQUIRED"
+    assert adapter._store.arm_request("sk", dg) is not None
+    out = linear_comment(dict(IN_TREE))
+    assert out["ok"] is True and out["issue"] == "RET-2"
+    assert [c["body"] for c in _comments_on(ws, "uuid-child")] == ["hi" + FOOTER]
+    assert adapter._store.request("sk", dg) is None  # consumed
+    assert linear_comment(dict(IN_TREE))["error"] == "APPROVAL_REQUIRED"
+    assert len(_comments_on(ws, "uuid-child")) == 1
+
+
+def test_outside_deny_refuses_not_linear_session(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    _outside(adapter, "deny")
+    assert linear_comment(dict(IN_TREE)) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert linear_issue_update({"id": "RET-2", "title": "x"}) == {
+        "ok": False, "error": "NOT_LINEAR_SESSION"}
     assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_outside_allow_writes_without_request(pin_ctx, ws, adapter, origin):
+    pin_ctx(linear=False)
+    _outside(adapter, "allow")
+    out = linear_comment(dict(IN_TREE))
+    assert out["ok"] is True
+    assert [c["body"] for c in _comments_on(ws, "uuid-child")] == ["hi" + FOOTER]
+    assert _requests(adapter) == 0
+
+
+def test_outside_no_session_key_refused(pin_ctx, ws, adapter):
+    pin_ctx(linear=False, key=None)  # approve mode, but nobody can be asked
+    assert linear_comment(dict(IN_TREE)) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_knobs_are_independent(pin_ctx, ws, adapter):
+    _mode(adapter, "allow")
+    _outside(adapter, "deny")
+    pin_ctx(linear=False)
+    assert linear_comment(dict(IN_TREE)) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    pin_ctx()
+    assert linear_comment(dict(COMMENT))["ok"] is True  # inside OTH-9: written
+    assert len(_comments_on(ws, "uuid-other")) == 1
+    _mode(adapter, "deny")
+    _outside(adapter, "allow")
+    pin_ctx(linear=False)
+    assert linear_comment(dict(IN_TREE))["ok"] is True
+    pin_ctx()
+    assert linear_comment(dict(COMMENT)) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert len(_comments_on(ws, "uuid-other")) == 1 and _requests(adapter) == 0
+
+
+def test_outside_update_both_ends_are_targets(pin_ctx, ws, adapter):
+    ws.add_issue("RET-3", title="Sibling", uuid="uuid-sib", parent=SELF)
+    pin_ctx(linear=False)
+    args = {"id": "RET-2", "parent": "RET-3"}
+    out = linear_issue_update(dict(args))
+    assert out["error"] == "APPROVAL_REQUIRED"
+    assert "RET-2" in out["message"] and "RET-3" in out["message"]
+    assert ws.writes() == [] and _requests(adapter) == 1
+    req = adapter._store.request("sk", digest("linear_issue_update", args))
+    assert set(req.targets) == {"uuid-child", "uuid-sib"}
+    adapter._store.arm_request("sk", req.digest)
+    assert linear_issue_update(dict(args))["ok"] is True
+    assert ws.issues["uuid-child"]["parent"] == "uuid-sib"
+
+
+def test_linear_platform_without_ticket_still_refused(pin_ctx, ws, adapter):
+    pin_ctx(linear=True, issue=None)  # a Linear call whose turn can't be found: not outside
+    assert linear_comment(dict(IN_TREE)) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_session_only_tools_refuse_outside(pin_ctx, ws, adapter, tmp_path):
+    pin_ctx(linear=False)  # the session key is bound this time
+    assert linear_task_state({"id": "RET-2", "state": "in_progress"}) == {
+        "ok": False, "error": "NOT_LINEAR_SESSION"}
+    spec = tmp_path / "spec.md"
+    spec.write_text("# Spec\n\nLinear: RET-1\n", encoding="utf-8")
+    assert linear_sync_spec({"path": str(spec)}) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    plan = tmp_path / "plan.md"
+    plan.write_text("# Plan\n\nLinear: RET-1\n\n### Task 1: Alpha\n\nDo it.\n",
+                    encoding="utf-8")
+    assert linear_sync_plan({"path": str(plan)}) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+# ------------------------------------- linear_issue_create outside a session (RET-148)
+
+
+def _outside_dest(adapter, team="RET", project=""):
+    adapter._settings = dataclasses.replace(adapter._settings, default_team=team,
+                                            default_project=project)
+
+
+def test_outside_create_request_names_destination(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    _outside_dest(adapter, project=PROJECT["name"])
+    args = {"title": "From Slack"}
+    out = linear_issue_create(dict(args))
+    assert out["ok"] is False and out["error"] == "APPROVAL_REQUIRED", out
+    assert "outside a Linear session" in out["message"] and "RET / Hermes" in out["message"]
+    assert "approval (destination RET / Hermes)." in out["message"]
+    assert ws.writes() == [] and _requests(adapter) == 1
+    req = adapter._store.request("sk", digest("linear_issue_create", args))
+    assert req.targets == [f"destination:{TEAM}/{PROJECT['id']}"]
+    assert req.message.splitlines()[0] == (
+        "Approve `linear_issue_create` from outside a Linear session?")
+    assert '- destination "RET / Hermes"' in req.message
+    adapter._store.arm_request("sk", req.digest)
+    done = linear_issue_create(dict(args))
+    assert done["ok"] is True, done
+    stored = ws.issues[done["issue"]["id"]]
+    assert stored["team"] == TEAM and stored["project"] == PROJECT
+    assert adapter._store.request("sk", req.digest) is None  # consumed
+    # without a project the destination is the team alone
+    _outside_dest(adapter)
+    out = linear_issue_create({"title": "Loose"})
+    assert out["error"] == "APPROVAL_REQUIRED"
+    assert "approval (destination RET, no project)." in out["message"]  # no nested parens
+    req = adapter._store.request("sk", digest("linear_issue_create", {"title": "Loose"}))
+    assert req.targets == [f"destination:{TEAM}/-"]
+    assert '- destination "RET, no project"' in req.message
+
+
+def test_outside_create_base_destination_is_a_target(pin_ctx, ws, adapter):
+    """Ruling 3: outside, team/project EQUAL to the base still need approval (RET-121 records
+    no target for them inside a session); one destination target names both."""
+    pin_ctx(linear=False)
+    _outside_dest(adapter, project=PROJECT["name"])
+    args = {"title": "x", "team": "RET", "project": "Hermes"}
+    assert linear_issue_create(dict(args))["error"] == "APPROVAL_REQUIRED"
+    req = adapter._store.request("sk", digest("linear_issue_create", args))
+    assert req.targets == [f"destination:{TEAM}/{PROJECT['id']}"]
+    assert ws.writes() == []
+
+
+def test_outside_create_with_parent_two_targets(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    _outside_dest(adapter, team="")  # with a parent no default team is needed
+    args = {"title": "Sub", "parent": "RET-2"}
+    out = linear_issue_create(dict(args))
+    assert out["error"] == "APPROVAL_REQUIRED"
+    assert "RET-2" in out["message"] and "RET / Hermes" in out["message"]
+    req = adapter._store.request("sk", digest("linear_issue_create", args))
+    assert req.targets == ["uuid-child", f"destination:{TEAM}/{PROJECT['id']}"]
+    assert ws.writes() == []
+    adapter._store.arm_request("sk", req.digest)
+    done = linear_issue_create(dict(args))
+    assert done["ok"] is True, done
+    assert ws.issues[done["issue"]["id"]]["parent"] == "uuid-child"
+    assert ws.issues[done["issue"]["id"]]["project"] == PROJECT  # the parent's project
+    assert adapter._store.created_by(SELF) == set()
+
+
+@pytest.mark.parametrize("team,project", [("OTH", ""), ("RET", "Elsewhere"), ("RET", "")])
+def test_outside_create_destination_changed_refused(pin_ctx, ws, adapter, team, project):
+    """An approved re-run bound to its destination: a default team or project that moved
+    (or a project dropped) between approval and re-run is OUT_OF_SCOPE, nothing written."""
+    pin_ctx(linear=False)
+    seed_other_team(ws)
+    _outside_dest(adapter, project=PROJECT["name"])
+    args = {"title": "x"}
+    assert linear_issue_create(dict(args))["error"] == "APPROVAL_REQUIRED"
+    adapter._store.arm_request("sk", digest("linear_issue_create", args))
+    _outside_dest(adapter, team=team, project=project)  # the defaults moved meanwhile
+    assert linear_issue_create(dict(args)) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert ws.writes() == [] and _requests(adapter) == 0  # taken, nothing new stored
+
+
+def test_outside_create_approved_parent_swapped_refused(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    _outside_dest(adapter)
+    args = {"title": "Sub", "parent": "RET-2"}
+    linear_issue_create(dict(args))
+    adapter._store.arm_request("sk", digest("linear_issue_create", args))
+    ws.issues["uuid-child"]["identifier"] = "RET-OLD"  # RET-2 now names another issue
+    ws.add_issue("RET-2", uuid="uuid-moved")
+    assert linear_issue_create(dict(args)) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert ws.writes() == []
+
+
+def test_outside_create_allow_writes_once(pin_ctx, ws, adapter):
+    pin_ctx(linear=False)
+    _outside_dest(adapter, project=PROJECT["name"])
+    _outside(adapter, "allow")
+    out = linear_issue_create({"title": "x", "parent": "RET-2"})
+    assert out["ok"] is True
+    assert [c[0] for c in ws.writes()] == ["issue_create"] and _requests(adapter) == 0
+    _outside(adapter, "deny")
+    assert linear_issue_create({"title": "x"}) == {"ok": False, "error": "NOT_LINEAR_SESSION"}
+    assert len(ws.writes()) == 1
 
 
 def test_scope_error_code_not_gated(pin_ctx, ws, adapter, monkeypatch):

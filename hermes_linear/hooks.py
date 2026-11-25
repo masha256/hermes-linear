@@ -50,7 +50,6 @@ from .questions import APPROVAL_PENDING_TEXT, PENDING_NOTICE
 
 log = logging.getLogger(__name__)
 
-PLATFORM = "linear"
 _SILENT_TOOLS = frozenset({"clarify"})  # rendered as an elicitation by outbound.clarify
 _BRIDGE_TOOL = "tool_call"  # tools/tool_search_catalog.py TOOL_CALL_NAME
 
@@ -104,10 +103,12 @@ def _bridged_call(tool_name: Any, args: Any) -> tuple[Any, Any]:
 
 
 def _gated_request(tool_name: Any, args: Any) -> tuple | None:
-    """``(store, session_key, tool, digest, request)`` for a gated tool call in a Linear
-    session whose approval request is stored in some adapter's store, else None."""
-    if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
-        return None
+    """``(store, session_key, tool, digest, request)`` for a gated tool call whose approval
+    request is stored in some adapter's store under the bound session key, else None.
+
+    Any platform (RET-148 spec §2 item 5): a request is found only by ``(session key,
+    digest)``, and Hermes session keys of different platforms never collide, so a Slack
+    request can't be armed from a Linear session or the reverse."""
     session_key = get_session_env("HERMES_SESSION_KEY") or None
     if not session_key:
         return None
@@ -137,13 +138,17 @@ def _approve_directive(tool_name: Any, args: Any) -> dict | None:
     req = store.arm_request(session_key, d)
     if req is None:  # dropped meanwhile
         return None
+    # Final review: an off-Linear call gets its own allowlist grain, so a permanent grant
+    # given on Slack/CLI never pre-approves the identical call in a Linear session.
+    outside = not tool_approval.is_linear_platform(
+        get_session_env("HERMES_SESSION_PLATFORM") or None)
     return {"action": "approve", "message": req.message,
-            "rule_key": tool_approval.rule_key(tool, d)}
+            "rule_key": tool_approval.rule_key(tool, d, outside=outside)}
 
 
 def _session(kw: dict) -> dict | None:
     """The bound Linear session vars, or None when this is not a Linear session."""
-    if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
+    if not tool_approval.is_linear_platform(get_session_env("HERMES_SESSION_PLATFORM") or None):
         return None
     return {
         "session_key": get_session_env("HERMES_SESSION_KEY") or None,
@@ -337,7 +342,8 @@ def on_transform_tool_result(tool_name: str, args: Any = None, result: Any = Non
     the agent thread: store access only, no network I/O or loop hop; any failure leaves the
     result untouched (None)."""
     try:
-        if get_session_env("HERMES_SESSION_PLATFORM") != PLATFORM:
+        if not tool_approval.is_linear_platform(
+                get_session_env("HERMES_SESSION_PLATFORM") or None):
             return None
         session_key = get_session_env("HERMES_SESSION_KEY") or None
         if not session_key:

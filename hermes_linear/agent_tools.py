@@ -38,7 +38,6 @@ from .linear_client import LinearError
 
 log = logging.getLogger(__name__)
 
-PLATFORM = "linear"
 SCOPE_PARENT_DEPTH = 5  # parent levels walked by check_write_scope
 CYCLE_WALK_DEPTH = 50  # ancestor levels walked before a reparent; deeper fails closed
 RESOLVE_TIMEOUT_S = 5.0  # per-adapter turn lookup (pure in-memory/store work on the loop)
@@ -98,6 +97,10 @@ class ToolContext:
     session_key: str | None
     is_linear: bool
     gate: Gate | None = None  # set only for a gated tool's pass (``_tool(gated=...)``)
+    #: The call comes from a non-Linear session (Slack, cron, …; RET-148 spec §2): no
+    #: session issue, ``session_key`` is the caller's own. Gated writes then go through
+    #: ``outside_session_writes``. A Linear call without its ticket is NOT outside.
+    outside: bool = False
 
 
 def _err(code: str) -> dict:
@@ -180,7 +183,9 @@ def resolve_context(session_id: str | None = None) -> ToolContext:
     ``HERMES_SESSION_KEY``, else the one whose store has the message id, else the chat (the
     ``hooks._route`` order). Outside Linear, or when no turn is found, reads still work on the
     adapter of the session's profile (``HERMES_SESSION_PROFILE``), else the first in
-    ``ADAPTERS``, with no session issue (writes are refused). Any unexpected failure yields a
+    ``ADAPTERS``, with no session issue. Outside Linear the context is ``outside`` and keeps
+    the caller's session key: gated writes ask for approval there (RET-148); a Linear call
+    with no turn found refuses writes. Any unexpected failure yields a
     context with no adapter: ``run_on_adapter`` answers ``NOT_CONNECTED``, writes are refused.
     """
     try:
@@ -196,15 +201,17 @@ def _resolve(session_id: str | None) -> ToolContext:
     registry = dict(adapter_mod.ADAPTERS)
     adapters = list(registry.values())
     fallback = _fallback(registry, env["profile"])
-    is_linear = env["platform"] == PLATFORM
+    is_linear = tool_approval.is_linear_platform(env["platform"])
     log.debug("linear: tool context (session_id=%s, key=%s, linear=%s)",
               session_id, env["session_key"], is_linear)
 
     def ctx(ad: Any, issue: str | None) -> ToolContext:
+        # Outside Linear the caller's own session key is kept: the gate stores and arms
+        # approval requests under it (RET-148 spec §2).
         return ToolContext(adapter=ad, client=getattr(ad, "client", None) if ad else None,
                            session_issue_id=issue if is_linear else None,
-                           session_key=env["session_key"] if is_linear else None,
-                           is_linear=is_linear)
+                           session_key=env["session_key"],
+                           is_linear=is_linear, outside=not is_linear)
 
     if not is_linear:
         return ctx(fallback, None)
@@ -503,14 +510,24 @@ def _gated(tool: str, args: dict, ctx: ToolContext,
     refuses, ``allow`` runs again with those targets approved, ``approve`` stores a request
     and answers ``APPROVAL_REQUIRED``. Fail-closed: no digest or no store refuses
     ``OUT_OF_SCOPE``, and the run sentinel never reaches the caller.
+
+    Outside a Linear session (``ctx.outside``; RET-148 spec §2) the mode is
+    ``outside_session_writes``, ``deny`` answers ``NOT_LINEAR_SESSION`` before anything
+    runs, and the request and its texts use the outside wording.
     """
     store = getattr(ctx.adapter, "_store", None)
+    settings = getattr(ctx.adapter, "_settings", None)
+    # Outside a Linear session the off-Linear knob decides (RET-148 spec §2 item 3).
+    knob = "outside_session_writes" if ctx.outside else "out_of_scope_writes"
+    mode = getattr(settings, knob, None) or "approve"
+    if ctx.outside and mode == "deny":
+        return _err("NOT_LINEAR_SESSION")  # today's behaviour: nothing fetched or stored
     try:
         dg: str | None = tool_approval.digest(tool, args)
     except (TypeError, ValueError):  # args that are not JSON: no request can match
         dg = None
-    can_request = (ctx.is_linear and bool(ctx.session_key) and store is not None
-                   and dg is not None)
+    can_request = ((ctx.is_linear or ctx.outside) and bool(ctx.session_key)
+                   and store is not None and dg is not None)
     if can_request:
         req = store.take_armed_request(ctx.session_key, dg)
         if req is not None:
@@ -520,18 +537,25 @@ def _gated(tool: str, args: dict, ctx: ToolContext,
     if result.get("error") != _NEEDS_APPROVAL:
         return result
     targets: list[dict] = result.get("targets") or []
-    settings = getattr(ctx.adapter, "_settings", None)
-    mode = getattr(settings, "out_of_scope_writes", None) or "approve"
     if mode == "allow":
         approved = frozenset(t["id"] for t in targets)
         return _sealed(execute(dataclasses.replace(ctx, gate=Gate(approved=approved))))
     if mode == "deny" or not can_request or not targets:
         return _err("OUT_OF_SCOPE")
     store.put_request(ctx.session_key, dg, tool, [t["id"] for t in targets],
-                      tool_approval.approval_message(tool, targets, args, dg))
-    names = ", ".join(str(t.get("identifier") or t["id"]) for t in targets)
+                      tool_approval.approval_message(tool, targets, args, dg,
+                                                     outside=ctx.outside))
+    names = ", ".join(_target_name(t) for t in targets)
+    text = tool_approval.REQUIRED_TEXT_OUTSIDE if ctx.outside else tool_approval.REQUIRED_TEXT
     return {"ok": False, "error": "APPROVAL_REQUIRED",
-            "message": tool_approval.REQUIRED_TEXT.format(tool=tool, targets=names)}
+            "message": text.format(tool=tool, targets=names)}
+
+
+def _target_name(target: dict) -> str:
+    """A target as the ``APPROVAL_REQUIRED`` text names it: an issue by its identifier, a
+    destination as ``destination RET / Hermes`` or ``destination RET, no project``."""
+    name = str(target.get("identifier") or target["id"])
+    return f"destination {name}" if target.get("kind") == "destination" else name
 
 
 def _sealed(result: dict) -> dict:
@@ -546,7 +570,23 @@ async def _writable(ctx: ToolContext, ref: str) -> dict:
     pass (nothing approved) a plain ``OUT_OF_SCOPE`` verdict is recorded on the gate and the
     issue returned, so the body must call ``gate.check()`` before writing. Any other code,
     or ``OUT_OF_SCOPE`` on an approved pass, is refused.
+
+    Outside a Linear session (``ctx.outside``; RET-148 spec §2 item 1) there is no tree:
+    every issue is out of scope, so a gated first pass records it without a scope walk and
+    an approved pass writes only its approved issues. A caller without a gate is refused
+    ``NOT_LINEAR_SESSION`` before anything is fetched.
     """
+    if ctx.outside:
+        gate = ctx.gate
+        if gate is None:
+            raise _Refusal("NOT_LINEAR_SESSION")
+        issue = await ctx.client.issue_get(ref)
+        if issue["id"] in gate.approved:
+            return issue
+        if not gate.approved:
+            gate.record(issue)
+            return issue
+        raise _Refusal("OUT_OF_SCOPE")
     if not ctx.is_linear or not ctx.session_issue_id:
         raise _Refusal("NOT_LINEAR_SESSION")
     issue = await ctx.client.issue_get(ref)
@@ -658,35 +698,140 @@ def _project_of(issue: dict | None) -> str | None:
 
 # -- linear_issue_create
 
+#: A trailing origin footer (``_origin_footer``), stripped so a re-edit never stacks two.
+_FOOTER_RE = re.compile(r"\n*---\n_Filed by [^\n]* via [^\n]*_\s*$")
+
+
+def _origin_footer() -> str:
+    """``"\\n\\n---\\n_Filed by <profile> via <platform>_"`` from the calling session (RET-148
+    spec §4), never from args. Call in the tool thread: the session vars are bound there,
+    not on the adapter loop."""
+    profile = (get_session_env("HERMES_SESSION_PROFILE") or "").strip() or "default"
+    platform = (get_session_env("HERMES_SESSION_PLATFORM") or "").strip() or "unknown"
+    return f"\n\n---\n_Filed by {profile} via {platform}_"
+
+
+def _with_footer(text: str | None, footer: str) -> str:
+    """``text`` without a trailing origin footer, then ``footer`` (alone if no text)."""
+    base = _FOOTER_RE.sub("", text or "").rstrip()
+    return base + footer if base else footer.lstrip("\n")
+
 
 def _parse_create(args: dict) -> dict:
     return {"title": _req_str(args, "title"), "description": _opt_str(args, "description"),
             "parent": _opt_str(args, "parent"), "labels": _opt_names(args, "labels"),
             "state": _opt_str(args, "state"),
-            "fields": issue_fields.parse(args, update=False)}
+            "fields": issue_fields.parse(args, update=False), "footer": _origin_footer()}
+
+
+async def _outside_base(ctx: ToolContext, fields: dict) -> tuple[str, str | None]:
+    """The base team and project of a create from outside a Linear session without a
+    parent (RET-148 spec §3): ``default_team`` / ``default_project`` resolved through the
+    directory, each only when the create uses it. Without ``default_team`` there is no
+    base: the ``team`` arg is required (``BAD_ARGS`` before any I/O) and
+    ``default_project``, which belongs to the default team, is not used.
+
+    An explicit ``team`` arg wins: a ``default_team`` that resolves to nothing is then no
+    base (``("", None)``; the arg can't equal it, so R8 drops the project). The default
+    project is resolved only when the resulting team is the base and there is no
+    ``project`` arg. A default that is used and misses refuses with the directory's code
+    and candidates plus a ``message`` naming the setting."""
+    settings = getattr(ctx.adapter, "_settings", None)
+    team_ref = (getattr(settings, "default_team", "") or "").strip()
+    project_ref = (getattr(settings, "default_project", "") or "").strip()
+    explicit_team = fields.get("team") is not None
+    if not team_ref:
+        if not explicit_team:
+            raise _Refusal("BAD_ARGS")
+        return "", None  # the team arg replaces it; R8 then drops any base project
+    names = directory.for_client(ctx.client)
+    try:
+        team = await names.resolve("teams", "", team_ref, issue_fields._by_team)
+    except _Refusal as exc:
+        if explicit_team:
+            return "", None  # never the base; the arg's own miss is blamed on the arg
+        raise _setting_miss(exc, "default_team", team_ref) from None
+    if not project_ref or "project" in fields:
+        return team["id"], None  # a project arg replaces the base project
+    if explicit_team:
+        arg = await names.resolve("teams", "", fields["team"], issue_fields._by_team)
+        if arg["id"] != team["id"]:
+            return team["id"], None  # R8: another team drops the base project
+    try:
+        project = await names.resolve("projects", "", project_ref, issue_fields._by_name)
+    except _Refusal as exc:
+        raise _setting_miss(exc, "default_project", project_ref) from None
+    return team["id"], project["id"]
+
+
+def _setting_miss(exc: _Refusal, setting: str, ref: str) -> _Refusal:
+    """A directory refusal for a configured default, its ``message`` naming the setting
+    (the agent passed nothing wrong)."""
+    what = "is ambiguous" if exc.code == "AMBIGUOUS" else "not found"
+    return _Refusal(exc.code, {**exc.extra, "message": f'{setting} "{ref}" {what}'})
+
+
+async def _outside_destination(ctx: ToolContext, team_id: str, project_id: str | None) -> None:
+    """Outside a Linear session every create asks, base or not (RET-148 spec §2 item 2): the
+    resulting team and project are ONE target ``destination:<team>/<project or ->``, shown
+    as ``- destination "<key> / <project>"``. An approved pass for another destination (a
+    default changed meanwhile, a project dropped) is ``OUT_OF_SCOPE``."""
+    gate = ctx.gate
+    tid = f"destination:{team_id}/{project_id or '-'}"
+    if gate is None or tid in gate.approved:
+        return
+    if gate.approved:
+        raise _Refusal("OUT_OF_SCOPE")
+    names = directory.for_client(ctx.client)
+
+    async def label(kind: str, row_id: str, key: str) -> str:
+        rows = await names.rows(kind, "")
+        return str(next((r.get(key) for r in rows if r.get("id") == row_id and r.get(key)),
+                        row_id))
+
+    where = await label("teams", team_id, "key")
+    where += f" / {await label('projects', project_id, 'name')}" if project_id \
+        else ", no project"
+    gate.record_target(tid, "destination", where)
 
 
 async def _create(ctx: ToolContext, a: dict) -> dict:
     """Base team and project (RET-121 spec §1.2): the parent's with ``parent``, else the
-    session ticket's. An explicit team / project other than the base is a target."""
-    if not ctx.is_linear or not ctx.session_issue_id:
+    session ticket's, or outside a Linear session ``default_team`` / ``default_project``
+    (RET-148 spec §3). Inside, an explicit team / project other than the base is a target;
+    outside, the resulting destination always is. Outside the description carries the
+    origin footer and nothing is recorded in ``created_issues``."""
+    if ctx.outside:
+        if ctx.gate is None:  # only ever run through _gated
+            raise _Refusal("NOT_LINEAR_SESSION")
+    elif not ctx.is_linear or not ctx.session_issue_id:
         raise _Refusal("NOT_LINEAR_SESSION")
     parent = None
     if a["parent"] and a["parent"].strip():
         parent = await _writable(ctx, a["parent"].strip())
-    base = parent if parent is not None else await ctx.client.issue_get(ctx.session_issue_id)
-    base_team, base_project = _team_of(base), _project_of(base)
+    if parent is not None:
+        base_team, base_project = _team_of(parent), _project_of(parent)
+    elif ctx.outside:
+        base_team, base_project = await _outside_base(ctx, a["fields"])
+    else:
+        home = await ctx.client.issue_get(ctx.session_issue_id)
+        base_team, base_project = _team_of(home), _project_of(home)
     r = await issue_fields.resolve(ctx, a["fields"], team_id=base_team,
                                    project_id=base_project)
-    if r.team is not None and r.team["id"] != base_team:
-        _scope_target(ctx, r.team, "team")
-    if r.project is not None and r.project["id"] != base_project:
-        _scope_target(ctx, r.project, "project")
+    if ctx.outside:
+        await _outside_destination(ctx, r.team_id, r.project_id)
+    else:
+        if r.team is not None and r.team["id"] != base_team:
+            _scope_target(ctx, r.team, "team")
+        if r.project is not None and r.project["id"] != base_project:
+            _scope_target(ctx, r.project, "project")
     team = r.team_id
     inp: dict[str, Any] = {"teamId": team, "title": a["title"]}
     if r.project_id:
         inp["projectId"] = r.project_id
-    if a["description"] is not None:
+    if ctx.outside:
+        inp["description"] = _with_footer(a["description"], a["footer"])
+    elif a["description"] is not None:
         inp["description"] = a["description"]
     if parent is not None:
         inp["parentId"] = parent["id"]
@@ -698,7 +843,8 @@ async def _create(ctx: ToolContext, a: dict) -> dict:
     inp.update({k: v for k, v in r.input.items() if k not in ("teamId", "projectId")})
     _check_gate(ctx)
     issue = await ctx.client.issue_create(inp)
-    _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
+    if not ctx.outside:  # no session ticket to key it by (RET-148 Q2.6)
+        _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
     return {"ok": True, "issue": issue}
 
 
@@ -778,7 +924,9 @@ async def _project_in_scope(ctx: ToolContext, issue: dict, parent_arg: str | Non
     issue's current parent. Reads only as far as needed."""
     if project_id == _project_of(issue):
         return True
-    if project_id == _project_of(await ctx.client.issue_get(ctx.session_issue_id or "")):
+    # Outside a Linear session there is no session ticket (RET-148): skip that rule.
+    if ctx.session_issue_id and project_id == _project_of(
+            await ctx.client.issue_get(ctx.session_issue_id)):
         return True
     if parent_arg is not None:  # the parent changes in this call
         return new_parent is not None and project_id == _project_of(new_parent)
@@ -822,7 +970,7 @@ def _parse_comment(args: dict) -> dict:
     resolve = False if args.get("resolve") is None else args["resolve"]
     a = {"id": _req_str(args, "id"), "body": _req_str(args, "body"),
          "edit_marker": _opt_str(args, "edit_marker"), "reply_to": reply_to,
-         "resolve": resolve}
+         "resolve": resolve, "footer": _origin_footer()}
     if a["edit_marker"] is not None and not MARKER_RE.match(a["edit_marker"]):
         raise _Refusal("BAD_ARGS")
     # RET-121 §1.5: resolve needs reply_to; a marker edit is never a reply.
@@ -857,6 +1005,10 @@ async def _comment(ctx: ToolContext, a: dict) -> dict:
     thread = await _thread_of(ctx, issue, a["reply_to"]) if a["reply_to"] else None
     _check_gate(ctx)  # after the scope and comment checks
     body, marker = a["body"], a["edit_marker"]
+    if ctx.outside:  # the origin footer (spec §4), before the marker so the tag stays last
+        if marker is not None:
+            body = ANY_MARKER_RE.sub("", body)  # a body copied back with its old tag
+        body = _with_footer(body, a["footer"])
 
     def done(comment_id: str, edited: bool) -> dict:
         return {"ok": True, "comment_id": comment_id, "edited": edited,
@@ -1311,8 +1463,10 @@ linear_task_state = _tool(_parse_task_state, _task_state)
 linear_query = _tool(_parse_query, _query)
 
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
-_GATED_NOTE = ("Outside the session issue's tree (issues you did not create) the first call "
-               "returns APPROVAL_REQUIRED; call again with identical arguments to ask a human.")
+_GATED_NOTE = ("Outside the session issue's tree (issues you did not create), or from outside a "
+               "Linear session (per outside_session_writes), the first call may return "
+               "APPROVAL_REQUIRED; call again with identical arguments to ask a human in "
+               "this chat.")
 _PRIORITY = ("none, urgent, high, medium or low, or Linear's number 0-4 "
              "(0 none, 1 urgent, 2 high, 3 medium, 4 low).")
 
@@ -1346,8 +1500,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_issue_create": {
         "name": "linear_issue_create",
         "description": ("Create a Linear issue as the Linear app, in the parent's team and "
-                        "project (with parent: a sub-issue), else the session issue's. A "
-                        "team or project other than that needs a human's approval. "
+                        "project (with parent: a sub-issue), else the session issue's; outside "
+                        "a Linear session without parent, in default_team / default_project. "
+                        "A team or project other than that needs a human's approval; outside "
+                        "a Linear session every create does (per outside_session_writes). "
                         "Delegating to this app is refused (SELF_DELEGATION). " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "title": {"type": "string"},
@@ -1360,8 +1516,9 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "team": {"type": "string", "description": "Team UUID, key (e.g. RET) or name."},
             "project": {"type": "string",
                         "description": ("Project UUID or name; omitted or null: the parent's "
-                                        "(else the session issue's); with another team: "
-                                        "no project.")},
+                                        "(else the session issue's, or default_project "
+                                        "outside a session); with another team: no "
+                                        "project.")},
             **_field_props(nullable=False),
         }, "required": ["title"]},
     },

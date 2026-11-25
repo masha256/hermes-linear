@@ -34,9 +34,12 @@ Coverage (proposed with Q3, accepted):
   parent is recorded as app-created (RET-110) and so is in scope afterwards.
 - **Scope-only, refused without a prompt:** `linear_sync_spec`, `linear_sync_plan`,
   `linear_task_state`. They are workflow tools for the session's own tree.
-- **No Linear session** (e.g. a Slack session calling `linear_comment`): still
+- ~~**No Linear session** (e.g. a Slack session calling `linear_comment`): still
   `NOT_LINEAR_SESSION`, before any gate. A Slack approval must never authorize a Linear
-  write ("answers only count in the ticket thread").
+  write ("answers only count in the ticket thread").~~ Superseded by RET-148
+  (`2026-11-24-outside-session-writes-design.md`, Q2.3): outside a Linear session the
+  gated tools follow `outside_session_writes`, and `approve` asks in the calling chat
+  through Hermes's own gate.
 - **No new hard-deny list.** The typed tools cannot reach destructive mutations; the
   deny list comes with D's generic mutate.
 

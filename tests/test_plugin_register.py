@@ -166,6 +166,16 @@ def test_readme_has_web_dashboard_section():
     assert "\n## Web dashboard\n" in text
 
 
+def test_readme_documents_outside_session_settings():
+    """RET-148: the README names the outside-session settings and error codes, and no
+    longer says an approval outside the ticket thread never authorizes a Linear write."""
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    for key in ("outside_session_writes", "default_team", "default_project",
+                "TEAM_NOT_FOUND", "PROJECT_NOT_FOUND"):
+        assert key in text, key
+    assert "never authorizes a Linear write" not in text
+
+
 def test_linear_tool_progress_defaults_off_real_resolver(ctx):
     from gateway.display_config import resolve_display_setting
 

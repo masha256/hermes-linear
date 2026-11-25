@@ -109,14 +109,77 @@ def test_pre_tool_call_none_non_gated_tool(store, session):
     assert hooks.on_pre_tool_call("linear_issue_get", dict(ARGS), "task-1") is None
 
 
-def test_pre_tool_call_none_non_linear_session(store, session):
+SLACK_SK = "agent:main:slack:dm:C1:1700000000.0001"
+
+
+def _slack(session, key: str | None = SLACK_SK):
+    env = {"HERMES_SESSION_PLATFORM": "slack", "HERMES_SESSION_MESSAGE_ID": "slack-m1"}
+    if key:
+        env["HERMES_SESSION_KEY"] = key
+    session(**env)
+
+
+def test_outside_request_armed_by_slack_key(store, session):
+    """RET-148: a request stored by an off-Linear call is armed by that session's key."""
+    store.put_request(SLACK_SK, D, TOOL, ["uuid-y"], MESSAGE)
+    _slack(session)
+    out = hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1", tool_call_id="c1")
+    # Final review: an outside grain, so a permanent Slack grant never applies in Linear.
+    assert out == {"action": "approve", "message": MESSAGE,
+                   "rule_key": f"{TOOL}:outside:{D}"}
+    assert store.take_armed_request(SLACK_SK, D) is not None
+
+
+def test_inside_rule_key_unchanged(store, session):
+    """In a Linear session the key stays ``<tool>:<digest>`` (existing grants keep working)."""
     _request(store)
-    session(HERMES_SESSION_PLATFORM="slack", HERMES_SESSION_KEY=SK,
+    out = hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1", tool_call_id="c1")
+    assert out is not None and out["rule_key"] == f"{TOOL}:{D}"
+
+
+def test_unbound_platform_counts_as_outside(store, session):
+    """No bound ``HERMES_SESSION_PLATFORM`` (a script, a thread without session vars) is
+    outside a Linear session, the same predicate ``agent_tools._resolve`` uses."""
+    store.put_request("script-key", D, TOOL, ["uuid-y"], MESSAGE)
+    session(HERMES_SESSION_KEY="script-key")
+    out = hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1", tool_call_id="c1")
+    assert out is not None and out["rule_key"] == f"{TOOL}:outside:{D}"
+
+
+def test_slack_request_not_armed_from_linear_key(store, session):
+    store.put_request(SLACK_SK, D, TOOL, ["uuid-y"], MESSAGE)
+    session(HERMES_SESSION_PLATFORM="linear", HERMES_SESSION_KEY="lk",
             HERMES_SESSION_MESSAGE_ID=MID)
+    assert hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1") is None
+    assert store.take_armed_request(SLACK_SK, D) is None
+
+
+def test_linear_request_not_armed_from_slack_key(store, session):
+    _request(store)  # stored under the Linear key SK
+    _slack(session)
+    assert hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1") is None
+    assert store.take_armed_request(SK, D) is None
+
+
+def test_outside_no_key_no_directive(store, session):
+    _request(store)
+    store.put_request(SLACK_SK, D, TOOL, ["uuid-y"], MESSAGE)
+    _slack(session, key=None)
     assert hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1") is None
     session(HERMES_SESSION_PLATFORM="linear", HERMES_SESSION_MESSAGE_ID=MID)  # no key
     assert hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1") is None
     assert store.take_armed_request(SK, D) is None
+    assert store.take_armed_request(SLACK_SK, D) is None
+
+
+def test_outside_posts_no_activities(store, session):
+    store.put_request(SLACK_SK, D, TOOL, ["uuid-y"], MESSAGE)
+    _slack(session)
+    assert hooks._session({}) is None
+    assert hooks.on_pre_tool_call(TOOL, dict(ARGS), "task-1", tool_call_id="c1") is not None
+    hooks.on_post_tool_call(TOOL, dict(ARGS), '{"ok": true}', "task-1", tool_call_id="c1")
+    assert adapter_mod.ADAPTERS["neo"].event_loop.calls == []  # no _route scheduled
+    assert store.request(SLACK_SK, D).armed is False  # post_tool_call disarmed it
 
 
 def test_pre_tool_call_none_on_store_error(store, session, monkeypatch):
