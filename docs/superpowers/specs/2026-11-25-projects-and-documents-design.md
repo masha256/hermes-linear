@@ -343,8 +343,9 @@ section as the description, adopted by title, canceled when removed.
 
 ### 6.5 Order of writes and results
 
-Document first, then (plan only) sub-tickets, then the description, then (plan only) the
-old comment. A failure part-way returns Linear's code and what was written so far
+Spec: document, then description. Plan: the `AMBIGUOUS` lookup before any write, then
+sub-tickets, then the document (it carries the new ticket IDs, so it must follow them for
+an identical re-run to write nothing), then the description, then the old comment. A failure part-way returns Linear's code and what was written so far
 (`document_id` when the document exists); a re-run finds the document and finishes. Nothing
 is created twice.
 
