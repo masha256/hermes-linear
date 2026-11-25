@@ -61,6 +61,8 @@ def shape_details(node: dict) -> dict:
                          "subtitle": a.get("subtitle"), "url": a.get("url"),
                          "source_type": a.get("sourceType")}
                         for a in _nodes(node.get("attachments"))],
+        "documents": [{"id": d.get("id"), "title": d.get("title"), "url": d.get("url")}
+                      for d in _nodes(node.get("documents"))],
     }
 
 

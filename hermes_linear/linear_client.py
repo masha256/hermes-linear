@@ -117,6 +117,7 @@ QUERY_ISSUE_DETAILS = """query IssueDetails($id: String!) {
     relations(first: 50) { nodes { type relatedIssue { identifier title state { name } } } }
     inverseRelations(first: 50) { nodes { type issue { identifier title state { name } } } }
     attachments(first: 50) { nodes { id title subtitle url sourceType } }
+    documents { nodes { id title url } }
   }
 }"""
 
@@ -284,6 +285,80 @@ MUTATION_ATTACHMENT_LINK_GITHUB_PR = """mutation AttachmentLinkGitHubPR($issueId
 
 #: ``Cache-Control`` of every upload PUT (with ``Content-Type`` and the ``uploadFile.headers``).
 _UPLOAD_CACHE_CONTROL = "public, max-age=31536000"
+
+# -- documents and projects (RET-122 spec §1; live probes 2026-11-25) ------
+
+# ``id`` is a UUID or a ``slugId``; an unknown one is ``Entity not found: Document``.
+QUERY_DOCUMENT_GET = """query DocumentGet($id: String!) {
+  document(id: $id) {
+    id title url content updatedAt
+    creator { name }
+    issue { id identifier title }
+    project { id name }
+  }
+}"""
+
+QUERY_ISSUE_DOCUMENTS = """query IssueDocuments($id: String!) {
+  issue(id: $id) { documents(first: 250) { nodes { id title url } } }
+}"""
+
+QUERY_PROJECT_DOCUMENTS = """query ProjectDocuments($id: String!) {
+  project(id: $id) { documents(first: 250) { nodes { id title url } } }
+}"""
+
+MUTATION_DOCUMENT_CREATE = """mutation DocumentCreate($input: DocumentCreateInput!) {
+  documentCreate(input: $input) { success document { id url } }
+}"""
+
+# The input also takes issueId, projectId, trashed and hiddenAt; ``document_update`` never
+# sends them (spec §1.2).
+MUTATION_DOCUMENT_UPDATE = """mutation DocumentUpdate($id: String!, $input: DocumentUpdateInput!) {
+  documentUpdate(id: $id, input: $input) { success document { id url } }
+}"""
+
+# Linear refuses ``first: 0`` ("first must not be less than 1", live probe), so ``updates``
+# 0 drops the connection with ``@include`` instead.
+QUERY_PROJECT_DETAIL = """query ProjectDetail($id: String!, $updates: Int!, $withUpdates: Boolean!) {
+  project(id: $id) {
+    id name url health targetDate
+    status { name }
+    lead { name }
+    externalLinks(first: 250) { nodes { id label url } }
+    projectMilestones(first: 250) { nodes { id name targetDate } }
+    documents(first: 250) { nodes { id title url } }
+    projectUpdates(first: $updates, orderBy: createdAt) @include(if: $withUpdates) {
+      nodes { id createdAt health body user { name } }
+    }
+  }
+}"""
+
+MUTATION_PROJECT_UPDATE_CREATE = """mutation ProjectUpdateCreate($input: ProjectUpdateCreateInput!) {
+  projectUpdateCreate(input: $input) { success projectUpdate { id url } }
+}"""
+
+# A duplicate name is Linear's INPUT_ERROR "name not unique" (userPresentableMessage
+# "A project milestone called '<name>' already exists on this project.").
+MUTATION_MILESTONE_CREATE = """mutation ProjectMilestoneCreate($input: ProjectMilestoneCreateInput!) {
+  projectMilestoneCreate(input: $input) { success projectMilestone { id name targetDate } }
+}"""
+
+MUTATION_MILESTONE_UPDATE = """mutation ProjectMilestoneUpdate($id: String!,
+    $input: ProjectMilestoneUpdateInput!) {
+  projectMilestoneUpdate(id: $id, input: $input) {
+    success projectMilestone { id name targetDate }
+  }
+}"""
+
+# Linear does not refuse a duplicate URL (brainstorm probe). ``label`` is non-null in the
+# input (introspection). The input also takes initiativeId / releaseId; never sent.
+MUTATION_PROJECT_LINK_CREATE = """mutation EntityExternalLinkCreate(
+    $input: EntityExternalLinkCreateInput!) {
+  entityExternalLinkCreate(input: $input) { success entityExternalLink { id } }
+}"""
+
+#: The only ``DocumentUpdateInput`` / ``ProjectMilestoneUpdateInput`` fields the client sends.
+DOCUMENT_UPDATE_FIELDS = frozenset({"title", "content"})
+MILESTONE_UPDATE_FIELDS = frozenset({"name", "description", "targetDate"})
 
 
 class LinearError(Exception):
@@ -878,3 +953,156 @@ class LinearClient:
         data = await self.gql(MUTATION_ATTACHMENT_LINK_GITHUB_PR,
                               {"issueId": issue_id, "url": url})
         return self._attachment(data, "attachmentLinkGitHubPR")
+
+    # -- documents and projects (RET-122) -----------------------------------
+
+    @staticmethod
+    def _payload(data: dict, field: str, entity: str) -> dict:
+        """``data[field][entity]`` of a successful mutation; a missing id is a LinearError."""
+        node = LinearClient._require_success(data, field).get(entity)
+        if not isinstance(node, dict) or not node.get("id"):
+            raise LinearError(f"{field} returned no {entity}")
+        return node
+
+    @staticmethod
+    def _doc_rows(conn: Any) -> list[dict]:
+        return [{"id": d["id"], "title": d.get("title") or "", "url": d.get("url")}
+                for d in LinearClient._nodes(conn)]
+
+    async def document_get(self, ref: str) -> dict | None:
+        """A document by UUID or ``slugId``: ``{id, title, url, content, issue: {id,
+        identifier, title} | None, project: {id, name} | None, creator: name | None,
+        updated_at}``. ``None`` when Linear says not found (or answers null)."""
+        try:
+            data = await self.gql(QUERY_DOCUMENT_GET, {"id": ref})
+        except LinearError as exc:
+            if exc.code == "NOT_FOUND":
+                return None
+            raise
+        d = data.get("document")
+        if not isinstance(d, dict) or not d.get("id"):
+            return None
+        issue, project = d.get("issue"), d.get("project")
+        return {
+            "id": d["id"], "title": d.get("title") or "", "url": d.get("url"),
+            "content": d.get("content") or "",
+            "issue": ({"id": issue.get("id"), "identifier": issue.get("identifier"),
+                       "title": issue.get("title")} if isinstance(issue, dict) else None),
+            "project": ({"id": project.get("id"), "name": project.get("name")}
+                        if isinstance(project, dict) else None),
+            "creator": (d.get("creator") or {}).get("name"),
+            "updated_at": d.get("updatedAt"),
+        }
+
+    async def documents_on(self, issue_id: str | None = None,
+                           project_id: str | None = None) -> list[dict]:
+        """``[{id, title, url}]``: the first 250 documents of exactly one of an issue or a
+        project. A null issue/project is ``NOT_FOUND``."""
+        if (issue_id is None) == (project_id is None):
+            raise ValueError("documents_on needs exactly one of issue_id and project_id")
+        query, key, ref = ((QUERY_ISSUE_DOCUMENTS, "issue", issue_id) if issue_id is not None
+                           else (QUERY_PROJECT_DOCUMENTS, "project", project_id))
+        node = (await self.gql(query, {"id": ref})).get(key)
+        if not isinstance(node, dict):
+            raise LinearError(f"{key} not found", code="NOT_FOUND")
+        return self._doc_rows(node.get("documents"))
+
+    async def document_create(self, title: str, content: str, *, issue_id: str | None,
+                              project_id: str | None) -> dict:
+        """``documentCreate`` on an issue or a project (at most one); returns ``{id, url}``.
+        Linear does not refuse a duplicate title (brainstorm probe)."""
+        if issue_id is not None and project_id is not None:
+            raise ValueError("document_create takes issue_id or project_id, not both")
+        inp: dict[str, Any] = {"title": title, "content": content}
+        if issue_id is not None:
+            inp["issueId"] = issue_id
+        if project_id is not None:
+            inp["projectId"] = project_id
+        data = await self.gql(MUTATION_DOCUMENT_CREATE, {"input": inp})
+        doc = self._payload(data, "documentCreate", "document")
+        return {"id": doc["id"], "url": doc.get("url")}
+
+    async def document_update(self, doc_id: str, fields: dict) -> dict:
+        """``documentUpdate`` of ``title`` / ``content`` only; returns ``{id, url}``. Any
+        other field (``trashed``, ``hiddenAt``, ``issueId``, ``projectId``, …) or none is a
+        ``ValueError`` before any request."""
+        if not fields or not set(fields) <= DOCUMENT_UPDATE_FIELDS:
+            raise ValueError(f"document_update sends only {sorted(DOCUMENT_UPDATE_FIELDS)}")
+        data = await self.gql(MUTATION_DOCUMENT_UPDATE, {"id": doc_id, "input": dict(fields)})
+        doc = self._payload(data, "documentUpdate", "document")
+        return {"id": doc["id"], "url": doc.get("url")}
+
+    async def project_detail(self, project_id: str, updates: int) -> dict:
+        """``{id, name, url, state, health, lead, target_date, links, milestones, documents,
+        updates}``. ``state`` is ``status.name``, ``lead`` a name; ``updates`` are the newest
+        ``updates`` project updates ``{id, created_at, author, health, body}``, newest first
+        (sorted here). A null project is ``NOT_FOUND``."""
+        data = await self.gql(QUERY_PROJECT_DETAIL, {
+            "id": project_id, "updates": max(updates, 1), "withUpdates": updates > 0})
+        p = data.get("project")
+        if not isinstance(p, dict) or not p.get("id"):
+            raise LinearError("project not found", code="NOT_FOUND")
+        ups = sorted(self._nodes(p.get("projectUpdates")),
+                     key=lambda u: u.get("createdAt") or "", reverse=True)[:max(updates, 0)]
+        return {
+            "id": p["id"], "name": p.get("name") or "", "url": p.get("url"),
+            "state": (p.get("status") or {}).get("name"), "health": p.get("health"),
+            "lead": (p.get("lead") or {}).get("name"), "target_date": p.get("targetDate"),
+            "links": [{"id": lk.get("id"), "label": lk.get("label"), "url": lk.get("url")}
+                      for lk in self._nodes(p.get("externalLinks"))],
+            "milestones": [{"id": m.get("id"), "name": m.get("name") or "",
+                            "target_date": m.get("targetDate")}
+                           for m in self._nodes(p.get("projectMilestones"))],
+            "documents": self._doc_rows(p.get("documents")),
+            "updates": [{"id": u.get("id"), "created_at": u.get("createdAt"),
+                         "author": (u.get("user") or {}).get("name"),
+                         "health": u.get("health"), "body": u.get("body") or ""}
+                        for u in ups],
+        }
+
+    async def project_update_create(self, project_id: str, body: str,
+                                    health: str | None) -> dict:
+        """``projectUpdateCreate``; ``health`` (``onTrack | atRisk | offTrack``) is left out
+        of the input when ``None``. Returns ``{id, url}``. Not idempotent."""
+        inp: dict[str, Any] = {"projectId": project_id, "body": body}
+        if health is not None:
+            inp["health"] = health
+        data = await self.gql(MUTATION_PROJECT_UPDATE_CREATE, {"input": inp})
+        upd = self._payload(data, "projectUpdateCreate", "projectUpdate")
+        return {"id": upd["id"], "url": upd.get("url")}
+
+    @staticmethod
+    def _milestone(data: dict, field: str) -> dict:
+        m = LinearClient._payload(data, field, "projectMilestone")
+        return {"id": m["id"], "name": m.get("name") or "", "target_date": m.get("targetDate")}
+
+    async def milestone_create(self, project_id: str, name: str, description: str | None,
+                               target_date: str | None) -> dict:
+        """``projectMilestoneCreate``; ``description`` / ``target_date`` are sent only if set.
+        Returns ``{id, name, target_date}``. A duplicate name raises Linear's
+        ``INPUT_ERROR`` with its ``userPresentableMessage`` as ``detail``."""
+        inp: dict[str, Any] = {"projectId": project_id, "name": name}
+        if description is not None:
+            inp["description"] = description
+        if target_date is not None:
+            inp["targetDate"] = target_date
+        data = await self.gql(MUTATION_MILESTONE_CREATE, {"input": inp})
+        return self._milestone(data, "projectMilestoneCreate")
+
+    async def milestone_update(self, milestone_id: str, fields: dict) -> dict:
+        """``projectMilestoneUpdate`` of ``name`` / ``description`` / ``targetDate`` only
+        (``None`` clears); anything else, or nothing, is a ``ValueError`` before any request.
+        Returns ``{id, name, target_date}``."""
+        if not fields or not set(fields) <= MILESTONE_UPDATE_FIELDS:
+            raise ValueError(f"milestone_update sends only {sorted(MILESTONE_UPDATE_FIELDS)}")
+        data = await self.gql(MUTATION_MILESTONE_UPDATE,
+                              {"id": milestone_id, "input": dict(fields)})
+        return self._milestone(data, "projectMilestoneUpdate")
+
+    async def project_link_create(self, project_id: str, url: str, label: str | None) -> dict:
+        """``entityExternalLinkCreate`` on the project (``projectId`` only, never
+        ``initiativeId`` / ``releaseId``). ``label`` is required by Linear, so ``None``
+        sends the URL as the label. Returns ``{id}``; a duplicate URL is not refused."""
+        data = await self.gql(MUTATION_PROJECT_LINK_CREATE, {"input": {
+            "projectId": project_id, "url": url, "label": url if label is None else label}})
+        return {"id": self._payload(data, "entityExternalLinkCreate", "entityExternalLink")["id"]}

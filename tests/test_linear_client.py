@@ -1030,3 +1030,298 @@ async def test_relation_create_input(fake, client):
         await client.relation_create("i-1", "i-2", "blocks")
     with pytest.raises(LinearError):
         await client.relation_create("i-1", "i-2", "blocks")
+
+
+# -- documents and projects (RET-163) -------------------------------------
+
+#: Live-probe shape of ``document(id: "000000000000")`` (2026-11-25).
+DOC_NOT_FOUND_BODY = {"errors": [{
+    "message": "Entity not found: Document", "path": ["document"],
+    "extensions": {"type": "invalid input", "code": "INPUT_ERROR", "statusCode": 400,
+                   "userError": True,
+                   "userPresentableMessage": "Could not find referenced Document."}}],
+    "data": None}
+
+#: Live-probe shape of ``document(id: "dd7c3ea51183")`` (2026-11-25).
+DOC_NODE = {"id": "2c967867-3320-47d0-91a0-075dc9b09b3f", "slugId": "dd7c3ea51183",
+            "title": "RET-122 probe doc",
+            "url": "https://linear.app/x/document/ret-122-probe-doc-dd7c3ea51183",
+            "content": "# Probe v2", "updatedAt": "2026-11-25T20:38:32.055Z",
+            "creator": {"name": "Neo"},
+            "issue": {"id": "6e159ea5", "identifier": "RET-161", "title": "RET-148 live test 1"},
+            "project": None}
+
+
+def _q(call) -> str:
+    return " ".join(call.json["query"].split())
+
+
+async def test_document_get_mapping(fake, client):
+    fake.on("DocumentGet", {"data": {"document": DOC_NODE}},
+            {"data": {"document": {**DOC_NODE, "issue": None, "creator": None,
+                                   "project": {"id": "p1", "name": "Orion"}}}})
+    assert await client.document_get("dd7c3ea51183") == {
+        "id": DOC_NODE["id"], "title": "RET-122 probe doc", "url": DOC_NODE["url"],
+        "content": "# Probe v2",
+        "issue": {"id": "6e159ea5", "identifier": "RET-161", "title": "RET-148 live test 1"},
+        "project": None, "creator": "Neo", "updated_at": "2026-11-25T20:38:32.055Z"}
+    (call, *_) = fake.gql_calls("DocumentGet")
+    assert call.variables == {"id": "dd7c3ea51183"}
+    q = _q(call)
+    for field in ("document(id: $id)", "content", "updatedAt", "creator { name }",
+                  "issue { id identifier title }", "project { id name }"):
+        assert field in q
+    other = await client.document_get(DOC_NODE["id"])
+    assert other["issue"] is None and other["creator"] is None
+    assert other["project"] == {"id": "p1", "name": "Orion"}
+
+
+async def test_document_get_not_found_is_none(fake, client):
+    fake.on("DocumentGet", Resp(400, DOC_NOT_FOUND_BODY), {"data": {"document": None}})
+    assert await client.document_get("000000000000") is None
+    assert await client.document_get("000000000000") is None
+
+
+async def test_document_get_other_errors_raise(fake, client):
+    fake.on("DocumentGet", {"errors": [{"message": "boom",
+                                        "extensions": {"code": "INTERNAL_ERROR"}}]})
+    with pytest.raises(LinearError) as ei:
+        await client.document_get("x")
+    assert ei.value.code == "INTERNAL_ERROR"
+
+
+async def test_documents_on_issue_and_project(fake, client):
+    docs = [{"id": "d1", "title": "Spec", "url": "https://e.test/d1"},
+            {"id": "d2", "title": None, "url": "https://e.test/d2"}]
+    fake.on("IssueDocuments", {"data": {"issue": {"documents": {"nodes": docs}}}})
+    fake.on("ProjectDocuments", {"data": {"project": {"documents": {"nodes": docs[:1]}}}})
+    assert await client.documents_on(issue_id="i-1") == [
+        {"id": "d1", "title": "Spec", "url": "https://e.test/d1"},
+        {"id": "d2", "title": "", "url": "https://e.test/d2"}]
+    assert await client.documents_on(project_id="p-1") == [docs[0]]
+    (ic,) = fake.gql_calls("IssueDocuments")
+    (pc,) = fake.gql_calls("ProjectDocuments")
+    assert ic.variables == {"id": "i-1"} and pc.variables == {"id": "p-1"}
+    assert "documents(first: 250) { nodes { id title url } }" in _q(ic)
+    assert "documents(first: 250) { nodes { id title url } }" in _q(pc)
+
+
+async def test_documents_on_needs_exactly_one_target(fake, client):
+    for kw in ({}, {"issue_id": "i", "project_id": "p"}):
+        with pytest.raises(ValueError):
+            await client.documents_on(**kw)
+    assert fake.gql_calls() == []
+
+
+async def test_documents_on_null_issue_is_not_found(fake, client):
+    fake.on("IssueDocuments", {"data": {"issue": None}})
+    with pytest.raises(LinearError) as ei:
+        await client.documents_on(issue_id="i-404")
+    assert ei.value.code == "NOT_FOUND"
+
+
+async def test_document_create_input(fake, client):
+    ok = {"data": {"documentCreate": {"success": True, "document": {"id": "d9", "url": "u9"}}}}
+    fake.on("DocumentCreate", ok)
+    assert await client.document_create("Spec", "", issue_id="i-1", project_id=None) == {
+        "id": "d9", "url": "u9"}
+    assert await client.document_create("Plan", "# x", issue_id=None, project_id="p-1") == {
+        "id": "d9", "url": "u9"}
+    first, second = fake.gql_calls("DocumentCreate")
+    assert first.variables == {"input": {"title": "Spec", "content": "", "issueId": "i-1"}}
+    assert second.variables == {"input": {"title": "Plan", "content": "# x", "projectId": "p-1"}}
+    assert "documentCreate(input: $input) { success document { id url } }" in _q(first)
+
+
+async def test_document_create_unsuccessful_raises(fake, client):
+    fake.on("DocumentCreate", {"data": {"documentCreate": {"success": False, "document": None}}},
+            {"data": {"documentCreate": {"success": True, "document": None}}})
+    for _ in range(2):
+        with pytest.raises(LinearError):
+            await client.document_create("t", "c", issue_id="i-1", project_id=None)
+
+
+async def test_document_update_input(fake, client):
+    fake.on("DocumentUpdate",
+            {"data": {"documentUpdate": {"success": True, "document": {"id": "d1", "url": "u1"}}}})
+    assert await client.document_update("d1", {"content": "new"}) == {"id": "d1", "url": "u1"}
+    assert await client.document_update("d1", {"title": "T", "content": ""}) == {
+        "id": "d1", "url": "u1"}
+    first, second = fake.gql_calls("DocumentUpdate")
+    assert first.variables == {"id": "d1", "input": {"content": "new"}}
+    assert second.variables == {"id": "d1", "input": {"title": "T", "content": ""}}
+    assert "documentUpdate(id: $id, input: $input) { success document { id url } }" in _q(first)
+
+
+@pytest.mark.parametrize("fields", [
+    {"trashed": True}, {"content": "x", "hiddenAt": "2026-01-01"}, {"issueId": "i-2"},
+    {"projectId": "p-2"}, {}])
+async def test_document_update_rejects_other_fields(fake, client, fields):
+    with pytest.raises((AssertionError, ValueError)):
+        await client.document_update("d1", fields)
+    assert fake.gql_calls() == [] and fake.token_calls() == []
+
+
+#: Live-probe shape of ``project(id: "d984ad14-…")`` (2026-11-25), plus one update.
+PROJECT_NODE = {
+    "id": "d984ad14", "name": "hermes linear test project",
+    "url": "https://linear.app/x/project/hermes-linear-test-project-89f3ed63f44a",
+    "status": {"name": "Backlog"}, "health": None, "lead": None, "targetDate": None,
+    "externalLinks": {"nodes": [{"id": "l1", "label": "repo",
+                                 "url": "https://github.com/masha256/hermes-linear"}]},
+    "projectMilestones": {"nodes": [{"id": "m1", "name": "ret-122 probe",
+                                     "targetDate": "2026-12-31"}]},
+    "documents": {"nodes": [{"id": "d1", "title": "Spec", "url": "https://e.test/d1"}]},
+    "projectUpdates": {"nodes": [
+        {"id": "u1", "createdAt": "2026-11-01T00:00:00.000Z", "health": "onTrack",
+         "body": "old", "user": {"name": "Mike"}},
+        {"id": "u2", "createdAt": "2026-11-20T00:00:00.000Z", "health": "atRisk",
+         "body": "new", "user": None}]},
+}
+
+
+async def test_project_detail_mapping(fake, client):
+    fake.on("ProjectDetail", {"data": {"project": PROJECT_NODE}},
+            {"data": {"project": {**PROJECT_NODE, "status": None,
+                                  "lead": {"name": "Mike"}, "health": "offTrack",
+                                  "targetDate": "2027-01-31"}}})
+    assert await client.project_detail("d984ad14", 3) == {
+        "id": "d984ad14", "name": "hermes linear test project", "url": PROJECT_NODE["url"],
+        "state": "Backlog", "health": None, "lead": None, "target_date": None,
+        "links": [{"id": "l1", "label": "repo",
+                   "url": "https://github.com/masha256/hermes-linear"}],
+        "milestones": [{"id": "m1", "name": "ret-122 probe", "target_date": "2026-12-31"}],
+        "documents": [{"id": "d1", "title": "Spec", "url": "https://e.test/d1"}],
+        "updates": [  # newest first, whatever Linear's order
+            {"id": "u2", "created_at": "2026-11-20T00:00:00.000Z", "author": None,
+             "health": "atRisk", "body": "new"},
+            {"id": "u1", "created_at": "2026-11-01T00:00:00.000Z", "author": "Mike",
+             "health": "onTrack", "body": "old"}],
+    }
+    (call,) = fake.gql_calls("ProjectDetail")
+    assert call.variables == {"id": "d984ad14", "updates": 3, "withUpdates": True}
+    q = _q(call)
+    for field in ("project(id: $id)", "status { name }", "health", "lead { name }",
+                  "targetDate", "externalLinks(first: 250) { nodes { id label url } }",
+                  "projectMilestones(first: 250) { nodes { id name targetDate } }",
+                  "documents(first: 250) { nodes { id title url } }",
+                  "projectUpdates(first: $updates, orderBy: createdAt) @include(if: $withUpdates)",
+                  "user { name }"):
+        assert field in q
+    other = await client.project_detail("d984ad14", 20)
+    assert (other["state"], other["lead"], other["health"], other["target_date"]) == (
+        None, "Mike", "offTrack", "2027-01-31")
+
+
+async def test_project_detail_zero_updates_skips_the_connection(fake, client):
+    """Linear refuses ``first: 0`` (live probe: "first must not be less than 1")."""
+    node = {k: v for k, v in PROJECT_NODE.items() if k != "projectUpdates"}
+    fake.on("ProjectDetail", {"data": {"project": node}})
+    assert (await client.project_detail("d984ad14", 0))["updates"] == []
+    (call,) = fake.gql_calls("ProjectDetail")
+    assert call.variables == {"id": "d984ad14", "updates": 1, "withUpdates": False}
+
+
+async def test_project_detail_null_is_not_found(fake, client):
+    fake.on("ProjectDetail", {"data": {"project": None}})
+    with pytest.raises(LinearError) as ei:
+        await client.project_detail("p-404", 3)
+    assert ei.value.code == "NOT_FOUND"
+
+
+async def test_project_update_create_input(fake, client):
+    fake.on("ProjectUpdateCreate", {"data": {"projectUpdateCreate": {
+        "success": True, "projectUpdate": {"id": "pu1", "url": "https://e.test/pu1"}}}})
+    assert await client.project_update_create("p-1", "All good", "onTrack") == {
+        "id": "pu1", "url": "https://e.test/pu1"}
+    (call,) = fake.gql_calls("ProjectUpdateCreate")
+    assert call.variables == {"input": {"projectId": "p-1", "body": "All good",
+                                        "health": "onTrack"}}
+    assert ("projectUpdateCreate(input: $input) { success projectUpdate { id url } }"
+            in _q(call))
+
+
+async def test_project_update_omits_null_health(fake, client):
+    fake.on("ProjectUpdateCreate", {"data": {"projectUpdateCreate": {
+        "success": True, "projectUpdate": {"id": "pu1", "url": "u"}}}})
+    await client.project_update_create("p-1", "Body", None)
+    (call,) = fake.gql_calls("ProjectUpdateCreate")
+    assert call.variables == {"input": {"projectId": "p-1", "body": "Body"}}
+    assert "health" not in call.variables["input"]
+
+
+async def test_milestone_create_input(fake, client):
+    fake.on("ProjectMilestoneCreate", {"data": {"projectMilestoneCreate": {
+        "success": True,
+        "projectMilestone": {"id": "m9", "name": "Beta", "targetDate": "2026-12-31"}}}})
+    assert await client.milestone_create("p-1", "Beta", "desc", "2026-12-31") == {
+        "id": "m9", "name": "Beta", "target_date": "2026-12-31"}
+    await client.milestone_create("p-1", "Beta", None, None)
+    first, second = fake.gql_calls("ProjectMilestoneCreate")
+    assert first.variables == {"input": {"projectId": "p-1", "name": "Beta",
+                                         "description": "desc", "targetDate": "2026-12-31"}}
+    assert second.variables == {"input": {"projectId": "p-1", "name": "Beta"}}
+    assert ("projectMilestoneCreate(input: $input) { success projectMilestone "
+            "{ id name targetDate } }") in _q(first)
+
+
+async def test_milestone_update_input(fake, client):
+    fake.on("ProjectMilestoneUpdate", {"data": {"projectMilestoneUpdate": {
+        "success": True, "projectMilestone": {"id": "m1", "name": "GA", "targetDate": None}}}})
+    assert await client.milestone_update("m1", {"name": "GA", "targetDate": None,
+                                                "description": None}) == {
+        "id": "m1", "name": "GA", "target_date": None}
+    (call,) = fake.gql_calls("ProjectMilestoneUpdate")
+    assert call.variables == {"id": "m1", "input": {"name": "GA", "targetDate": None,
+                                                    "description": None}}
+    assert ("projectMilestoneUpdate(id: $id, input: $input) { success projectMilestone "
+            "{ id name targetDate } }") in _q(call)
+
+
+@pytest.mark.parametrize("fields", [{"sortOrder": 1.0}, {"projectId": "p-2"}, {}])
+async def test_milestone_update_rejects_other_fields(fake, client, fields):
+    with pytest.raises((AssertionError, ValueError)):
+        await client.milestone_update("m1", fields)
+    assert fake.gql_calls() == []
+
+
+#: Linear's refusal of a duplicate milestone name (brainstorm probe, RET-122).
+DUP_MILESTONE_BODY = {"errors": [{"message": "name not unique", "extensions": {
+    "type": "invalid input", "code": "INPUT_ERROR",
+    "userPresentableMessage": "A project milestone called 'x' already exists on this project."}}],
+    "data": None}
+
+
+async def test_milestone_duplicate_name_error(fake, client):
+    fake.on("ProjectMilestoneCreate", DUP_MILESTONE_BODY)
+    with pytest.raises(LinearError) as ei:
+        await client.milestone_create("p-1", "x", None, None)
+    assert ei.value.code == "INPUT_ERROR"
+    assert str(ei.value) == "name not unique"
+    assert ei.value.detail == "A project milestone called 'x' already exists on this project."
+
+
+async def test_project_link_create_input(fake, client):
+    fake.on("EntityExternalLinkCreate", {"data": {"entityExternalLinkCreate": {
+        "success": True, "entityExternalLink": {"id": "l9"}}}})
+    assert await client.project_link_create("p-1", "https://e.test/r", "repo") == {"id": "l9"}
+    # ``label`` is non-null in EntityExternalLinkCreateInput (introspection): the URL stands in.
+    await client.project_link_create("p-1", "https://e.test/r", None)
+    first, second = fake.gql_calls("EntityExternalLinkCreate")
+    assert first.variables == {"input": {"projectId": "p-1", "url": "https://e.test/r",
+                                         "label": "repo"}}
+    assert second.variables == {"input": {"projectId": "p-1", "url": "https://e.test/r",
+                                          "label": "https://e.test/r"}}
+    q = _q(first)
+    assert "entityExternalLinkCreate(input: $input) { success entityExternalLink { id } }" in q
+    assert "initiativeId" not in q and "releaseId" not in q
+
+
+async def test_issue_details_query_has_documents(fake, client):
+    fake.on("IssueDetails", {"data": {"issue": DETAILS_NODE}})
+    await client.issue_details("uuid-1")
+    (call,) = fake.gql_calls("IssueDetails")
+    assert "documents { nodes { id title url } }" in _q(call)
+    fake.on("IssueGet", {"data": {"issue": ISSUE_NODE}})
+    await client.issue_get("RET-1")  # QUERY_ISSUE_GET is not widened (spec §1.3)
+    assert "documents" not in fake.gql_calls("IssueGet")[0].json["query"]

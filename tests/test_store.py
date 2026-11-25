@@ -569,3 +569,56 @@ def test_created_issues_survive_reopen(tmp_path):
         assert s.created_by("T1") == {"i1"}
     finally:
         s.close()
+
+
+# ------------------------------------------------------------- created documents (RET-163)
+
+
+def test_record_document_roundtrip_and_restart(tmp_path):
+    path = tmp_path / "db.sqlite"
+    s = Store.open(path)
+    assert s.documents_by("T1") == set()
+    s.record_document("T1", "d1")
+    s.record_document("T1", "d2")
+    s.record_document("T1", "d1")  # INSERT OR IGNORE
+    assert s.documents_by("T1") == {"d1", "d2"}
+    s.close()
+    s = Store.open(path)  # a restart: a new Store on the same file
+    try:
+        assert s.documents_by("T1") == {"d1", "d2"}
+        assert s.created_by("T1") == set()  # documents are not created issues
+    finally:
+        s.close()
+
+
+def test_documents_by_other_owner_empty(store):
+    store.record_document("T1", "d1")
+    store.record_document("T1", "d1")
+    store.record_document("T2", "d1")  # first owner keeps the document
+    assert store.documents_by("T2") == set()
+    assert store.documents_by("T1") == {"d1"}
+
+
+def test_existing_db_gains_table(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    # A database made by the schema before RET-163: every table but created_documents.
+    old_schema = store_mod._SCHEMA.split("CREATE TABLE IF NOT EXISTS created_documents")[0]
+    conn = sqlite3.connect(path)
+    conn.executescript(old_schema)
+    conn.execute(f"PRAGMA user_version = {store_mod.SCHEMA_VERSION}")
+    conn.commit()
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert "created_issues" in tables and "created_documents" not in tables
+    conn.close()
+    s = Store.open(path)
+    try:
+        cols = {r[1]: r[2] for r in s.conn.execute("PRAGMA table_info(created_documents)")}
+        assert cols == {"document_id": "TEXT", "owner_issue_id": "TEXT", "created_at": "TEXT"}
+        idx = {r[1] for r in s.conn.execute("PRAGMA index_list(created_documents)")}
+        assert "created_documents_owner" in idx
+        assert s.conn.execute("PRAGMA user_version").fetchone()[0] == store_mod.SCHEMA_VERSION == 1
+        s.record_document("T1", "d1")
+        assert s.documents_by("T1") == {"d1"}
+    finally:
+        s.close()

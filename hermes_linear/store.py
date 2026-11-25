@@ -16,6 +16,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
@@ -155,6 +156,15 @@ CREATE TABLE IF NOT EXISTS created_issues (
     created_at     REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS created_owner ON created_issues(owner_issue_id);
+
+-- Documents the agent tools created, by the session ticket they were created from
+-- (RET-122 spec §2.2): later edits from that ticket's sessions need no prompt.
+CREATE TABLE IF NOT EXISTS created_documents (
+    document_id    TEXT PRIMARY KEY,
+    owner_issue_id TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS created_documents_owner ON created_documents(owner_issue_id);
 """
 
 # Approval requests older than this are pruned on ``put_request`` and never taken.
@@ -888,6 +898,21 @@ class Store:
         rows = self._all("SELECT issue_id FROM created_issues WHERE owner_issue_id = ?",
                          (owner_issue_id,))
         return {r["issue_id"] for r in rows}
+
+    def record_document(self, owner_issue_id: str, document_id: str) -> None:
+        """Record ``document_id`` (a UUID) as created from session ticket ``owner_issue_id``;
+        a document already recorded keeps its first owner."""
+        created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self._write(lambda: self.conn.execute(
+            "INSERT OR IGNORE INTO created_documents(document_id, owner_issue_id, created_at) "
+            "VALUES (?, ?, ?)", (document_id, owner_issue_id, created)))
+
+    def documents_by(self, owner_issue_id: str) -> set[str]:
+        """UUIDs of the documents the agent tools created from session ticket ``owner_issue_id``."""
+        rows = self._all(
+            "SELECT document_id FROM created_documents WHERE owner_issue_id = ?",
+            (owner_issue_id,))
+        return {r["document_id"] for r in rows}
 
     def cache_state(self, state_id: str, name: str) -> None:
         self._write(lambda: self.conn.execute(

@@ -153,8 +153,38 @@ def test_details_mapping(pin_ctx, stub):
         ],
         "attachments": [{"id": "a1", "title": "PR", "subtitle": "open",
                          "url": "https://github.com/o/r/pull/1", "source_type": "github"}],
+        "documents": [],
     }
     assert stub.calls == [("issue_get", "RET-1"), ("issue_details", "uuid-1")]
+
+
+def test_issue_get_lists_documents(loop, pin_ctx):
+    from fake_workspace import FakeWorkspace
+
+    ws = FakeWorkspace()
+    iid = ws.add_issue("RET-1", title="T")
+    other = ws.add_issue("RET-2", title="Other")
+    d1 = ws.add_document("Spec", "# s", issue=iid)
+    d2 = ws.add_document("Plan", "", issue=iid)
+    ws.add_document("Elsewhere", "", issue=other)
+    ws.add_document("Project doc", "", project="proj-1")
+    pin_ctx(ad=new_adapter(loop, client=ws))
+    out = linear_issue_get({"id": "RET-1"})
+    assert out["ok"] is True
+    assert out["issue"]["documents"] == [
+        {"id": d1, "title": "Spec", "url": ws.documents[d1]["url"]},
+        {"id": d2, "title": "Plan", "url": ws.documents[d2]["url"]}]
+
+
+def test_issue_get_documents_empty(pin_ctx, stub):
+    stub.details = {**DETAILS, "documents": {"nodes": []}}
+    assert linear_issue_get({"id": "RET-1"})["issue"]["documents"] == []
+    stub.details = {**DETAILS, "documents": None}
+    assert linear_issue_get({"id": "RET-1"})["issue"]["documents"] == []
+    stub.details = {**DETAILS, "documents": {"nodes": [
+        {"id": "d1", "title": "Spec", "url": "https://e.test/d1", "extra": 1}]}}
+    assert linear_issue_get({"id": "RET-1"})["issue"]["documents"] == [
+        {"id": "d1", "title": "Spec", "url": "https://e.test/d1"}]
 
 
 def test_details_nulls_and_milestone():
