@@ -52,7 +52,7 @@ SKILL_MD = REPO_ROOT / "hermes_linear" / "skills" / "manage-superpowers" / "SKIL
 TOOL_NAMES = ["linear_issue_get", "linear_issue_create", "linear_issue_update", "linear_comment",
               "linear_sync_spec", "linear_sync_plan", "linear_task_state", "linear_query",
               "linear_search", "linear_attach", "linear_session_link", "linear_relation",
-              "linear_lookup"]
+              "linear_lookup", "linear_document"]
 
 
 class FakeCtx:
@@ -319,7 +319,8 @@ def test_registered_handlers_return_json_strings_real_registry(monkeypatch):
         assert _json.loads(raw)["ok"] is False
 
 
-@pytest.mark.parametrize("first", ["hermes_linear.tools_lookup", "hermes_linear.tools_relation"])
+@pytest.mark.parametrize("first", ["hermes_linear.tools_lookup", "hermes_linear.tools_relation",
+                                   "hermes_linear.tools_document"])
 def test_import_order_fresh_interpreter(first):
     """A tool module imported first in a fresh interpreter still yields the full roster,
     every slot filled, and ``agent_tools`` reaches the sibling modules' helpers."""
@@ -330,12 +331,12 @@ def test_import_order_fresh_interpreter(first):
             "print(','.join(a.TOOL_SCHEMAS), ','.join(a.TOOL_HANDLERS), "
             "all(a.TOOL_SCHEMAS.values()), all(callable(h) for h in a.TOOL_HANDLERS.values()), "
             "all(getattr(a, n) is a.TOOL_HANDLERS[n] for n in a.TOOL_HANDLERS), "
-            "callable(a.tools_relation.check_relation))")
+            "callable(a.tools_relation.check_relation), callable(a.tools_document.doc_ref))")
     proc = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT,
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     roster = ",".join(TOOL_NAMES)
-    assert proc.stdout.split() == [roster, roster, "True", "True", "True", "True"]
+    assert proc.stdout.split() == [roster, roster, "True", "True", "True", "True", "True"]
 
 
 def test_manifest_declares_every_tool():

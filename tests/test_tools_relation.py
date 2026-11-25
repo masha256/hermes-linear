@@ -26,7 +26,7 @@ CHILD, CHILD2, OTHER, OTHER2 = "uuid-child", "uuid-child2", "uuid-other", "uuid-
 ROSTER = ["linear_issue_get", "linear_issue_create", "linear_issue_update", "linear_comment",
           "linear_sync_spec", "linear_sync_plan", "linear_task_state", "linear_query",
           "linear_search", "linear_attach", "linear_session_link", "linear_relation",
-          "linear_lookup"]
+          "linear_lookup", "linear_document"]
 
 
 @pytest.fixture
@@ -78,6 +78,7 @@ def test_schema_and_registration():
     "import hermes_linear.tools_attach; from hermes_linear import agent_tools",
     "import hermes_linear.tools_read; from hermes_linear import agent_tools",
     "import hermes_linear.tools_lookup; from hermes_linear import agent_tools",
+    "import hermes_linear.tools_document; from hermes_linear import agent_tools",
     "from hermes_linear import agent_tools; import hermes_linear.tools_relation",
 ])
 def test_roster_order_any_import_order(imports):

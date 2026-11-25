@@ -14,7 +14,7 @@ import re
 from typing import Any
 
 GATED_TOOLS = frozenset({"linear_comment", "linear_issue_update", "linear_issue_create",
-                         "linear_attach", "linear_relation"})
+                         "linear_attach", "linear_relation", "linear_document"})
 
 REQUIRED_TEXT = (
     "Not run: {targets} is outside this session's write scope. Call {tool} "
@@ -59,6 +59,8 @@ FIELD_TYPES: dict[str, dict[str, str]] = {
                             "estimate": "integer|null", "due_date": "string|null",
                             "cycle": "string|null", "milestone": "string|null"},
     "linear_relation": {"id": "string", "type": "string", "other": "string"},
+    "linear_document": {"action": "string", "id": "string", "title": "string",
+                        "content": "string", "issue": "string", "project": "string"},
 }
 
 
@@ -180,8 +182,9 @@ def approval_message(tool: str, targets: list[dict], args: dict, digest: str,
                      outside: bool = False) -> str:
     """Human-facing approval description; its last line carries the digest.
 
-    An issue target is ``- RET-n "title"``; a team or project target (one with ``kind``)
-    is ``- project "<name>"`` / ``- team "<key>"``, its name in ``identifier``.
+    An issue target is ``- RET-n "title"``; a team, project or document target (one with
+    ``kind``) is ``- project "<name>"`` / ``- team "<key>"`` / ``- document "<title>"``, its
+    name in ``identifier``.
     ``outside``: the call comes from a non-Linear session (RET-148), so the first line says
     so instead of naming the session's tickets."""
     lines = [f"Approve `{tool}` from outside a Linear session?" if outside

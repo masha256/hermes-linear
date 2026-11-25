@@ -20,7 +20,7 @@ Per-stage differences; work the ticket directly with the tools, per Questions an
 The `linear_*` tools are deferred behind tool search: load a schema with `tool_describe` (exact
 names), then always call via `tool_call`, one entry per call (a batch of plugin tools is
 rejected): `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])`. A
-direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The thirteen tools:
+direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The fourteen tools:
 
 - `linear_issue_get` (`id`, `comments?`: newest N threads): fields, relations, attachments, children.
 - `linear_search` (`text?`, `team?`, `project?`, `state?`, `assignee?`, `label?`, `parent?`, …):
@@ -38,6 +38,8 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The th
 - `linear_session_link` (`url`, `label?`): show a link (the PR) on this turn's agent session.
 - `linear_relation` (`id`, `type`: `blocks|blocked_by|related|duplicate_of`, `other`).
 - `linear_lookup` (`kind`, `team?`, `project?`, `query?`): the names (and ids) write tools accept.
+- `linear_document` (`action`: `get|create|update`, `id?`, `title?`, `content?`, `issue?`|`project?`):
+  docs; on an in-scope issue no prompt.
 
 They act as the Linear app, never raise and fail as `{"ok": false, "error": …}`. Re-runs are safe (a
 URL re-link is `ALREADY_LINKED`, a relation `ALREADY_RELATED`, any other one between the pair
@@ -96,16 +98,14 @@ choices and design-section approvals are selects. No visual companion (it can't 
 **Spec.** Header line `Linear: <session ticket ID>` (before the first `## ` heading). Commit, then
 `linear_sync_spec` (absolute path). Review gate: a select; each change: edit → commit → sync.
 
-**Plan.** Load `superpowers:writing-plans`. Header line `Linear: <ID>`; tasks keep the
-heading form `### Task N: <name>`. Commit, then `linear_sync_plan` (absolute path). It
-writes the plan comment (header and task list) and one `T<n> · <name>` sub-ticket per
-task (description: the whole task section), and writes the IDs back into the headings
-(`### Task N: <name> — <ID>`). Humans' and Done tickets are untouched. By result: `file_changed:
-true` → commit the plan (the IDs are now in the headings); `file_conflict: true` → the file
-changed during the sync, re-read and sync again; `file_error` → IDs not written, fix and re-sync.
-
-Plan approval is one select that includes the execution method (subagent-driven or
-inline). A later plan change: edit, commit, `linear_sync_plan`, commit again.
+**Plan.** Load `superpowers:writing-plans`. Header line `Linear: <ID>`; tasks keep the heading form
+`### Task N: <name>`. Commit, then `linear_sync_plan` (absolute path). It writes the plan comment
+(header and task list) and one `T<n> · <name>` sub-ticket per task (description: the whole task
+section), and writes the IDs back into the headings (`### Task N: <name> — <ID>`). Humans' and Done
+tickets are untouched. By result: `file_changed: true` → commit the plan (the IDs are now in the
+headings); `file_conflict: true` → the file changed during the sync, re-read and sync again;
+`file_error` → IDs not written, fix and re-sync. Plan approval is one select that includes the
+execution method (subagent-driven or inline). A later plan change: edit, commit, re-sync, commit again.
 
 **Implementation.** Load `superpowers:subagent-driven-development`. The ledger's
 line 1 stays its identity line; line 2 is `Linear: <ID>`. Each task's ledger entry

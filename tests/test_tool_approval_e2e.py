@@ -431,6 +431,48 @@ async def test_e2e_relation_out_of_scope(e2e):
     assert len(h.notified) == 1 and store.request(SK, d) is None
 
 
+async def test_e2e_document_one_prompt(e2e, monkeypatch):
+    """RET-164 (Review Focus 1): ``linear_document`` create on an out-of-scope issue. The
+    hook digests the model's raw args, the handler gets Hermes's real ``coerce_tool_args``
+    output for the plugin's registered schema. One card (``- OTH-9 "Unrelated"``), and after
+    "Allow once" the identical re-call creates the document exactly once. A read (``get``)
+    of it afterwards never asks."""
+    import copy
+
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry
+
+    h, a, client, gw, store, ws, config = e2e
+    tool = "linear_document"
+    real_get_schema = registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(
+        agent_tools.TOOL_SCHEMAS[name]) if name == tool else real_get_schema(name))
+    raw = {"action": "create", "title": "Notes", "content": "", "issue": "OTH-9"}
+    coerced = coerce_tool_args(tool, copy.deepcopy(raw))
+    assert coerced == raw  # all strings: Hermes hands them on unchanged
+    first = await h.run(tool, raw, cid="c-first", coerced=coerced)
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert ws.writes() == []
+    d = tool_approval.digest(tool, raw)
+    assert d == tool_approval.digest(tool, coerced) and store.request(SK, d).targets == [OTHER]
+    task = asyncio.create_task(h.run(tool, raw, cid="c-again", coerced=coerced))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert data["command"] == f"<{tool}> (plugin approval rule)"
+    assert '\n- OTH-9 "Unrelated"\n' in data["description"]
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out["ok"] is True and out["issue"] == "OTH-9", out
+    assert ws.writes() == [("document_create", ("Notes", "", OTHER, None))]
+    assert len(h.notified) == 1 and store.request(SK, d) is None
+    assert store.documents_by(SELF) == {out["document_id"]}
+    got = await h.run(tool, {"action": "get", "id": out["document_id"]}, cid="c-get")
+    assert got["ok"] is True and got["document"]["title"] == "Notes"
+    assert len(h.notified) == 1 and len(ws.writes()) == 1
+
+
 # ------------------------------------------- outside a Linear session (RET-148, Task 1)
 
 SLACK_SK = "agent:main:slack:dm:C0E2E:1700000000.0001"

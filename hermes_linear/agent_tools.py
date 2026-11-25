@@ -78,8 +78,9 @@ class Gate:
                              "title": issue.get("title")})
 
     def record_target(self, id: str, kind: str, name: str) -> None:  # noqa: A002
-        """A team or project target (``kind`` ``team`` / ``project``; RET-121 spec §2.4),
-        shown on the card as ``- <kind> "<name>"``."""
+        """A team, project or document target (``kind`` ``team`` / ``project`` /
+        ``document``; RET-121 spec §2.4, RET-122 spec §2.1), shown on the card as
+        ``- <kind> "<name>"``."""
         if any(t["id"] == id for t in self.targets):
             return
         self.targets.append({"id": id, "kind": kind, "identifier": name, "title": ""})
@@ -1651,6 +1652,7 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_session_link": {},
     "linear_relation": {},
     "linear_lookup": {},
+    "linear_document": {},
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
@@ -1667,11 +1669,13 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_session_link": None,  # type: ignore[dict-item]  # registered by tools_attach
     "linear_relation": None,  # type: ignore[dict-item]  # registered by tools_relation
     "linear_lookup": None,  # type: ignore[dict-item]  # registered by tools_lookup
+    "linear_document": None,  # type: ignore[dict-item]  # registered by tools_document
 }
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
-           "linear_attach", "linear_comment", "linear_issue_create", "linear_issue_get",
+           "linear_attach", "linear_comment", "linear_document", "linear_issue_create",
+           "linear_issue_get",
            "linear_issue_update", "linear_lookup", "linear_query", "linear_relation",
            "linear_search",
            "linear_session_link",
@@ -1686,3 +1690,4 @@ from . import tools_read  # noqa: E402,F401
 from . import tools_attach  # noqa: E402,F401
 from . import tools_relation  # noqa: E402,F401
 from . import tools_lookup  # noqa: E402,F401
+from . import tools_document  # noqa: E402,F401

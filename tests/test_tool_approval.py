@@ -27,7 +27,7 @@ CMD = "<linear_comment> (plugin approval rule)"
 def test_constants_verbatim():
     assert GATED_TOOLS == frozenset(
         {"linear_comment", "linear_issue_update", "linear_issue_create", "linear_attach",
-         "linear_relation"}
+         "linear_relation", "linear_document"}
     )
     assert REQUIRED_TEXT == (
         "Not run: {targets} is outside this session's write scope. Call {tool} "
@@ -209,6 +209,16 @@ def test_message_renders_kind_targets():
     assert "\r" not in msg
     assert parse_rule("<linear_issue_create> (plugin approval rule)", msg) == (
         "linear_issue_create", d)
+
+
+def test_message_renders_document_target():
+    """RET-164 (spec §2.1): a document target is ``- document "<title>"``, one line."""
+    d = "0123456789abcdef"
+    msg = approval_message(
+        "linear_document",
+        [{"id": "doc-1", "kind": "document", "identifier": "Spec: X\nY", "title": ""}],
+        {"action": "update", "id": "doc-1", "content": "c"}, d)
+    assert msg.split("\n")[1:3] == ['- document "Spec: X Y"', "Arguments:"]
 
 
 def test_message_tolerates_non_json_values():

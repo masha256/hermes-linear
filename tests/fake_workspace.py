@@ -464,7 +464,9 @@ class FakeWorkspace:
                      project: str | None = None, creator: str = VIEWER) -> str:
         """Seed a document on an issue (UUID or identifier) or a project; returns its id."""
         n = next(self._ids)
-        did, slug = f"doc-{n}", f"{n:012x}"
+        # UUID-shaped like Linear's (``linear_document`` refuses an id that is neither a
+        # UUID nor a slug id); the slug id is 12 hex digits, as live ones are.
+        did, slug = f"00000000-0000-4000-8000-{n:012x}", f"{n:012x}"
         self.documents[did] = {
             "id": did, "slugId": slug, "title": title, "content": content,
             "url": f"https://linear.app/x/document/doc-{slug}",
