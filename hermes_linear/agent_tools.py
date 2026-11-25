@@ -656,15 +656,6 @@ def _project_of(issue: dict | None) -> str | None:
     return ((issue or {}).get("project") or {}).get("id")
 
 
-def _with_fields(out: dict, r: issue_fields.Resolved) -> dict:
-    """A write's result plus self-delegation's ``starts_session`` / ``warnings``."""
-    if r.starts_session is not None:
-        out["starts_session"] = r.starts_session
-    if r.warnings:
-        out["warnings"] = list(r.warnings)
-    return out
-
-
 # -- linear_issue_create
 
 
@@ -708,7 +699,7 @@ async def _create(ctx: ToolContext, a: dict) -> dict:
     _check_gate(ctx)
     issue = await ctx.client.issue_create(inp)
     _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
-    return _with_fields({"ok": True, "issue": issue}, r)
+    return {"ok": True, "issue": issue}
 
 
 # -- linear_issue_update
@@ -776,8 +767,7 @@ async def _update(ctx: ToolContext, a: dict) -> dict:
     if not inp:  # only no-op removals: never send an empty issueUpdate (Task 2 minor N1)
         return {"ok": True, "issue": _summary(issue)}
     _check_gate(ctx)  # after both ends' scope checks, the cycle check and the project check
-    return _with_fields({"ok": True, "issue": await ctx.client.issue_update(issue["id"], inp)},
-                        r)
+    return {"ok": True, "issue": await ctx.client.issue_update(issue["id"], inp)}
 
 
 async def _project_in_scope(ctx: ToolContext, issue: dict, parent_arg: str | None,
@@ -1323,7 +1313,6 @@ linear_query = _tool(_parse_query, _query)
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
 _GATED_NOTE = ("Outside the session issue's tree (issues you did not create) the first call "
                "returns APPROVAL_REQUIRED; call again with identical arguments to ask a human.")
-_USER_REF = "User UUID, name, display name or email; me is this app."
 _PRIORITY = ("none, urgent, high, medium or low, or Linear's number 0-4 "
              "(0 none, 1 urgent, 2 high, 3 medium, 4 low).")
 
@@ -1333,10 +1322,13 @@ def _field_props(nullable: bool) -> dict[str, dict]:
     s: Any = ["string", "null"] if nullable else "string"
     i: Any = ["integer", "null"] if nullable else "integer"
     return {
-        "assignee": {"type": s, "description": _USER_REF},
+        "assignee": {"type": s, "description": (
+            "A human user: UUID, name, display name or email. An app user (me included) "
+            "is refused with ASSIGNEE_IS_APP: Linear would turn it into a delegation.")},
         "delegate": {"type": s, "description": (
-            "An agent (app) user: UUID, name, display name or email; me is this app, "
-            "which starts no session (starts_session: false).")},
+            "Another agent (app) user: UUID, name, display name or email. This app (me) "
+            "is refused with SELF_DELEGATION: only a human can delegate to this app, so "
+            "ask in the thread.")},
         "priority": {"type": s, "description": _PRIORITY},
         "estimate": {"type": i, "description": ("Estimate points, an integer >= 0. Linear "
                                                 "stores it even when the team doesn't use "

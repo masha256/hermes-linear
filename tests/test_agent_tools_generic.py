@@ -760,12 +760,12 @@ def test_create_follows_parent_project_no_target(pin_ctx, ws, adapter):
 def test_update_fields_input(pin_ctx, ws):
     ws.cycles_rows[TEAM] = [{"id": "cy-7", "number": 7, "name": "Sprint 7"}]
     ws.milestones_rows[PROJECT["id"]] = [{"id": "ms-1", "name": "Alpha"}]
-    out = linear_issue_update({"id": "RET-2", "assignee": "me", "priority": "4",
+    out = linear_issue_update({"id": "RET-2", "assignee": "mike", "priority": "4",
                                "estimate": 0, "due_date": "2027-01-31", "cycle": "7",
                                "milestone": "Alpha"})
     assert out["ok"] is True and set(out) == {"ok", "issue"}
     assert _updates(ws) == [("uuid-child", {
-        "assigneeId": VIEWER, "priority": 4, "estimate": 0, "dueDate": "2027-01-31",
+        "assigneeId": HUMAN, "priority": 4, "estimate": 0, "dueDate": "2027-01-31",
         "cycleId": "cy-7", "projectMilestoneId": "ms-1"})]
 
 
@@ -793,19 +793,57 @@ def test_update_milestone_in_resulting_project(pin_ctx, ws):
     assert out == {"ok": False, "error": "MILESTONE_NOT_FOUND", "candidates": []}
 
 
-def test_self_delegation_result(pin_ctx, ws):
-    from hermes_linear.issue_fields import SELF_DELEGATION_WARNING
-    out = linear_issue_create({"title": "x", "delegate": "me"})
-    assert out["ok"] is True and out["starts_session"] is False
-    assert out["warnings"] == [SELF_DELEGATION_WARNING]
-    assert _created_inputs(ws)[-1]["delegateId"] == VIEWER
-    out = linear_issue_update({"id": "RET-2", "delegate": "Neo"})
-    assert out["ok"] is True and out["starts_session"] is False
-    assert out["warnings"] == [SELF_DELEGATION_WARNING]
-    n = len(ws.writes())
+CODEX = "codex-user"
+SELF_MSG = "Only a human can delegate to this app; ask in the thread."
+APP_ASSIGNEE_MSG = ("Linear turns an app assignee into a delegation; use delegate (another "
+                    "agent) or ask a human.")
+
+
+def _add_codex(ws) -> None:
+    ws.users_rows.append({"id": CODEX, "name": "Codex", "displayName": "codex",
+                          "email": "codex@app.linear", "app": True, "active": True})
+
+
+def test_self_delegation_refused(pin_ctx, ws, adapter):
+    refusal = {"ok": False, "error": "SELF_DELEGATION", "message": SELF_MSG}
+    assert linear_issue_create({"title": "x", "delegate": "me"}) == refusal
+    for ref in ("Neo", "neo@app.linear", VIEWER):
+        assert linear_issue_update({"id": "RET-2", "delegate": ref}) == refusal, ref
     assert linear_issue_update({"id": "RET-2", "delegate": "mike"}) == {
         "ok": False, "error": "DELEGATE_NOT_AGENT"}
-    assert len(ws.writes()) == n
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_app_assignee_refused(pin_ctx, ws, adapter):
+    _add_codex(ws)
+    refusal = {"ok": False, "error": "ASSIGNEE_IS_APP", "message": APP_ASSIGNEE_MSG}
+    assert linear_issue_create({"title": "x", "assignee": "me"}) == refusal
+    for ref in ("me", "Neo", VIEWER, "Codex", CODEX):
+        assert linear_issue_update({"id": "RET-2", "assignee": ref}) == refusal, ref
+    assert ws.writes() == [] and _requests(adapter) == 0
+
+
+def test_other_agent_delegate_writes(pin_ctx, ws):
+    _add_codex(ws)
+    out = linear_issue_create({"title": "x", "delegate": "Codex"})
+    assert out["ok"] is True and set(out) == {"ok", "issue"}
+    assert _created_inputs(ws)[-1]["delegateId"] == CODEX
+    out = linear_issue_update({"id": "RET-2", "delegate": "codex@app.linear"})
+    assert out["ok"] is True and set(out) == {"ok", "issue"}
+    assert _updates(ws)[-1][1] == {"delegateId": CODEX}
+
+
+def test_self_delegation_refused_before_approval(pin_ctx, ws, adapter):
+    """A first pass that would also need approval (a project outside the scope) refuses
+    with the field's code: no write and no approval request."""
+    _orion(ws)
+    assert needs_approval(linear_issue_update({"id": "RET-2", "project": "orion"}))
+    n = _requests(adapter)
+    out = linear_issue_update({"id": "RET-2", "project": "orion", "delegate": "me"})
+    assert out == {"ok": False, "error": "SELF_DELEGATION", "message": SELF_MSG}
+    out = linear_issue_create({"title": "x", "project": "orion", "assignee": "me"})
+    assert out == {"ok": False, "error": "ASSIGNEE_IS_APP", "message": APP_ASSIGNEE_MSG}
+    assert ws.writes() == [] and _requests(adapter) == n
 
 
 def test_update_team_bad_args(pin_ctx, ws):
@@ -880,6 +918,10 @@ def test_issue_field_schemas():
         assert all(w in props["priority"]["description"]
                    for w in ("none", "urgent", "high", "medium", "low", "0", "4"))
     assert "clears the milestone" in update["project"]["description"]
+    for props in (create, update):
+        assert "ASSIGNEE_IS_APP" in props["assignee"]["description"]
+        assert "SELF_DELEGATION" in props["delegate"]["description"]
+        assert "starts_session" not in props["delegate"]["description"]
     for key in ("labels",):
         assert create[key]["type"] == "array"
     assert update["add_labels"]["type"] == update["remove_labels"]["type"] == "array"

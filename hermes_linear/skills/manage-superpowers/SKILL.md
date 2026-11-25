@@ -132,9 +132,9 @@ then end with the final reply (PR link and a short summary).
 When brainstorming decomposes the work into sub-projects, the current ticket becomes the
 umbrella: it holds the decomposition and build order. Create one top-level ticket per
 sub-project with `linear_issue_create` (no `parent`; same project; link the umbrella in its
-description). Each runs its own cycle in its own session. The tools can set a delegate, but a
-delegation by the app starts no session: at a sub-project's turn, ask the user in the umbrella
-ticket to delegate it to the app (never via other Linear tools or MCP servers; they act as the user).
+description). Each runs its own cycle in its own session. The tools can set another agent as
+delegate, never this app (`SELF_DELEGATION`): at a sub-project's turn, ask the user in the
+umbrella to delegate it to the app (never via other Linear tools or MCP servers; they act as the user).
 
 ## Rules
 

@@ -3,6 +3,7 @@ I/O) and ``resolve`` (names to Linear ids through the directory)."""
 
 from __future__ import annotations
 
+import dataclasses
 from types import SimpleNamespace
 
 import pytest
@@ -181,11 +182,25 @@ def test_parse_team_on_update_bad_args(value):
 
 # --- resolve: users ------------------------------------------------------------------------
 
-async def test_me_is_app(ctx, client):
-    r = await run(ctx, {"assignee": "me"})
-    assert r.input == {"assigneeId": APP}
-    assert r.warnings == [] and r.starts_session is None
+SELF_MSG = "Only a human can delegate to this app; ask in the thread."
+APP_ASSIGNEE_MSG = ("Linear turns an app assignee into a delegation; use delegate (another "
+                    "agent) or ask a human.")
+
+
+async def test_assignee_me_refused(ctx, client):
+    exc = await refused(run(ctx, {"assignee": "me"}))
+    assert (exc.code, exc.extra) == ("ASSIGNEE_IS_APP", {"message": APP_ASSIGNEE_MSG})
     assert ("users", "") not in client.calls  # `me` needs no lookup
+
+
+@pytest.mark.parametrize("ref", ["Neo", "neo@app.linear", APP, "Codex", "codex", OTHER_APP])
+async def test_assignee_app_user_refused(ctx, ref):
+    exc = await refused(run(ctx, {"assignee": ref}))
+    assert (exc.code, exc.extra) == ("ASSIGNEE_IS_APP", {"message": APP_ASSIGNEE_MSG})
+
+
+async def test_assignee_human_ok(ctx):
+    assert (await run(ctx, {"assignee": "Mike Smith"})).input == {"assigneeId": MIKE}
 
 
 async def test_user_by_email_case_insensitive(ctx):
@@ -214,19 +229,22 @@ async def test_delegate_human_refused(ctx):
     assert exc.code == "DELEGATE_NOT_AGENT"
 
 
-async def test_self_delegation_warning(ctx):
-    for ref in ("me", "Neo", APP):
+@pytest.mark.parametrize("ref", ["me", "ME", "Neo", "neo", "neo@app.linear", APP, APP.upper()])
+async def test_self_delegation_refused(ctx, ref):
+    exc = await refused(run(ctx, {"delegate": ref}))
+    assert (exc.code, exc.extra) == ("SELF_DELEGATION", {"message": SELF_MSG})
+
+
+async def test_other_agent_delegate_ok(ctx):
+    for ref in ("codex@app.linear", "Codex", OTHER_APP):
         r = await run(ctx, {"delegate": ref})
-        assert r.input == {"delegateId": APP}
-        assert r.starts_session is False
-        assert r.warnings == [
-            "Delegated to this app: no session starts until a human delegates the issue."]
+        assert r.input == {"delegateId": OTHER_APP}
 
 
-async def test_other_agent_delegate_no_warning(ctx):
-    r = await run(ctx, {"delegate": "codex@app.linear"})
-    assert r.input == {"delegateId": OTHER_APP}
-    assert r.warnings == [] and r.starts_session is None
+def test_self_delegation_success_path_removed():
+    assert not hasattr(issue_fields, "SELF_DELEGATION_WARNING")
+    names = {f.name for f in dataclasses.fields(Resolved)}
+    assert not names & {"starts_session", "warnings"}
 
 
 # --- resolve: scalars ----------------------------------------------------------------------
@@ -323,17 +341,15 @@ async def test_clear_on_update(ctx, client):
                        "estimate": None, "dueDate": None, "cycleId": None,
                        "projectMilestoneId": None, "projectId": None}
     assert r.project_id is None and r.project is None
-    assert r.warnings == [] and r.starts_session is None
     assert client.calls == []  # clearing reads nothing
 
 
 async def test_parse_then_resolve_end_to_end(ctx):
-    parsed = parse({"assignee": "me", "delegate": "Codex", "priority": "Low",
+    parsed = parse({"assignee": "mike@example.com", "delegate": "Codex", "priority": "Low",
                     "estimate": 3, "due_date": "2026-12-01", "cycle": "2",
                     "project": "hermes linear", "milestone": "Alpha", "title": "t"},
                    update=False)
     r = await run(ctx, parsed, project_id=None)
-    assert r.input == {"assigneeId": APP, "delegateId": OTHER_APP, "priority": 4,
+    assert r.input == {"assigneeId": MIKE, "delegateId": OTHER_APP, "priority": 4,
                        "estimate": 3, "dueDate": "2026-12-01", "cycleId": "cy2",
                        "projectId": PROJ, "projectMilestoneId": "m1"}
-    assert issue_fields.SELF_DELEGATION_WARNING not in r.warnings

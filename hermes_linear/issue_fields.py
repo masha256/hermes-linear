@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import datetime
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from . import directory
@@ -24,8 +24,11 @@ FIELDS = ("assignee", "delegate", "priority", "estimate", "due_date", "cycle", "
 #: Linear's priority numbers by name.
 PRIORITIES = {"none": 0, "urgent": 1, "high": 2, "medium": 3, "low": 4}
 
-SELF_DELEGATION_WARNING = (
-    "Delegated to this app: no session starts until a human delegates the issue.")
+#: Refusal messages (RET-154): Linear opens a creatorless session, which the router refuses,
+#: when the app delegates to itself, and turns an app-user assignee into a delegation.
+SELF_DELEGATION_MESSAGE = "Only a human can delegate to this app; ask in the thread."
+ASSIGNEE_IS_APP_MESSAGE = ("Linear turns an app assignee into a delegation; use delegate "
+                           "(another agent) or ask a human.")
 
 _DIGITS = re.compile(r"[0-9]+")
 _YMD = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")  # fromisoformat alone takes "2026-W05-1"
@@ -120,14 +123,11 @@ def parse(args: dict, *, update: bool) -> dict:
 class Resolved:
     """``input``: ``IssueCreateInput`` / ``IssueUpdateInput`` keys for the given fields.
     ``team_id`` / ``project_id``: the resulting team and project. ``team`` / ``project``:
-    the rows resolved for an explicit ``team`` / ``project`` (approval targets).
-    ``starts_session`` is ``False`` only for a delegation to this app."""
+    the rows resolved for an explicit ``team`` / ``project`` (approval targets)."""
 
     input: dict
     team_id: str
     project_id: str | None
-    warnings: list[str] = field(default_factory=list)
-    starts_session: bool | None = None
     team: dict | None = None
     project: dict | None = None
 
@@ -195,7 +195,13 @@ async def resolve(ctx: Any, parsed: dict, *, team_id: str, project_id: str | Non
 
     if "assignee" in parsed:
         ref = parsed["assignee"]
-        inp["assigneeId"] = None if ref is None else (await _user(ctx, d, ref))[0]
+        if ref is None:
+            inp["assigneeId"] = None
+        else:
+            uid, app = await _user(ctx, d, ref)
+            if app:  # Linear would make it a delegation (RET-154)
+                raise _refusal("ASSIGNEE_IS_APP", {"message": ASSIGNEE_IS_APP_MESSAGE})
+            inp["assigneeId"] = uid
     if "delegate" in parsed:
         ref = parsed["delegate"]
         if ref is None:
@@ -204,10 +210,9 @@ async def resolve(ctx: Any, parsed: dict, *, team_id: str, project_id: str | Non
             uid, app = await _user(ctx, d, ref)
             if not app:
                 raise _refusal("DELEGATE_NOT_AGENT")
+            if uid == await ctx.client.viewer_id():  # would open a creatorless session
+                raise _refusal("SELF_DELEGATION", {"message": SELF_DELEGATION_MESSAGE})
             inp["delegateId"] = uid
-            if uid == await ctx.client.viewer_id():
-                out.starts_session = False
-                out.warnings.append(SELF_DELEGATION_WARNING)
 
     if "priority" in parsed:  # clearing a priority is Linear's 0 ("No priority")
         inp["priority"] = parsed["priority"] or 0
