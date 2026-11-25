@@ -68,7 +68,8 @@ def test_schema_and_handler():
     s = TOOL_SCHEMAS["linear_task_state"]
     assert s["name"] == "linear_task_state" and "Linear app" in s["description"]
     props = s["parameters"]["properties"]
-    assert set(props) == {"id", "state", "summary", "question"}
+    assert set(props) == {"id", "state", "summary", "question", "blocked_by"}
+    assert props["blocked_by"]["type"] == "string" and "blocked" in props["blocked_by"]["description"]
     assert props["state"]["enum"] == ["in_progress", "in_review", "done", "blocked",
                                       "unblocked"]
     assert s["parameters"]["required"] == ["id", "state"]
@@ -221,11 +222,31 @@ def test_unblocked_noop_makes_no_writes(pin_ctx, ws):
     # not labelled
     out = linear_task_state({"id": "RET-2", "state": "unblocked"})
     assert out["ok"] is True and ws.writes() == []
-    # no Blocked label on the team at all
+
+
+def test_unblocked_without_label_makes_no_writes(pin_ctx, ws):
+    # no Blocked label on the team at all (a fresh workspace: labels are cached per client)
     ws.workspace_labels = []
     out = linear_task_state({"id": "RET-2", "state": "unblocked"})
     assert out == {"ok": True, "issue": "RET-2", "state": "Todo", "label_missing": True}
     assert ws.writes() == []
+
+
+def test_blocked_label_added_meanwhile_found_by_refetch(pin_ctx, ws):
+    ws.workspace_labels = []
+    assert linear_task_state({"id": "RET-2", "state": "unblocked"})["label_missing"] is True
+    ws.workspace_labels = [{"id": BLOCKED, "name": "Blocked"}]
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "question": "q"})
+    assert out["ok"] is True and ws.issues[TASK]["labels"] == [BLOCKED]
+
+
+def test_task_state_states_and_labels_cached(pin_ctx, ws):
+    for st in ("in_progress", "in_review", "done"):
+        assert linear_task_state({"id": "RET-2", "state": st})["ok"] is True
+    for _ in range(2):
+        assert linear_task_state({"id": "RET-2", "state": "unblocked"})["ok"] is True
+    assert [c for c in ws.calls if c[0] in {"team_states", "team_labels"}] == [
+        ("team_states", "team-1"), ("team_labels", "team-1")]
 
 
 def test_task_state_out_of_scope(pin_ctx, ws):
@@ -328,3 +349,154 @@ def test_task_state_without_store_still_works(pin_ctx, ws, adapter, loop):
     a = agent_tools._parse_task_state({"id": "RET-2", "state": "done"})
     out = asyncio.run_coroutine_threadsafe(agent_tools._task_state(ctx, a), loop).result(5)
     assert out["ok"] is True and out["state"] == "Done"
+
+
+# ------------------------------------------------------------- blocked_by (RET-121 §1.6)
+
+BLOCKER = "uuid-blocker"
+
+
+@pytest.fixture
+def blocker(ws):
+    """RET-3: another task of the session ticket (in the tree), the blocker."""
+    ws.add_issue("RET-3", title="T2 · Other task", uuid=BLOCKER, parent=SELF)
+    return BLOCKER
+
+
+def _relations(ws):
+    return [(r["issue"], r["related"], r["type"]) for r in ws.relations.values()]
+
+
+def test_blocked_by_creates_relation_no_question(pin_ctx, ws, blocker):
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3"})
+    [rid] = ws.relations
+    assert out == {"ok": True, "issue": "RET-2", "state": "Todo", "label_missing": False,
+                   "question_posted": False, "relation_id": rid, "relation_created": True}
+    assert _relations(ws) == [(BLOCKER, TASK, "blocks")]  # the blocker blocks the task
+    assert ws.issues[TASK]["labels"] == [BLOCKED]
+    assert ws.comments == {}  # no question: no comment
+    assert _kinds(ws) == ["issue_update", "relation_create"]  # label first, then relation
+
+
+def test_blocked_by_with_question(pin_ctx, ws, blocker):
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": BLOCKER,
+                             "question": "Wait for RET-3?"})
+    assert out["ok"] is True and out["question_posted"] is True
+    assert out["relation_created"] is True and out["relation_id"] in ws.relations
+    assert _kinds(ws) == ["issue_update", "relation_create", "comment_create"]
+    (_, c), = ws.comments.items()
+    assert (c["issue"], c["body"]) == (SELF, "**RET-2 needs input:** Wait for RET-3?")
+
+
+def test_blocked_by_rerun_no_duplicate_relation(pin_ctx, ws, blocker):
+    """Review Focus 5: a re-run finds the relation (and the label) and writes nothing."""
+    first = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3"})
+    n = len(ws.writes())
+    again = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3"})
+    assert again["ok"] is True and again["relation_created"] is False
+    assert again["relation_id"] == first["relation_id"]
+    assert len(ws.writes()) == n and len(ws.relations) == 1 and ws.comments == {}
+
+
+def test_blocked_by_existing_relation_not_created(pin_ctx, ws, blocker):
+    rid = ws.add_relation(BLOCKER, TASK, "blocks")
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3"})
+    assert out["relation_id"] == rid and out["relation_created"] is False
+    assert _kinds(ws) == ["issue_update"]
+
+
+@pytest.mark.parametrize("seed, direction", [
+    ((TASK, BLOCKER, "blocks"), "inbound"),  # the reverse: the task blocks the blocker
+    ((BLOCKER, TASK, "related"), "outbound"),
+    ((TASK, BLOCKER, "duplicate"), "inbound"),
+    ((BLOCKER, TASK, "similar"), "outbound"),
+])
+def test_blocked_by_conflict_refused_before_writes(pin_ctx, ws, blocker, seed, direction):
+    """Ruling R9 / §1.6: the relation check runs before the label; a conflict writes
+    nothing (no label, no comment) and replaces nothing."""
+    old = ws.add_relation(*seed)
+    for args in ({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3"},
+                 {"id": "RET-2", "state": "blocked", "blocked_by": "RET-3", "question": "q"}):
+        assert linear_task_state(args) == {
+            "ok": False, "error": "RELATION_CONFLICT",
+            "existing": {"relation_id": old, "type": seed[2], "direction": direction}}
+    assert ws.writes() == [] and ws.comments == {}
+    assert ws.issues[TASK]["labels"] == [] and _relations(ws) == [seed]
+
+
+def test_blocked_by_reads_relations_once(pin_ctx, ws, blocker):
+    linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3"})
+    assert [c[1] for c in ws.calls if c[0] == "issue_relations"] == [BLOCKER]
+
+
+def test_blocked_by_out_of_tree_refused_before_writes(pin_ctx, ws, adapter):
+    """The tool stays tree-only: an out-of-tree blocker is OUT_OF_SCOPE, no approval asked
+    and zero writes (not even the label)."""
+    for args in ({"id": "RET-2", "state": "blocked", "blocked_by": "OTH-9"},
+                 {"id": "RET-2", "state": "blocked", "blocked_by": "OTH-9", "question": "q"}):
+        assert linear_task_state(args) == {"ok": False, "error": "OUT_OF_SCOPE"}
+    assert ws.writes() == [] and ws.relations == {} and ws.comments == {}
+    assert ws.issues[TASK]["labels"] == []
+
+
+def test_blocked_by_unknown_issue_before_writes(pin_ctx, ws):
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "NOPE-1"})
+    assert out == {"ok": False, "error": "NOT_FOUND", "message": "Entity not found: Issue"}
+    assert ws.writes() == []
+
+
+def test_blocked_by_self_bad_args(pin_ctx, ws):
+    for ref in ("RET-2", TASK):
+        out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": ref,
+                                 "question": "q"})
+        assert out == {"ok": False, "error": "BAD_ARGS"}
+    assert ws.writes() == []
+
+
+@pytest.mark.parametrize("state", ["in_progress", "in_review", "done", "unblocked"])
+def test_blocked_by_with_done_bad_args(pin_ctx, ws, blocker, state):
+    out = linear_task_state({"id": "RET-2", "state": state, "blocked_by": "RET-3"})
+    assert out == {"ok": False, "error": "BAD_ARGS"}
+    assert ws.calls == []
+
+
+@pytest.mark.parametrize("blocked_by", ["", "  ", 7, ["RET-3"]])
+def test_blocked_by_bad_value(pin_ctx, ws, blocked_by):
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": blocked_by,
+                             "question": "q"})
+    assert out == {"ok": False, "error": "BAD_ARGS"} and ws.calls == []
+
+
+@pytest.mark.parametrize("question", ["", "   ", 7])
+def test_blocked_by_with_bad_question(pin_ctx, ws, blocker, question):
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3",
+                             "question": question})
+    assert out == {"ok": False, "error": "BAD_ARGS"} and ws.calls == []
+
+
+def test_blocked_without_question_or_blocked_by_bad_args(pin_ctx, ws):
+    out = linear_task_state({"id": "RET-2", "state": "blocked"})
+    assert out == {"ok": False, "error": "BAD_ARGS"} and ws.calls == []
+
+
+def test_label_missing_carries_relation_keys(pin_ctx, ws, blocker):
+    ws.workspace_labels = []
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3"})
+    [rid] = ws.relations
+    assert out == {"ok": False, "error": "LABEL_MISSING", "issue": "RET-2",
+                   "label_missing": True, "question_posted": False, "relation_id": rid,
+                   "relation_created": True}
+    assert _kinds(ws) == ["relation_create"]
+    out = linear_task_state({"id": "RET-2", "state": "blocked", "blocked_by": "RET-3",
+                             "question": "q"})
+    assert out["error"] == "LABEL_MISSING" and out["question_posted"] is True
+    assert out["relation_id"] == rid and out["relation_created"] is False
+
+
+def test_blocked_by_closes_open_task(pin_ctx, ws, adapter, blocker):
+    from hermes_linear.store import Store
+    adapter._store = store = Store.open(":memory:")
+    store.set_open_task(SELF, TASK, True)
+    assert linear_task_state({"id": "RET-2", "state": "blocked",
+                              "blocked_by": "RET-3"})["ok"] is True
+    assert store.open_tasks(SELF) == []

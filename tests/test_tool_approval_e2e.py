@@ -311,6 +311,68 @@ async def test_e2e_coerced_array_arg_digests_agree(e2e):
     assert store.request(SK, d) is None
 
 
+async def test_e2e_coerced_estimate_one_prompt(e2e, monkeypatch):
+    """RET-121 Review Focus 1: the hook digests the raw ``estimate: "2"``, the handler the
+    output of Hermes's real ``coerce_tool_args`` for the plugin's registered schema
+    (``estimate: 2``). One approval prompt, and the approved re-call writes."""
+    import copy
+
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry
+
+    h, a, client, gw, store, ws, config = e2e
+    tool = "linear_issue_update"
+    real_get_schema = registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(
+        agent_tools.TOOL_SCHEMAS[name]) if name == tool else real_get_schema(name))
+    raw = {"id": "OTH-9", "estimate": "2", "due_date": "null"}
+    coerced = coerce_tool_args(tool, copy.deepcopy(raw))
+    assert coerced == {"id": "OTH-9", "estimate": 2, "due_date": None}  # what Hermes hands on
+    first = await h.run(tool, raw, cid="c-first", coerced=coerced)
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    d = tool_approval.digest(tool, raw)
+    assert d == tool_approval.digest(tool, coerced) and store.request(SK, d) is not None
+    task = asyncio.create_task(h.run(tool, raw, cid="c-again", coerced=coerced))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    assert h.notified[-1]["description"].endswith(f"digest: {d}")
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out["ok"] is True, out
+    assert len(h.notified) == 1  # one prompt: the approved re-call did not ask again
+    assert ws.issues[OTHER]["fields"] == {"estimate": 2, "dueDate": None}
+    assert store.request(SK, d) is None
+
+
+async def test_e2e_project_target(e2e):
+    """RET-121 §2.4: another project is an approval target; after "Allow once" the
+    identical re-call creates the issue in that project only, and a third identical call
+    asks again."""
+    h, a, client, gw, store, ws, config = e2e
+    ws.add_project("proj-orion", "orion")
+    tool, args = "linear_issue_create", {"title": "Over there", "project": "orion"}
+    first = await h.run(tool, args, cid="c-first")
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert "orion" in first["message"] and ws.writes() == []
+    d = tool_approval.digest(tool, args)
+    assert store.request(SK, d).targets == ["proj-orion"]
+    task = asyncio.create_task(h.run(tool, args, cid="c-again"))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert data["command"] == f"<{tool}> (plugin approval rule)"
+    assert '\n- project "orion"\n' in data["description"]
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out["ok"] is True, out
+    [(_, inp)] = ws.writes()
+    assert inp["projectId"] == "proj-orion" and inp["teamId"] == ws.issues[SELF]["team"]
+    assert ws.issues[out["issue"]["id"]]["project"] == {"id": "proj-orion", "name": "orion"}
+    assert store.request(SK, d) is None
+    again = await h.run(tool, args, cid="c-third")
+    assert again["error"] == "APPROVAL_REQUIRED" and len(ws.writes()) == 1
+
+
 async def test_out_of_scope_attach_end_to_end(e2e, tmp_path, monkeypatch):
     """RET-134: an out-of-scope ``linear_attach`` of a file goes through the same approval
     path. The first call uploads nothing; the identical re-call asks in Linear, and after
@@ -340,3 +402,28 @@ async def test_out_of_scope_attach_end_to_end(e2e, tmp_path, monkeypatch):
     [att] = ws.attachments.values()
     assert att["issue"] == OTHER and att["url"] == out["asset_url"] and att["title"] == "shot.png"
     assert store.request(SK, d) is None
+
+
+async def test_e2e_relation_out_of_scope(e2e):
+    """RET-141: ``linear_relation`` with an out-of-scope ``other`` asks once; after "Allow
+    once" the identical re-call creates the relation exactly once."""
+    h, a, client, gw, store, ws, config = e2e
+    tool, args = "linear_relation", {"id": "RET-1", "type": "blocks", "other": "OTH-9"}
+    first = await h.run(tool, args, cid="c-first")
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert ws.writes() == []
+    d = tool_approval.digest(tool, args)
+    assert store.request(SK, d).targets == [OTHER]
+    task = asyncio.create_task(h.run(tool, args, cid="c-again"))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert data["command"] == f"<{tool}> (plugin approval rule)"
+    assert '\n- OTH-9 "Unrelated"\n' in data["description"]
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out == {"ok": True, "relation_id": out["relation_id"], "issue": "RET-1",
+                   "other": "OTH-9", "type": "blocks"}, out
+    assert ws.writes() == [("relation_create", (SELF, OTHER, "blocks"))]
+    assert len(h.notified) == 1 and store.request(SK, d) is None

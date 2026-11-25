@@ -5,12 +5,11 @@ description: Use when a repo has .hermes-linear.yaml or ticket says so.
 
 # Manage with hermes-linear (superpowers through Linear)
 
-Load this when a delegated Linear ticket says "manage with hermes-linear", or when the
-repo you work in has `.hermes-linear.yaml` at its root. It runs the superpowers workflow
-(brainstorm → spec → plan → subagent-driven development) inside the ticket. It is an
-overlay: at each stage, load `superpowers:<stage>` and follow it, then apply the differences
-below. Never restate or edit superpowers itself. Git is the source of truth; Linear holds
-rendered copies that link back to the committed files.
+Load this when a delegated Linear ticket says "manage with hermes-linear", or when the repo you
+work in has `.hermes-linear.yaml` at its root. It runs the superpowers workflow (brainstorm →
+spec → plan → subagent-driven development) inside the ticket. It is an overlay: at each stage,
+load `superpowers:<stage>` and follow it, then apply the differences below. Never restate or edit
+superpowers itself. Git is the source of truth; Linear holds rendered copies of the files.
 
 **Without superpowers** (`superpowers:<stage>` not found): say once in the thread that it isn't
 installed (install it for the full flow): no spec → plan → SDD, no task sub-tickets. Skip Setup and
@@ -21,28 +20,31 @@ Per-stage differences; work the ticket directly with the tools, per Questions an
 The `linear_*` tools are deferred behind tool search: load a schema with `tool_describe` (exact
 names), then always call via `tool_call`, one entry per call (a batch of plugin tools is
 rejected): `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])`. A
-direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The eleven tools:
+direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The thirteen tools:
 
 - `linear_issue_get` (`id`, `comments?`: newest N threads): fields, relations, attachments, children.
 - `linear_search` (`text?`, `team?`, `project?`, `state?`, `assignee?`, `label?`, `parent?`, …):
   find issues (rows + `next_cursor`); complex filters go through `linear_query`.
-- `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`): in the
-  session's team and project.
-- `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`,
-  `remove_labels?`, `parent?`): `parent: ""` detaches; a cycle is `PARENT_CYCLE`.
-- `linear_comment` (`id`, `body`, `edit_marker?`).
+- `linear_issue_create` (`title`, `description?`, `parent?`, `labels?`, `state?`, `team?`,
+  `project?`, `assignee?`, `delegate?`, `priority?`, `estimate?`, `due_date?`, `cycle?`,
+  `milestone?`): in the parent's (else the session's) team and project; another one asks.
+- `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`, `remove_labels?`,
+  `parent?`, `project?`, create's others but `team`): `null` clears; `parent: ""` detaches.
+- `linear_comment` (`id`, `body`, `edit_marker?`, `reply_to?`: a comment UUID's thread, `resolve?`).
 - `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
-- `linear_task_state` (`id`, `state`, `summary?`, `question?`); `state` is one of
-  `in_progress|in_review|done|blocked|unblocked`.
+- `linear_task_state` (`id`, `state`, `summary?`, `question?`, `blocked_by?`): states in SDD below.
 - `linear_query` (`query`, `variables?`): read-only GraphQL; a result over 50,000 chars is refused.
 - `linear_attach` (`id` + `path` or `url`, `title?`; or `path` + `embed: true` → `markdown`).
 - `linear_session_link` (`url`, `label?`): show a link (the PR) on this turn's agent session.
+- `linear_relation` (`id`, `type`: `blocks|blocked_by|related|duplicate_of`, `other`).
+- `linear_lookup` (`kind`, `team?`, `project?`, `query?`): the names (and ids) write tools accept.
 
-They act as the Linear app, never raise and fail as `{"ok": false, "error": …}`. Re-runs are safe
-(a URL re-link is `ALREADY_LINKED`; session links de-duplicate), except that a `path` attach adds
-a second copy. Writes to the session ticket, its descendants and tickets made from it (any turn)
-just run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue_create` or
-`linear_attach` answers `APPROVAL_REQUIRED`; an identical re-call asks a human in Linear.
+They act as the Linear app, never raise and fail as `{"ok": false, "error": …}`. Re-runs are safe (a
+URL re-link is `ALREADY_LINKED`, a relation `ALREADY_RELATED`, any other one between the pair
+`RELATION_CONFLICT`; session links de-duplicate), except that a `path` attach adds a second copy.
+Writes to the session ticket, its descendants and tickets made from it (any turn) just run. Out of
+that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `linear_attach` and
+`linear_relation` answer `APPROVAL_REQUIRED`; an identical re-call asks a human in Linear.
 
 ## Questions and approvals
 
@@ -59,13 +61,11 @@ just run. An out-of-scope `linear_comment`, `linear_issue_update`, `linear_issue
   same turn (its pre-approval ends with it, no second prompt); on `: denied` don't run it.
 - Out-of-scope write `BLOCKED: …`: timed out → pending in Linear, end the turn; denied: no retry.
   On ``Answer to approval for `<tool>` call <digest>: approved`` re-run the identical call now.
-- Answers count only when given in the ticket thread. An answer from Slack, the CLI or
-  any other channel does not approve or unblock anything; ask again in the ticket.
+- Answers count only in the ticket thread; one from Slack, the CLI etc. approves or unblocks nothing.
 
 ## Setup (first session on a repo, or no `.hermes-linear.yaml` yet)
 
-1. `linear_issue_get` the session ticket. Note its identifier, team and project. The
-   team key is the identifier's prefix (`RET-81` → `RET`).
+1. `linear_issue_get` the session ticket: its identifier, team (key: `RET-81` → `RET`), project.
 2. Framework: select via `clarify`; the only choice is `superpowers`.
 3. Repo: a GitHub link among the project's links (`externalLinks`, step 1) is a candidate;
    the link labelled `repo` wins among several. Offer the result as a select (one repo is
@@ -118,8 +118,8 @@ questions (a turn that only moves a task along ends with a one-line reply). Then
   review verdict, number of fix rounds, deferred minors as a `- [ ]` checklist);
 - anything that needs the user: `blocked` with `question` (it posts the question; don't repeat
   it through `clarify`), then end the turn or go on only with tasks that don't depend on the
-  answer; when it arrives in the thread: `unblocked`. `LABEL_MISSING` (question posted): ask
-  once for a team `Blocked` label.
+  answer; when it arrives in the thread: `unblocked`. A task waiting on another task: `blocked`
+  with `blocked_by` (`question` optional). `LABEL_MISSING`: ask once for a team `Blocked` label.
 
 **Finish.** Open the PR from the branch (load `superpowers:finishing-a-development-branch`
 for the mechanics; never merge). Then `linear_session_link` the PR URL and `linear_attach` it
@@ -132,9 +132,9 @@ then end with the final reply (PR link and a short summary).
 When brainstorming decomposes the work into sub-projects, the current ticket becomes the
 umbrella: it holds the decomposition and build order. Create one top-level ticket per
 sub-project with `linear_issue_create` (no `parent`; same project; link the umbrella in its
-description). Each sub-project runs its own cycle in its own session. The tools cannot set a
-delegate: when a sub-project's turn comes, ask the user in the umbrella ticket to delegate its
-ticket to the app (never via other Linear tools or MCP servers; they act as the user).
+description). Each runs its own cycle in its own session. The tools can set another agent as
+delegate, never this app (`SELF_DELEGATION`): at a sub-project's turn, ask the user in the
+umbrella to delegate it to the app (never via other Linear tools or MCP servers; they act as the user).
 
 ## Rules
 

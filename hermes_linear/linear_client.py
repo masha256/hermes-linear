@@ -10,6 +10,7 @@ import asyncio
 import base64
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 import aiohttp
@@ -166,6 +167,16 @@ MUTATION_COMMENT_UPDATE = """mutation CommentUpdate($id: String!, $input: Commen
   commentUpdate(id: $id, input: $input) { success comment { id } }
 }"""
 
+# A comment's issue, thread parent and resolution (RET-121 §1.5). Linear refuses a reply's
+# id as ``parentId`` (live probe RET-142), so a thread is one level deep.
+QUERY_COMMENT_GET = """query CommentGet($id: String!) {
+  comment(id: $id) { id resolvedAt issue { id } parent { id } }
+}"""
+
+MUTATION_COMMENT_RESOLVE = """mutation CommentResolve($id: String!, $resolvingCommentId: String) {
+  commentResolve(id: $id, resolvingCommentId: $resolvingCommentId) { success comment { id } }
+}"""
+
 # Server-side filter on the app user; ``user.id`` is re-checked client-side. Paged.
 QUERY_ISSUE_APP_COMMENTS = """query IssueAppComments($id: String!, $userId: ID!, $after: String) {
   issue(id: $id) {
@@ -196,6 +207,55 @@ QUERY_TEAM_LABELS = """query TeamLabels($teamId: ID!, $after: String) {
     nodes { id name isGroup }
     pageInfo { hasNextPage endCursor }
   }
+}"""
+
+# Name directory lists (RET-121 spec §2.1). Paged like QUERY_TEAMS.
+QUERY_USERS = """query Users($after: String) {
+  users(first: 250, after: $after) {
+    nodes { id name displayName email app active }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+
+QUERY_TEAM_CYCLES = """query TeamCycles($teamId: String!, $after: String) {
+  team(id: $teamId) {
+    activeCycle { id }
+    cycles(first: 250, after: $after) {
+      nodes { id number name startsAt endsAt }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
+
+QUERY_PROJECTS = """query Projects($after: String) {
+  projects(first: 250, after: $after) {
+    nodes { id name state }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+
+QUERY_PROJECT_MILESTONES = """query ProjectMilestones($projectId: String!, $after: String) {
+  project(id: $projectId) {
+    projectMilestones(first: 250, after: $after) {
+      nodes { id name }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
+
+# Both directions of an issue's relations (RET-121 spec §2.1), first 250 each.
+QUERY_ISSUE_RELATIONS = """query IssueRelations($id: String!) {
+  issue(id: $id) {
+    relations(first: 250) { nodes { id type issue { id } relatedIssue { id } } }
+    inverseRelations(first: 250) { nodes { id type issue { id } relatedIssue { id } } }
+  }
+}"""
+
+# Live probe (RET-141, 2026-11-24): Linear keeps one relation per issue pair. An identical
+# create answers the existing relation (same id); another type or direction replaces it.
+# ``duplicate``: ``issueId`` is the duplicate (it moves to the Duplicate state).
+MUTATION_RELATION_CREATE = """mutation IssueRelationCreate($input: IssueRelationCreateInput!) {
+  issueRelationCreate(input: $input) { success issueRelation { id } }
 }"""
 
 MUTATION_FILE_UPLOAD = """mutation FileUpload($size: Int!, $filename: String!, $contentType: String!) {
@@ -295,7 +355,6 @@ class LinearClient:
         self._token: str | None = None
         self._renew_at = 0.0
         self._viewer_id: str | None = None
-        self._team_states: dict[str, list[dict]] = {}
         #: Wall-clock expiry of the cached token (status display only; renewal uses ``clock``).
         self.token_expires_at: float | None = None
 
@@ -629,10 +688,36 @@ class LinearClient:
         data = await self.gql(MUTATION_ISSUE_UPDATE, {"id": issue_id, "input": input})
         return self._require_success(data, "issueUpdate").get("issue") or {"id": issue_id}
 
-    async def comment_create(self, issue_id: str, body: str) -> str:
-        data = await self.gql(MUTATION_COMMENT_CREATE,
-                              {"input": {"issueId": issue_id, "body": body}})
+    async def comment_create(self, issue_id: str, body: str,
+                             parent_id: str | None = None) -> str:
+        """``commentCreate``; with ``parent_id`` (a top-level comment) a thread reply."""
+        inp = {"issueId": issue_id, "body": body}
+        if parent_id is not None:
+            inp["parentId"] = parent_id
+        data = await self.gql(MUTATION_COMMENT_CREATE, {"input": inp})
         return self._require_success(data, "commentCreate")["comment"]["id"]
+
+    async def comment_get(self, comment_id: str) -> dict | None:
+        """``{id, issue_id, parent_id, resolved_at}``; ``None`` for an unknown comment."""
+        try:
+            data = await self.gql(QUERY_COMMENT_GET, {"id": comment_id})
+        except LinearError as exc:
+            if exc.code == "NOT_FOUND":
+                return None
+            raise
+        c = data.get("comment")
+        if not isinstance(c, dict) or not c.get("id"):
+            return None
+        return {"id": c["id"], "issue_id": (c.get("issue") or {}).get("id"),
+                "parent_id": (c.get("parent") or {}).get("id"),
+                "resolved_at": c.get("resolvedAt")}
+
+    async def comment_resolve(self, comment_id: str, resolving_comment_id: str) -> None:
+        """``commentResolve`` of thread ``comment_id`` by the reply ``resolving_comment_id``.
+        Linear accepts it on a resolved thread too (re-stamps ``resolvedAt``; probe)."""
+        data = await self.gql(MUTATION_COMMENT_RESOLVE, {
+            "id": comment_id, "resolvingCommentId": resolving_comment_id})
+        self._require_success(data, "commentResolve")
 
     async def comment_update(self, comment_id: str, body: str) -> None:
         data = await self.gql(MUTATION_COMMENT_UPDATE, {"id": comment_id, "input": {"body": body}})
@@ -649,15 +734,13 @@ class LinearClient:
         return [{"id": c["id"], "body": c.get("body") or ""} for c in mine]
 
     async def team_states(self, team_id: str) -> list[dict]:
-        """``[{id, name, type}]`` in workflow position order; cached per client."""
-        if team_id not in self._team_states:
-            data = await self.gql(QUERY_TEAM_STATES, {"teamId": team_id})
-            nodes = self._nodes((data.get("team") or {}).get("states"))
-            nodes.sort(key=lambda s: s.get("position") or 0)
-            self._team_states[team_id] = [
-                {"id": s["id"], "name": s.get("name") or "", "type": s.get("type") or ""}
+        """``[{id, name, type}]`` in workflow position order. Not cached here: the name
+        directory caches it (RET-121)."""
+        data = await self.gql(QUERY_TEAM_STATES, {"teamId": team_id})
+        nodes = self._nodes((data.get("team") or {}).get("states"))
+        nodes.sort(key=lambda s: s.get("position") or 0)
+        return [{"id": s["id"], "name": s.get("name") or "", "type": s.get("type") or ""}
                 for s in nodes]
-        return [dict(s) for s in self._team_states[team_id]]
 
     async def teams(self) -> list[dict]:
         """``[{id, key, name}]``: the workspace's teams visible to the app."""
@@ -672,7 +755,74 @@ class LinearClient:
         return [{"id": lb["id"], "name": lb.get("name") or ""}
                 for lb in nodes if not lb.get("isGroup")]
 
+    async def users(self) -> list[dict]:
+        """``[{id, name, displayName, email, app, active}]``: the workspace's users."""
+        nodes = await self._paged(QUERY_USERS, {}, lambda d: d.get("users"))
+        return [{"id": u["id"], "name": u.get("name") or "",
+                 "displayName": u.get("displayName") or "", "email": u.get("email") or "",
+                 "app": bool(u.get("app")), "active": bool(u.get("active"))} for u in nodes]
+
+    async def cycles(self, team_id: str) -> list[dict]:
+        """``[{id, number, name, startsAt, endsAt}]`` of the team, by number. The team's
+        ``activeCycle`` carries ``current: True``; the first cycle starting after it (after
+        now when the team has none) carries ``next: True``."""
+        active: list[str | None] = []
+
+        def conn_of(d: dict) -> Any:
+            team = d.get("team") or {}
+            if not active:
+                active.append((team.get("activeCycle") or {}).get("id"))
+            return team.get("cycles")
+
+        nodes = await self._paged(QUERY_TEAM_CYCLES, {"teamId": team_id}, conn_of)
+        rows = sorted(({"id": c["id"], "number": c.get("number"), "name": c.get("name") or "",
+                        "startsAt": c.get("startsAt") or "", "endsAt": c.get("endsAt") or ""}
+                       for c in nodes),
+                      key=lambda c: (c["number"] is None, c["number"] or 0))
+        current = next((c for c in rows if active and c["id"] == active[0]), None)
+        if current is not None:
+            current["current"] = True
+            after = current["startsAt"]
+        else:  # Linear's ISO form: 2026-11-24T08:00:00.000Z, comparable as text
+            after = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        upcoming = [c for c in rows if c["startsAt"] > after]
+        if upcoming:
+            min(upcoming, key=lambda c: c["startsAt"])["next"] = True
+        return rows
+
+    async def projects(self) -> list[dict]:
+        """``[{id, name, state}]``: the workspace's projects."""
+        nodes = await self._paged(QUERY_PROJECTS, {}, lambda d: d.get("projects"))
+        return [{"id": p["id"], "name": p.get("name") or "", "state": p.get("state") or ""}
+                for p in nodes]
+
+    async def milestones(self, project_id: str) -> list[dict]:
+        """``[{id, name}]``: the project's milestones."""
+        nodes = await self._paged(QUERY_PROJECT_MILESTONES, {"projectId": project_id},
+                                  lambda d: (d.get("project") or {}).get("projectMilestones"))
+        return [{"id": m["id"], "name": m.get("name") or ""} for m in nodes]
+
     # -- uploads and attachments (RET-120) ---------------------------------
+
+    async def issue_relations(self, issue_id: str) -> list[dict]:
+        """``[{id, type, issue_id, related_id}]``: the issue's outbound ``relations`` then
+        its inbound ``inverseRelations`` (first 250 each)."""
+        data = await self.gql(QUERY_ISSUE_RELATIONS, {"id": issue_id})
+        issue = data.get("issue") or {}
+        return [{"id": r.get("id"), "type": r.get("type"),
+                 "issue_id": (r.get("issue") or {}).get("id"),
+                 "related_id": (r.get("relatedIssue") or {}).get("id")}
+                for key in ("relations", "inverseRelations")
+                for r in self._nodes(issue.get(key))]
+
+    async def relation_create(self, issue_id: str, related_id: str, type: str) -> str:  # noqa: A002
+        """``issueRelationCreate`` (``issue_id`` <type> ``related_id``); the relation id."""
+        data = await self.gql(MUTATION_RELATION_CREATE, {"input": {
+            "issueId": issue_id, "relatedIssueId": related_id, "type": type}})
+        rel = self._require_success(data, "issueRelationCreate").get("issueRelation")
+        if not isinstance(rel, dict) or not rel.get("id"):
+            raise LinearError("issueRelationCreate returned no relation")
+        return rel["id"]
 
     async def file_upload(self, name: str, content_type: str, data: bytes) -> str:
         """Upload ``data`` and return its ``assetUrl``: ``fileUpload``, then a PUT of the

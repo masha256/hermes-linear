@@ -24,7 +24,8 @@ CMD = "<linear_comment> (plugin approval rule)"
 
 def test_constants_verbatim():
     assert GATED_TOOLS == frozenset(
-        {"linear_comment", "linear_issue_update", "linear_issue_create", "linear_attach"}
+        {"linear_comment", "linear_issue_update", "linear_issue_create", "linear_attach",
+         "linear_relation"}
     )
     assert REQUIRED_TEXT == (
         "Not run: {targets} is outside this session's write scope. Call {tool} "
@@ -131,6 +132,22 @@ def test_message_flattens_newlines_in_identifier_and_title():
     assert parse_rule(CMD, msg) == ("linear_comment", d)
 
 
+def test_message_renders_kind_targets():
+    d = "0123456789abcdef"
+    msg = approval_message(
+        "linear_issue_create",
+        [{"id": "u1", "identifier": "OTH-9", "title": "Fix it"},
+         {"id": "p1", "kind": "project", "identifier": "orion\r\nX", "title": ""},
+         {"id": "t1", "kind": "team", "identifier": "OPS", "title": ""}],
+        {"title": "x"}, d)
+    lines = msg.split("\n")
+    assert lines[1:4] == ['- OTH-9 "Fix it"', '- project "orion  X"', '- team "OPS"']
+    assert lines[4] == "Arguments:" and lines[-1] == f"digest: {d}"
+    assert "\r" not in msg
+    assert parse_rule("<linear_issue_create> (plugin approval rule)", msg) == (
+        "linear_issue_create", d)
+
+
 def test_message_tolerates_non_json_values():
     args = {"when": object()}
     msg = approval_message("linear_comment", [], args, "0123456789abcdef")
@@ -189,11 +206,146 @@ def test_digest_normalization_idempotent_and_keeps_none_and_other_fields():
         digest("linear_issue_create", {"title": "t", "labels": [None]})
 
 
-def test_array_fields_match_tool_schemas():
-    from hermes_linear.agent_tools import TOOL_SCHEMAS
-    from hermes_linear.tool_approval import ARRAY_FIELDS
+def _field_type(prop: dict) -> str:
+    """One property's FIELD_TYPES entry: its JSON type, ``|null`` when null is allowed."""
+    declared = prop.get("type")
+    types = declared if isinstance(declared, list) else [declared]
+    base = [t for t in types if t != "null"]
+    assert len(base) == 1 and base[0] in {"array", "integer", "number", "boolean", "string"}, prop
+    assert not ({"anyOf", "oneOf", "allOf", "$ref", "nullable"} & set(prop)), prop
+    return base[0] + ("|null" if "null" in types else "")
 
-    assert set(ARRAY_FIELDS) == set(GATED_TOOLS)
-    for tool in GATED_TOOLS:
-        props = TOOL_SCHEMAS[tool]["parameters"]["properties"]
-        assert ARRAY_FIELDS[tool] == {k for k, v in props.items() if v.get("type") == "array"}
+
+def _field_types(schema: dict) -> dict[str, str]:
+    return {k: _field_type(v) for k, v in schema["parameters"]["properties"].items()}
+
+
+def test_field_types_match_schemas():
+    from hermes_linear.agent_tools import TOOL_SCHEMAS
+    from hermes_linear.tool_approval import FIELD_TYPES
+
+    assert {tool: _field_types(TOOL_SCHEMAS[tool]) for tool in GATED_TOOLS} == FIELD_TYPES
+
+
+def test_array_fields_constant_is_gone():
+    import hermes_linear.tool_approval as tool_approval
+
+    assert not hasattr(tool_approval, "ARRAY_FIELDS")
+
+
+_PARITY_TOOL = "linear_parity_probe"
+_PARITY_SCHEMA = {
+    "name": _PARITY_TOOL,
+    "parameters": {"type": "object", "properties": {
+        "count": {"type": "integer"},
+        "estimate": {"type": ["integer", "null"]},
+        "ratio": {"type": "number"},
+        "flag": {"type": "boolean"},
+        "maybe_flag": {"type": ["boolean", "null"]},
+        "name": {"type": "string"},
+        "note": {"type": ["string", "null"]},
+        "tags": {"type": "array", "items": {"type": "string"}},
+        "maybe_tags": {"type": ["array", "null"], "items": {"type": "string"}},
+    }},
+}
+
+_PARITY_RAW = [
+    {"count": "2"}, {"count": " 2 "}, {"count": "2.0"}, {"count": "2.5"}, {"count": "1e3"},
+    {"count": "abc"}, {"count": "nan"}, {"count": "inf"}, {"count": "null"}, {"count": 3},
+    {"estimate": "2"}, {"estimate": "null"}, {"estimate": " NULL "}, {"estimate": "2.5"},
+    {"estimate": None},
+    {"ratio": "2.5"}, {"ratio": "2"}, {"ratio": "-0.5"}, {"ratio": "x"}, {"ratio": "null"},
+    {"flag": "true"}, {"flag": "TRUE"}, {"flag": " False "}, {"flag": "yes"}, {"flag": "null"},
+    {"flag": True}, {"maybe_flag": "null"}, {"maybe_flag": "false"},
+    {"name": "null"}, {"name": "2"}, {"name": "true"}, {"name": '["a"]'},
+    {"note": "null"}, {"note": "Null"}, {"note": "text"},
+    {"tags": '["a", "b"]'}, {"tags": "a"}, {"tags": "[not json"}, {"tags": "null"},
+    {"tags": 7}, {"tags": ["a"]}, {"tags": None},
+    {"maybe_tags": "null"}, {"maybe_tags": '["a"]'}, {"maybe_tags": "a"},
+    {"maybe_tags": "[not json"}, {"maybe_tags": '"a"'}, {"maybe_tags": 7},
+    {"maybe_tags": ["a"]}, {"maybe_tags": None},
+    {"count": "2", "flag": "true", "note": "null", "tags": '["x"]', "unknown": "2"},
+]
+
+
+@pytest.fixture
+def parity_schema(monkeypatch):
+    """Hermes's registry answers the parity schema; FIELD_TYPES carries its derived map."""
+    import copy
+
+    from tools.registry import registry
+
+    from hermes_linear import tool_approval
+
+    real_get_schema = registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(_PARITY_SCHEMA)
+                        if name == _PARITY_TOOL else real_get_schema(name))
+    monkeypatch.setitem(tool_approval.FIELD_TYPES, _PARITY_TOOL, _field_types(_PARITY_SCHEMA))
+
+
+@pytest.mark.parametrize("raw", _PARITY_RAW, ids=lambda raw: json.dumps(raw))
+def test_normalize_scalar_mirrors_hermes(parity_schema, raw):
+    """normalize(raw) == normalize(coerce_tool_args(raw)) == coerce_tool_args(raw)."""
+    import copy
+
+    from tools.arg_coercion import coerce_tool_args
+
+    from hermes_linear.tool_approval import normalize_args
+
+    coerced = coerce_tool_args(_PARITY_TOOL, copy.deepcopy(raw))
+    assert normalize_args(_PARITY_TOOL, raw) == coerced
+    assert normalize_args(_PARITY_TOOL, coerced) == coerced
+    assert digest(_PARITY_TOOL, raw) == digest(_PARITY_TOOL, coerced)
+
+
+def test_normalize_scalar_spot_values(parity_schema):
+    from hermes_linear.tool_approval import normalize_args
+
+    def norm(**kw):
+        return normalize_args(_PARITY_TOOL, kw)
+
+    assert norm(count="2") == {"count": 2} and type(norm(count="2")["count"]) is int
+    assert norm(count="2.5") == {"count": "2.5"}
+    assert norm(ratio="2") == {"ratio": 2} and type(norm(ratio="2")["ratio"]) is int
+    assert norm(ratio="2.5") == {"ratio": 2.5}
+    assert norm(flag="TRUE") == {"flag": True}
+    assert norm(note="null") == {"note": None}
+    assert norm(name="null") == {"name": "null"}
+    assert norm(estimate="null") == {"estimate": None}
+    assert norm(count="null") == {"count": "null"}
+    assert norm(tags='["a"]') == {"tags": ["a"]}
+    assert norm(maybe_tags="null") == {"maybe_tags": None}
+    assert norm(maybe_tags="a") == {"maybe_tags": "a"}
+    assert norm(tags="null") == {"tags": ["null"]}
+
+
+@pytest.mark.parametrize("tool", sorted(GATED_TOOLS))
+def test_normalize_mirrors_hermes_on_real_schemas(monkeypatch, tool):
+    """Every gated tool's real schema: the hook's digest equals the handler's."""
+    import copy
+
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry
+
+    from hermes_linear.agent_tools import TOOL_SCHEMAS
+    from hermes_linear.tool_approval import normalize_args
+
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(TOOL_SCHEMAS[name]))
+    samples = {"array": '["a"]', "boolean": "TRUE", "integer": "2", "number": "2.5",
+               "string": "null"}
+    raw = {k: samples[v.split("|")[0]]
+           for k, v in _field_types(TOOL_SCHEMAS[tool]).items()}
+    coerced = coerce_tool_args(tool, copy.deepcopy(raw))
+    assert normalize_args(tool, raw) == coerced
+    assert digest(tool, raw) == digest(tool, coerced)
+
+
+def test_normalize_idempotent(parity_schema):
+    from hermes_linear.tool_approval import normalize_args
+
+    for raw in _PARITY_RAW:
+        once = normalize_args(_PARITY_TOOL, raw)
+        assert normalize_args(_PARITY_TOOL, once) == once, raw
+    assert normalize_args("linear_attach", {"id": "X-1", "embed": "true"}) == \
+        {"id": "X-1", "embed": True}
+    assert normalize_args("linear_not_gated", {"n": "2"}) == {"n": "2"}

@@ -198,6 +198,22 @@ async def test_set_blocked_adds_and_removes_only_on_change(env, caplog):
     assert client.issue_updates[1:] == [("I", {"removedLabelIds": [BLOCKED]})]
 
 
+async def test_set_blocked_label_lookup_is_cached(env, monkeypatch):
+    """The Blocked label comes from the name directory (RET-121): one fetch per TTL."""
+    a, client, gw, store, order = env
+    fetches = []
+    real = client.team_labels
+
+    async def counted(team_id):
+        fetches.append(team_id)
+        return await real(team_id)
+
+    monkeypatch.setattr(client, "team_labels", counted)
+    assert await questions.set_blocked(client, "I", True)
+    assert await questions.set_blocked(client, "I", False)
+    assert len(fetches) == 1
+
+
 async def test_set_blocked_failure_and_missing_label_return_false(env, caplog, monkeypatch):
     a, client, gw, store, order = env
 

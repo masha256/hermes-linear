@@ -32,7 +32,7 @@ from typing import Any, Callable, Coroutine
 from gateway.session_context import get_session_env
 
 from . import adapter as adapter_mod
-from . import graphql_guard, sync, tool_approval
+from . import directory, graphql_guard, issue_fields, sync, tool_approval
 from .constants import PLAN_SYNC_TIMEOUT_S, TOOL_TIMEOUT_S
 from .linear_client import LinearError
 
@@ -77,6 +77,13 @@ class Gate:
             return
         self.targets.append({"id": issue["id"], "identifier": issue.get("identifier"),
                              "title": issue.get("title")})
+
+    def record_target(self, id: str, kind: str, name: str) -> None:  # noqa: A002
+        """A team or project target (``kind`` ``team`` / ``project``; RET-121 spec §2.4),
+        shown on the card as ``- <kind> "<name>"``."""
+        if any(t["id"] == id for t in self.targets):
+            return
+        self.targets.append({"id": id, "kind": kind, "identifier": name, "title": ""})
 
     def check(self) -> None:
         if self.targets:
@@ -252,8 +259,9 @@ def run_on_adapter(ctx: ToolContext, coro_factory: Callable[[], Coroutine[Any, A
     except (TimeoutError, concurrent.futures.TimeoutError):
         fut.cancel()
         return _err("TIMEOUT")
-    except LinearError as exc:
-        return _err(exc.code or "LINEAR_ERROR")
+    except LinearError as exc:  # spec §2.5: the code plus Linear's message
+        return {"ok": False, "error": exc.code or "LINEAR_ERROR",
+                "message": exc.detail or str(exc)}
     except concurrent.futures.CancelledError:
         return _err("NOT_CONNECTED")  # task cancelled on the loop: the adapter disconnected
     except Exception as exc:  # noqa: BLE001
@@ -353,11 +361,16 @@ ANY_MARKER_RE = re.compile(r"[ \t]*<!--\s*hermes-linear:.*?-->", re.DOTALL)
 
 
 class _Refusal(Exception):
-    """Raised inside a tool coroutine to answer ``{"ok": False, "error": code}``."""
+    """Raised inside a tool coroutine to answer ``{"ok": False, "error": code, **extra}``
+    (``extra``: e.g. a miss's ``candidates``, RET-121 spec §2.2)."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, extra: dict | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.extra: dict = dict(extra or {})
+
+    def result(self) -> dict:
+        return {**_err(self.code), **self.extra}
 
 
 def resolve_state(states: list[dict], name_or_type: str) -> str | None:
@@ -454,7 +467,7 @@ def _tool(parse: Callable[[dict], dict],
             try:
                 parsed = parse(args)
             except _Refusal as r:
-                return _err(r.code)
+                return r.result()
             ctx = resolve_context(kw.get("session_id"))
             if ctx.client is None:
                 return _err("NOT_CONNECTED")
@@ -464,7 +477,7 @@ def _tool(parse: Callable[[dict], dict],
                     try:
                         return await body(c, parsed)
                     except _Refusal as r:
-                        return _err(r.code)
+                        return r.result()
                     except _NeedsApproval as n:
                         return {"ok": False, "error": _NEEDS_APPROVAL, "targets": n.targets}
                 return run_on_adapter(c, run, timeout_s=timeout_s)
@@ -556,38 +569,80 @@ def _check_gate(ctx: ToolContext) -> None:
         ctx.gate.check()
 
 
+def _target_ok(ctx: ToolContext, id: str) -> bool:  # noqa: A002
+    """True on a pass whose approved targets hold ``id`` (a team or project UUID)."""
+    return ctx.gate is not None and id in ctx.gate.approved
+
+
+def _scope_target(ctx: ToolContext, row: dict, kind: str) -> None:
+    """``row`` (a resolved team or project) is outside the session's scope: approved on
+    this pass, recorded on a first pass (the body's ``_check_gate`` then asks), else
+    ``OUT_OF_SCOPE`` (RET-121 spec §2.4)."""
+    if _target_ok(ctx, row["id"]):
+        return
+    if ctx.gate is None or ctx.gate.approved:
+        raise _Refusal("OUT_OF_SCOPE")
+    ctx.gate.record_target(row["id"], kind, row.get("key" if kind == "team" else "name")
+                           or row["id"])
+
+
+def _state_row(states: list[dict], ref: str) -> dict | None:
+    """``resolve_state``'s pick as a row: a directory ``match``."""
+    sid = resolve_state(states, ref)
+    return next((s for s in states if s.get("id") == sid), None) if sid else None
+
+
+def _label_row(labels: list[dict], name: str) -> dict | None:
+    """The first label named ``name`` (case-insensitive): a directory ``match``."""
+    want = name.casefold()
+    return next((lb for lb in labels
+                 if (lb.get("name") or "").casefold() == want and lb.get("id")), None)
+
+
+def _labels_all_named(labels: list[dict], names: list[str]) -> dict | None:
+    """A directory ``match`` for several names at once: ``{"rows": labels}`` when every
+    name is a label, else ``None`` (a miss)."""
+    return {"rows": labels} if all(_label_row(labels, n) for n in names) else None
+
+
 async def _state_id(ctx: ToolContext, team_id: str, name: str) -> str:
-    sid = resolve_state(await ctx.client.team_states(team_id), name)
-    if sid is None:
-        raise _Refusal("BAD_ARGS")
-    return sid
+    """The team's state named (or typed) ``name``; a miss is ``STATE_NOT_FOUND`` with the
+    team's states as ``candidates`` (after the directory's refetch-once)."""
+    row = await directory.for_client(ctx.client).resolve("states", team_id, name, _state_row)
+    return row["id"]
 
 
-async def _label_ids(ctx: ToolContext, team_id: str, add: list[str],
-                     remove: list[str] = ()) -> tuple[list[str], list[str]]:
-    """Label ids for names to ``add`` and ``remove`` (case-insensitive).
+async def _cancel_state(ctx: ToolContext, team_id: str) -> str:
+    """The team's ``canceled`` state for plan sync. Not an agent-supplied name, so a team
+    without one stays ``BAD_ARGS`` (spec §2.5, as ``_target_state``)."""
+    try:
+        return await _state_id(ctx, team_id, "canceled")
+    except _Refusal:
+        raise _Refusal("BAD_ARGS") from None
 
-    An unknown name to add is ``LABEL_MISSING`` (probe P3: the app cannot create labels);
-    an unknown name to remove is skipped, since no issue can carry it (Ruling S13).
+
+async def _label_ids(ctx: ToolContext, team_id: str, add: list[str]) -> list[str]:
+    """Label ids for names to ``add`` (case-insensitive). An unknown name is
+    ``LABEL_MISSING`` with ``available`` (probe P3: the app cannot create labels), after one
+    refetch of the cached labels.
     """
-    if not add and not remove:
-        return [], []
-    by_name: dict[str, str] = {}
-    for lb in await ctx.client.team_labels(team_id):
-        by_name.setdefault((lb.get("name") or "").casefold(), lb["id"])
-    out: list[list[str]] = []
-    for names, strict in ((add, True), (remove, False)):
-        ids: list[str] = []
-        for n in names:
-            lid = by_name.get(n.casefold())
-            if lid is None:
-                if strict:
-                    raise _Refusal("LABEL_MISSING")
-                continue
-            if lid not in ids:
-                ids.append(lid)
-        out.append(ids)
-    return out[0], out[1]
+    if not add:
+        return []
+    names = directory.for_client(ctx.client)
+    # one resolve: a miss refetches once (unless just fetched), then LABEL_MISSING
+    labels = (await names.resolve("labels", team_id, add, _labels_all_named))["rows"]
+    return _ids_named(labels, add)
+
+
+def _ids_named(labels: list[dict], names: list[str]) -> list[str]:
+    """The ids of the ``labels`` rows ``names`` name (case-insensitive, deduplicated, in
+    ``names`` order); a name no row has is skipped."""
+    ids: list[str] = []
+    for n in names:
+        row = _label_row(labels, n)
+        if row is not None and row["id"] not in ids:
+            ids.append(row["id"])
+    return ids
 
 
 def _team_of(issue: dict) -> str:
@@ -597,32 +652,50 @@ def _team_of(issue: dict) -> str:
     return team
 
 
+def _project_of(issue: dict | None) -> str | None:
+    return ((issue or {}).get("project") or {}).get("id")
+
+
 # -- linear_issue_create
 
 
 def _parse_create(args: dict) -> dict:
     return {"title": _req_str(args, "title"), "description": _opt_str(args, "description"),
             "parent": _opt_str(args, "parent"), "labels": _opt_names(args, "labels"),
-            "state": _opt_str(args, "state")}
+            "state": _opt_str(args, "state"),
+            "fields": issue_fields.parse(args, update=False)}
 
 
 async def _create(ctx: ToolContext, a: dict) -> dict:
+    """Base team and project (RET-121 spec §1.2): the parent's with ``parent``, else the
+    session ticket's. An explicit team / project other than the base is a target."""
     if not ctx.is_linear or not ctx.session_issue_id:
         raise _Refusal("NOT_LINEAR_SESSION")
-    home = await ctx.client.issue_get(ctx.session_issue_id)
-    team = _team_of(home)
+    parent = None
+    if a["parent"] and a["parent"].strip():
+        parent = await _writable(ctx, a["parent"].strip())
+    base = parent if parent is not None else await ctx.client.issue_get(ctx.session_issue_id)
+    base_team, base_project = _team_of(base), _project_of(base)
+    r = await issue_fields.resolve(ctx, a["fields"], team_id=base_team,
+                                   project_id=base_project)
+    if r.team is not None and r.team["id"] != base_team:
+        _scope_target(ctx, r.team, "team")
+    if r.project is not None and r.project["id"] != base_project:
+        _scope_target(ctx, r.project, "project")
+    team = r.team_id
     inp: dict[str, Any] = {"teamId": team, "title": a["title"]}
-    if (home.get("project") or {}).get("id"):
-        inp["projectId"] = home["project"]["id"]
+    if r.project_id:
+        inp["projectId"] = r.project_id
     if a["description"] is not None:
         inp["description"] = a["description"]
-    if a["parent"] and a["parent"].strip():
-        inp["parentId"] = (await _writable(ctx, a["parent"].strip()))["id"]
+    if parent is not None:
+        inp["parentId"] = parent["id"]
     if a["state"] is not None:
         inp["stateId"] = await _state_id(ctx, team, a["state"])
-    labels, _ = await _label_ids(ctx, team, a["labels"])
+    labels = await _label_ids(ctx, team, a["labels"])
     if labels:
         inp["labelIds"] = labels
+    inp.update({k: v for k, v in r.input.items() if k not in ("teamId", "projectId")})
     _check_gate(ctx)
     issue = await ctx.client.issue_create(inp)
     _record_created(ctx, issue["id"])  # the UUID Linear returned, never the identifier
@@ -636,11 +709,13 @@ def _parse_update(args: dict) -> dict:
     a = {"id": _req_str(args, "id"), "title": _opt_str(args, "title"),
          "description": _opt_str(args, "description"), "state": _opt_str(args, "state"),
          "add_labels": _opt_names(args, "add_labels"),
-         "remove_labels": _opt_names(args, "remove_labels"), "parent": _parse_parent(args)}
+         "remove_labels": _opt_names(args, "remove_labels"), "parent": _parse_parent(args),
+         "fields": issue_fields.parse(args, update=True)}  # ``team``: BAD_ARGS
     if a["title"] is not None and not a["title"].strip():
         raise _Refusal("BAD_ARGS")
     if not (a["title"] is not None or a["description"] is not None or a["state"] is not None
-            or a["add_labels"] or a["remove_labels"] or a["parent"] is not None):
+            or a["add_labels"] or a["remove_labels"] or a["parent"] is not None
+            or a["fields"]):
         raise _Refusal("BAD_ARGS")
     return a
 
@@ -667,23 +742,48 @@ async def _update(ctx: ToolContext, a: dict) -> dict:
             inp[key] = a[key]
     if a["state"] is not None:
         inp["stateId"] = await _state_id(ctx, team, a["state"])
+    parent: dict | None = None
     if a["parent"] == "":
         inp["parentId"] = None  # detach: top-level
     elif a["parent"] is not None:
         parent = await _writable(ctx, a["parent"])  # both ends in scope (RET-110)
         await _refuse_cycle(ctx, issue["id"], parent)
         inp["parentId"] = parent["id"]
-    added, removed = await _label_ids(ctx, team, a["add_labels"], a["remove_labels"])
-    carried = _carried(issue)
-    removed = [lid for lid in removed if lid in carried]  # removing an absent label: no-op
+    r = await issue_fields.resolve(ctx, a["fields"], team_id=team,
+                                   project_id=_project_of(issue))
+    if r.project is not None and not await _project_in_scope(ctx, issue, a["parent"], parent,
+                                                             r.project["id"]):
+        _scope_target(ctx, r.project, "project")
+    inp.update(r.input)
+    added = await _label_ids(ctx, team, a["add_labels"])
+    # Removals match the issue's own labels, never the cache: a label created and applied
+    # after the directory was filled is still removed; a name it doesn't carry is a no-op
+    # (Ruling S13).
+    removed = _ids_named(issue.get("labels") or [], a["remove_labels"])
     if added:
         inp["addedLabelIds"] = added
     if removed:
         inp["removedLabelIds"] = removed
     if not inp:  # only no-op removals: never send an empty issueUpdate (Task 2 minor N1)
         return {"ok": True, "issue": _summary(issue)}
-    _check_gate(ctx)  # after both ends' scope checks and the cycle check
+    _check_gate(ctx)  # after both ends' scope checks, the cycle check and the project check
     return {"ok": True, "issue": await ctx.client.issue_update(issue["id"], inp)}
+
+
+async def _project_in_scope(ctx: ToolContext, issue: dict, parent_arg: str | None,
+                            new_parent: dict | None, project_id: str) -> bool:
+    """True if moving ``issue`` to ``project_id`` needs no approval (RET-121 spec §1.3):
+    its current project (no change), the session ticket's, or its parent's project, the
+    parent being ``new_parent`` when the call sets one (none when it detaches), else the
+    issue's current parent. Reads only as far as needed."""
+    if project_id == _project_of(issue):
+        return True
+    if project_id == _project_of(await ctx.client.issue_get(ctx.session_issue_id or "")):
+        return True
+    if parent_arg is not None:  # the parent changes in this call
+        return new_parent is not None and project_id == _project_of(new_parent)
+    current = (issue.get("parent") or {}).get("id")
+    return bool(current) and project_id == _project_of(await ctx.client.issue_get(current))
 
 
 async def _refuse_cycle(ctx: ToolContext, issue_id: str, parent: dict) -> None:
@@ -718,9 +818,16 @@ def _summary(issue: dict) -> dict:
 
 
 def _parse_comment(args: dict) -> dict:
+    reply_to = None if args.get("reply_to") is None else _req_str(args, "reply_to").strip()
+    resolve = False if args.get("resolve") is None else args["resolve"]
     a = {"id": _req_str(args, "id"), "body": _req_str(args, "body"),
-         "edit_marker": _opt_str(args, "edit_marker")}
+         "edit_marker": _opt_str(args, "edit_marker"), "reply_to": reply_to,
+         "resolve": resolve}
     if a["edit_marker"] is not None and not MARKER_RE.match(a["edit_marker"]):
+        raise _Refusal("BAD_ARGS")
+    # RET-121 §1.5: resolve needs reply_to; a marker edit is never a reply.
+    if not isinstance(resolve, bool) or (resolve and reply_to is None) \
+            or (reply_to is not None and a["edit_marker"] is not None):
         raise _Refusal("BAD_ARGS")
     return a
 
@@ -730,15 +837,46 @@ def _with_marker(body: str, marker: str) -> str:
     return f"{ANY_MARKER_RE.sub('', body).rstrip()}\n\n{_marker_tag(marker)}"
 
 
+async def _thread_of(ctx: ToolContext, issue: dict, reply_to: str) -> dict:
+    """The top-level comment of ``reply_to``'s thread (``comment_get`` shape), which must
+    be on ``issue``; else ``COMMENT_NOT_ON_ISSUE``. Linear refuses a reply's id as
+    ``parentId`` (live probe RET-142), so threads are one level deep."""
+    c = await ctx.client.comment_get(reply_to)
+    if c is None or c["issue_id"] != issue["id"]:
+        raise _Refusal("COMMENT_NOT_ON_ISSUE")
+    if not c["parent_id"]:
+        return c
+    top = await ctx.client.comment_get(c["parent_id"])
+    if top is None or top["issue_id"] != issue["id"]:
+        raise _Refusal("COMMENT_NOT_ON_ISSUE")
+    return top
+
+
 async def _comment(ctx: ToolContext, a: dict) -> dict:
     issue = await _writable(ctx, a["id"])
-    _check_gate(ctx)
+    thread = await _thread_of(ctx, issue, a["reply_to"]) if a["reply_to"] else None
+    _check_gate(ctx)  # after the scope and comment checks
     body, marker = a["body"], a["edit_marker"]
 
     def done(comment_id: str, edited: bool) -> dict:
         return {"ok": True, "comment_id": comment_id, "edited": edited,
                 "issue": issue.get("identifier"), "url": issue.get("url")}
 
+    if thread is not None:
+        out = done(await ctx.client.comment_create(issue["id"], body, parent_id=thread["id"]),
+                   False)
+        out.update(thread_id=thread["id"], resolved=bool(thread["resolved_at"]))
+        if a["resolve"] and thread["resolved_at"]:
+            out["already_resolved"] = True  # Linear would re-stamp it: no resolve call
+        elif a["resolve"]:
+            try:
+                await ctx.client.comment_resolve(thread["id"], out["comment_id"])
+            except LinearError as exc:  # R12: the reply is posted; say so, don't lose it
+                return {"ok": False, "error": exc.code or "LINEAR_ERROR",
+                        "message": exc.detail or str(exc), "comment_id": out["comment_id"],
+                        "thread_id": thread["id"], "posted": True}
+            out["resolved"] = True
+        return out
     if marker is None:
         return done(await ctx.client.comment_create(issue["id"], body), False)
     tag = _marker_tag(marker)
@@ -930,7 +1068,7 @@ async def _sync_plan(ctx: ToolContext, a: dict) -> dict:
         if not _app_made(c, me):
             unmanaged.append(c["identifier"])  # a human's T<n> ticket: reported, never touched
             continue
-        cancel_state = cancel_state or await _state_id(ctx, team, "canceled")
+        cancel_state = cancel_state or await _cancel_state(ctx, team)
         # Reason first: a crash in between repeats the comment rather than losing it.
         await client.comment_create(
             c["id"], f"Removed from the plan in {info.commit or sync.UNCOMMITTED}.")
@@ -993,8 +1131,13 @@ def _parse_task_state(args: dict) -> dict:
     if not isinstance(state, str) or state.strip() not in TASK_STATES:
         raise _Refusal("BAD_ARGS")
     a = {"id": _req_str(args, "id"), "state": state.strip(),
-         "summary": _opt_str(args, "summary"), "question": _opt_str(args, "question")}
-    if a["state"] == "blocked":
+         "summary": _opt_str(args, "summary"), "question": _opt_str(args, "question"),
+         "blocked_by": None}
+    if args.get("blocked_by") is not None:  # RET-121 §1.6: only with blocked
+        if a["state"] != "blocked":
+            raise _Refusal("BAD_ARGS")
+        a["blocked_by"] = _req_str(args, "blocked_by").strip()
+    if a["state"] == "blocked" and (a["blocked_by"] is None or a["question"] is not None):
         a["question"] = _req_str(args, "question").strip()  # before any write (or read)
     return a
 
@@ -1026,10 +1169,15 @@ def _target_state(states: list[dict], current: dict, state: str) -> dict:
 
 
 async def _blocked_label(ctx: ToolContext, team: str) -> str | None:
-    """The id of the team's (or workspace's) ``Blocked`` label, case-insensitive."""
-    want = BLOCKED_LABEL.casefold()
-    return next((lb["id"] for lb in await ctx.client.team_labels(team)
-                 if (lb.get("name") or "").casefold() == want and lb.get("id")), None)
+    """The id of the team's (or workspace's) ``Blocked`` label, case-insensitive; None when
+    missing after the directory's refetch-once (the caller answers ``LABEL_MISSING`` in its
+    own shape, Ruling S18)."""
+    try:
+        row = await directory.for_client(ctx.client).resolve("labels", team, BLOCKED_LABEL,
+                                                             _label_row)
+    except _Refusal:
+        return None
+    return row["id"]
 
 
 def _track_open_task(ctx: ToolContext, task_id: str, open_: bool) -> None:
@@ -1049,7 +1197,8 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
                            "state": current.get("name"), "label_missing": False}
 
     if state in {"in_progress", "in_review", "done"}:
-        target = _target_state(await client.team_states(team), current, state)
+        target = _target_state(await directory.for_client(client).rows("states", team),
+                               current, state)
         summary = (a["summary"] or "").strip() if state == "done" else ""
         if state == "done":
             out["summary_posted"] = False
@@ -1076,18 +1225,33 @@ async def _task_state(ctx: ToolContext, a: dict) -> dict:
         return out  # nothing to remove: zero writes
 
     # blocked: the question goes to the project ticket (the session issue), scope-checked
-    # like every write target, before anything is written.
+    # like every write target, before anything is written. So is the blocker (RET-121
+    # §1.6), without a gate: this tool stays tree-only, an out-of-tree blocker is
+    # OUT_OF_SCOPE (``linear_relation`` asks for it).
     project = await _writable(ctx, ctx.session_issue_id or "")
+    blocker = await _writable(ctx, a["blocked_by"]) if a["blocked_by"] else None
+    if blocker is not None and blocker["id"] == task["id"]:
+        raise _Refusal("BAD_ARGS")
+    rid = None
+    if blocker is not None:  # RELATION_CONFLICT refuses before any write (Ruling R9)
+        # ``tools_relation`` is bottom-imported (R3): bound by the time any tool runs
+        rid = await tools_relation.check_relation(ctx, blocker, task, "blocks")
     if label is not None and not carried:
         await client.issue_update(task["id"], {"addedLabelIds": [label]})
-    await client.comment_create(
-        project["id"], f"**{task.get('identifier')} needs input:** {a['question']}")
-    _track_open_task(ctx, task["id"], False)  # posted: blocked, even with LABEL_MISSING
-    if label is None:  # Ruling S18: the question is posted, the label could not be
+    rel: dict[str, Any] = {}
+    if blocker is not None:  # an existing relation is kept: a re-run writes nothing
+        created = rid is None
+        if created:
+            rid = await tools_relation.create_relation(ctx, blocker, task, "blocks")
+        rel = {"relation_id": rid, "relation_created": created}
+    if a["question"]:
+        await client.comment_create(
+            project["id"], f"**{task.get('identifier')} needs input:** {a['question']}")
+    _track_open_task(ctx, task["id"], False)  # blocked, even with LABEL_MISSING
+    if label is None:  # Ruling S18: the rest is done, the label could not be
         return {"ok": False, "error": "LABEL_MISSING", "issue": task.get("identifier"),
-                "label_missing": True, "question_posted": True}
-    out["question_posted"] = True
-    return out
+                "label_missing": True, "question_posted": bool(a["question"]), **rel}
+    return {**out, "question_posted": bool(a["question"]), **rel}
 
 
 # -- linear_query (RET-119 spec §3)
@@ -1149,13 +1313,42 @@ linear_query = _tool(_parse_query, _query)
 _ISSUE_REF = "Issue identifier (e.g. RET-12) or UUID."
 _GATED_NOTE = ("Outside the session issue's tree (issues you did not create) the first call "
                "returns APPROVAL_REQUIRED; call again with identical arguments to ask a human.")
+_PRIORITY = ("none, urgent, high, medium or low, or Linear's number 0-4 "
+             "(0 none, 1 urgent, 2 high, 3 medium, 4 low).")
+
+
+def _field_props(nullable: bool) -> dict[str, dict]:
+    """The shared issue fields (RET-121 spec §1.1); on update ``null`` (or "") clears."""
+    s: Any = ["string", "null"] if nullable else "string"
+    i: Any = ["integer", "null"] if nullable else "integer"
+    return {
+        "assignee": {"type": s, "description": (
+            "A human user: UUID, name, display name or email. An app user (me included) "
+            "is refused with ASSIGNEE_IS_APP: Linear would turn it into a delegation.")},
+        "delegate": {"type": s, "description": (
+            "Another agent (app) user: UUID, name, display name or email. This app (me) "
+            "is refused with SELF_DELEGATION: only a human can delegate to this app, so "
+            "ask in the thread.")},
+        "priority": {"type": s, "description": _PRIORITY},
+        "estimate": {"type": i, "description": ("Estimate points, an integer >= 0. Linear "
+                                                "stores it even when the team doesn't use "
+                                                "estimates.")},
+        "due_date": {"type": s, "description": "YYYY-MM-DD."},
+        "cycle": {"type": s, "description": ("Cycle UUID, number, name, current or next, in "
+                                             "the issue's team.")},
+        "milestone": {"type": s, "description": ("Project milestone UUID or name, in the "
+                                                 "issue's resulting project.")},
+    }
+
 
 TOOL_SCHEMAS: dict[str, dict] = {
     "linear_issue_get": {},  # first slot; tools_read registers its schema here (Ruling R3)
     "linear_issue_create": {
         "name": "linear_issue_create",
-        "description": ("Create a Linear issue as the Linear app, in the session issue's team "
-                        "and project. Set parent to make it a sub-issue. " + _GATED_NOTE),
+        "description": ("Create a Linear issue as the Linear app, in the parent's team and "
+                        "project (with parent: a sub-issue), else the session issue's. A "
+                        "team or project other than that needs a human's approval. "
+                        "Delegating to this app is refused (SELF_DELEGATION). " + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "title": {"type": "string"},
             "description": {"type": "string", "description": "Markdown."},
@@ -1164,12 +1357,22 @@ TOOL_SCHEMAS: dict[str, dict] = {
                        "description": "Existing label names."},
             "state": {"type": "string",
                       "description": "Workflow state name, or a type such as started."},
+            "team": {"type": "string", "description": "Team UUID, key (e.g. RET) or name."},
+            "project": {"type": "string",
+                        "description": ("Project UUID or name; omitted or null: the parent's "
+                                        "(else the session issue's); with another team: "
+                                        "no project.")},
+            **_field_props(nullable=False),
         }, "required": ["title"]},
     },
     "linear_issue_update": {
         "name": "linear_issue_update",
         "description": ("Update a Linear issue as the Linear app: title, description, state, "
-                        "labels, parent. " + _GATED_NOTE),
+                        "labels, parent, project, assignee, delegate, priority, estimate, "
+                        "due date, cycle, milestone (null clears a field). A project other "
+                        "than the issue's own, the session issue's or the parent's needs a "
+                        "human's approval. "
+                        + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "title": {"type": "string"},
@@ -1185,18 +1388,37 @@ TOOL_SCHEMAS: dict[str, dict] = {
                                        "string detaches the issue (top-level). Refused "
                                        "(PARENT_CYCLE) if it is the issue or a descendant. A "
                                        "detached issue you did not create leaves your scope.")},
+            "project": {"type": ["string", "null"],
+                        "description": ("Project UUID or name; null removes the project. "
+                                        "The issue's current project, the session issue's "
+                                        "and the parent's need no approval; another one "
+                                        "does. Moving to another project clears the "
+                                        "milestone unless milestone is given too.")},
+            **_field_props(nullable=True),
         }, "required": ["id"]},
     },
     "linear_comment": {
         "name": "linear_comment",
         "description": ("Comment on a Linear issue as the Linear app. With edit_marker, edit "
                         "the app's earlier comment carrying that marker instead of adding a "
-                        "new one. " + _GATED_NOTE),
+                        "new one. With reply_to, reply in that comment's thread; resolve: true "
+                        "also resolves the thread (needs reply_to; not with edit_marker). "
+                        "With reply_to, the result's thread_id is the thread and resolved "
+                        "its current state; with resolve: true on a thread resolved "
+                        "before, also already_resolved: true. If resolving fails after the "
+                        "reply was posted, the error carries posted: true with comment_id "
+                        "and thread_id: the reply exists, so don't re-run the call. "
+                        + _GATED_NOTE),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "body": {"type": "string", "description": "Markdown."},
             "edit_marker": {"type": "string",
                             "description": "Stable key, e.g. status (letters, digits, _.:-)."},
+            "reply_to": {"type": "string",
+                         "description": ("Comment UUID on this issue (linear_issue_get "
+                                         "comments); a reply's id means its thread.")},
+            "resolve": {"type": "boolean",
+                        "description": "With reply_to: resolve the thread after replying."},
         }, "required": ["id", "body"]},
     },
     "linear_sync_spec": {
@@ -1234,8 +1456,10 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "stay in or move to a started state); done: move to a completed "
                         "state, posting summary (if given) on the task ticket; blocked: add "
                         "the Blocked label and post question on the session (project) "
-                        "ticket as '**<ID> needs input:** <question>' (LABEL_MISSING if the "
-                        "team has no Blocked label, the question is still posted); "
+                        "ticket as '**<ID> needs input:** <question>'; with blocked_by, also "
+                        "record '<blocked_by> blocks <id>' (question then optional; both in "
+                        "the session tree, else OUT_OF_SCOPE) (LABEL_MISSING if the team "
+                        "has no Blocked label, the rest is still done); "
                         "unblocked: remove the Blocked label. Already-applied changes are "
                         "not rewritten."),
         "parameters": {"type": "object", "properties": {
@@ -1244,7 +1468,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
             "summary": {"type": "string",
                         "description": "Markdown; with done, posted on the task ticket."},
             "question": {"type": "string",
-                         "description": "Required with blocked: what you need answered."},
+                         "description": ("With blocked: what you need answered (required "
+                                         "without blocked_by).")},
+            "blocked_by": {"type": "string",
+                           "description": ("Only with blocked: the issue blocking this one "
+                                           "(identifier or UUID, in the session tree).")},
         }, "required": ["id", "state"]},
     },
     "linear_query": {
@@ -1259,6 +1487,13 @@ TOOL_SCHEMAS: dict[str, dict] = {
                           "description": "Values for the query's variables."},
         }, "required": ["query"]},
     },
+    # Placeholders: the tool modules fill these slots (Ruling R3), so the roster order is
+    # fixed whichever module is imported first.
+    "linear_search": {},
+    "linear_attach": {},
+    "linear_session_link": {},
+    "linear_relation": {},
+    "linear_lookup": {},
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
@@ -1270,12 +1505,19 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_sync_plan": linear_sync_plan,
     "linear_task_state": linear_task_state,
     "linear_query": linear_query,
+    "linear_search": None,  # type: ignore[dict-item]  # registered by tools_read (R3)
+    "linear_attach": None,  # type: ignore[dict-item]  # registered by tools_attach (R3)
+    "linear_session_link": None,  # type: ignore[dict-item]  # registered by tools_attach
+    "linear_relation": None,  # type: ignore[dict-item]  # registered by tools_relation
+    "linear_lookup": None,  # type: ignore[dict-item]  # registered by tools_lookup
 }
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
            "linear_attach", "linear_comment", "linear_issue_create", "linear_issue_get",
-           "linear_issue_update", "linear_query", "linear_search", "linear_session_link",
+           "linear_issue_update", "linear_lookup", "linear_query", "linear_relation",
+           "linear_search",
+           "linear_session_link",
            "linear_sync_plan", "linear_sync_spec", "linear_task_state", "resolve_context",
            "resolve_state", "run_on_adapter"]
 
@@ -1285,3 +1527,5 @@ __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
 # here: a tool module imported first is still partially initialized at this point.
 from . import tools_read  # noqa: E402,F401
 from . import tools_attach  # noqa: E402,F401
+from . import tools_relation  # noqa: E402,F401
+from . import tools_lookup  # noqa: E402,F401

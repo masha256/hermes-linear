@@ -196,11 +196,23 @@ def test_linear_error_maps_to_code(bg_loop):
     async def boom():
         raise LinearError("slow down", code="RATELIMITED")
 
+    async def refused():
+        raise LinearError("bad input", code="INVALID_INPUT",
+                          detail="cycle belongs to another team")
+
+    async def bare():
+        raise LinearError("boom")
+
     async def other():
         raise KeyError("x")
 
-    out = agent_tools.run_on_adapter(ctx_for(a), boom)
-    assert out["ok"] is False and out["error"] == "RATELIMITED"
+    # spec §2.5: the Linear code (else LINEAR_ERROR) plus message (detail, else the text)
+    assert agent_tools.run_on_adapter(ctx_for(a), boom) == {
+        "ok": False, "error": "RATELIMITED", "message": "slow down"}
+    assert agent_tools.run_on_adapter(ctx_for(a), refused) == {
+        "ok": False, "error": "INVALID_INPUT", "message": "cycle belongs to another team"}
+    assert agent_tools.run_on_adapter(ctx_for(a), bare) == {
+        "ok": False, "error": "LINEAR_ERROR", "message": "boom"}
     assert agent_tools.run_on_adapter(ctx_for(a), other) == {"ok": False,
                                                              "error": "INTERNAL_ERROR"}
 
