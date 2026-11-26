@@ -2,9 +2,10 @@ name: linear
 label: Linear
 kind: platform
 version: 0.2.1
-# Floor: v0.23.2 is the first release whose media-delivery policy refuses .env files
-# anywhere (linear_attach relies on it). CI's pinned job runs this exact version.
-requires_hermes: ">=0.23.2"
+# Floor: v0.23.3. v0.23.2 is the first release whose media-delivery policy refuses .env files
+# anywhere (linear_attach relies on it); v0.23.3 is the first whose public plugin API lists
+# parse_retry_after_seconds and hermes_user_agent. CI's pinned job runs this exact version.
+requires_hermes: ">=0.23.3"
 description: >
   Linear channel for Hermes Agent. Receives Linear agent-session and
   workspace webhooks on a shared listener and runs one Hermes session per

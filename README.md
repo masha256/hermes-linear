@@ -146,7 +146,7 @@ There is no ticket tree outside a session, so every issue counts as out of scope
 
 ## Requirements
 
-- Hermes Agent v0.23.2 or newer, with the gateway running (`hermes gateway run` or the systemd service).
+- Hermes Agent v0.23.3 or newer, with the gateway running (`hermes gateway run` or the systemd service).
 - A Linear workspace where you can create an OAuth application (workspace admin).
 - A way for Linear to reach your machine over HTTPS: Tailscale Funnel, Cloudflare Tunnel, ngrok, or a reverse proxy on a public host. See [Expose the webhook](#expose-the-webhook).
 
