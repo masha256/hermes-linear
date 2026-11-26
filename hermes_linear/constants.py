@@ -1,5 +1,7 @@
 """Internal constants (not user settings)."""
 
+PLUGIN_VERSION = "0.2.1"  # equals plugin.yaml / pyproject.toml version (test_packaging pins it)
+
 REPLAY_WINDOW_S = 60
 MAX_BODY_BYTES = 1_048_576
 DEDUP_TTL_S = 86_400

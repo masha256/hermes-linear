@@ -1,26 +1,18 @@
-[build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
+# Metadata and test config only. There is deliberately no [build-system] and no
+# entry point: Hermes installs this plugin as a directory (plugin.yaml + the
+# repo-root __init__.py shim). A [build-system] table makes Hermes's package
+# manager treat the file as an install declaration and build the plugin into
+# every environment it prepares, even with no dependencies.
 
 [project]
 name = "hermes-linear"
-version = "0.2.0"
+version = "0.2.1"
 description = "Linear channel (platform) plugin for Hermes Agent"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
 # Runtime deps (aiohttp) are supplied by Hermes itself; nothing to install.
 dependencies = []
-
-[project.entry-points."hermes_agent.plugins"]
-linear = "hermes_linear.plugin"
-
-[tool.setuptools]
-# Only the code package ships; the repo-root __init__.py is the directory-plugin shim.
-packages = ["hermes_linear"]
-
-[tool.setuptools.package-data]
-hermes_linear = ["skills/*/SKILL.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

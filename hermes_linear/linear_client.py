@@ -15,7 +15,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
-from .constants import TOKEN_RENEW_MARGIN_S, UPLOAD_PUT_TIMEOUT_S, WRITE_RETRIES
+from .constants import PLUGIN_VERSION, TOKEN_RENEW_MARGIN_S, UPLOAD_PUT_TIMEOUT_S, WRITE_RETRIES
 
 log = logging.getLogger(__name__)
 
@@ -398,14 +398,23 @@ def _first_error(body: Any) -> tuple[str | None, str, str | None]:
 
 
 def _retry_after(headers: Any) -> float:
-    raw = headers.get("Retry-After") if headers is not None else None
-    if raw is None:
-        return _DEFAULT_RETRY_AFTER_S
-    try:
-        val = float(raw)
-    except (TypeError, ValueError):
+    """Seconds to wait before retrying: Hermes's own ``Retry-After`` parser (seconds or an
+    HTTP date), clamped to ``[0, _MAX_RETRY_AFTER_S]``; ``_DEFAULT_RETRY_AFTER_S`` when absent
+    or unreadable."""
+    from agent.retry_utils import parse_retry_after_seconds
+
+    val = parse_retry_after_seconds(headers) if headers is not None else None
+    if val is None:
         return _DEFAULT_RETRY_AFTER_S
     return min(max(val, 0.0), _MAX_RETRY_AFTER_S)
+
+
+def _user_agent() -> str:
+    """``hermes-linear/<plugin version> Hermes-Agent/<Hermes version>``. Built per client, not at
+    import: on a source checkout Hermes resolves its version from git."""
+    from hermes_cli.version_info import hermes_user_agent
+
+    return f"hermes-linear/{PLUGIN_VERSION} {hermes_user_agent('Hermes-Agent')}"
 
 
 class LinearClient:
@@ -435,6 +444,12 @@ class LinearClient:
 
     # -- plumbing -------------------------------------------------------
 
+    def _ua(self) -> str:
+        ua = getattr(self, "_user_agent_value", None)
+        if ua is None:
+            ua = self._user_agent_value = _user_agent()
+        return ua
+
     def _http(self) -> aiohttp.ClientSession:
         if self._session is None or (self._own_session and self._session.closed):
             self._session = aiohttp.ClientSession(
@@ -454,7 +469,7 @@ class LinearClient:
             async with self._http().post(
                 f"{self._base}/oauth/token",
                 data={"grant_type": "client_credentials", "scope": SCOPES},
-                headers={"Authorization": f"Basic {basic}"},
+                headers={"Authorization": f"Basic {basic}", "User-Agent": self._ua()},
             ) as resp:
                 status = resp.status
                 try:
@@ -495,7 +510,7 @@ class LinearClient:
             async with self._http().post(
                 f"{self._base}/graphql",
                 json=payload,
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {token}", "User-Agent": self._ua()},
             ) as resp:
                 try:
                     body = await resp.json(content_type=None)
