@@ -42,13 +42,24 @@ UUID_A = "00000000-0000-4000-8000-000000000001"
 
 EXPECTED_HINT = (
     "You are working inside Linear. Your final reply is posted as a comment in the thread that "
-    "asked. Linear issue/user URLs in markdown render as mentions. If the ticket says 'manage "
-    "with hermes-linear', or the repo has `.hermes-linear.yaml`, load "
-    "`linear:manage-superpowers` first."
+    "asked. Linear issue/user URLs in markdown render as mentions. Load "
+    "`linear:manage-superpowers` first when the ticket description starts with \"Build with "
+    "hermes\" (any case, optionally followed by \".\" or \":\") or has that phrase alone on a "
+    "line, or when the repo has `.hermes-linear.yaml`. The older \"Manage with hermes-linear\" "
+    "counts the same way. A ticket that only mentions Hermes inside a sentence (\"can we build "
+    "with Hermes instead?\") is not the trigger."
 )
-MARKER_SENTENCE = ("If the ticket says 'manage with hermes-linear', or the repo has "
-                   "`.hermes-linear.yaml`, load `linear:manage-superpowers` first.")
-SKILL_DESCRIPTION = "Use when a repo has .hermes-linear.yaml or ticket says so."
+#: RET-171: the trigger is matched by the model reading the hint, not by code, so the hint
+#: pins it narrowly (start of description or a line of its own) and keeps the old phrase.
+TRIGGER_SENTENCES = (
+    "Load `linear:manage-superpowers` first when the ticket description starts with \"Build with "
+    "hermes\" (any case, optionally followed by \".\" or \":\") or has that phrase alone on a "
+    "line, or when the repo has `.hermes-linear.yaml`.",
+    "The older \"Manage with hermes-linear\" counts the same way.",
+    "A ticket that only mentions Hermes inside a sentence (\"can we build with Hermes "
+    "instead?\") is not the trigger.",
+)
+SKILL_DESCRIPTION = 'Use when ticket says "build with hermes". Superpowers flow.'
 SKILL_MD = REPO_ROOT / "hermes_linear" / "skills" / "manage-superpowers" / "SKILL.md"
 TOOL_NAMES = ["linear_issue_get", "linear_issue_create", "linear_issue_update", "linear_comment",
               "linear_sync_spec", "linear_sync_plan", "linear_task_state", "linear_query",
@@ -365,9 +376,23 @@ def test_skill_registered(ctx):
     assert skill["description"] == SKILL_DESCRIPTION
 
 
-def test_platform_hint_mentions_marker():
-    assert MARKER_SENTENCE in plugin.PLATFORM_HINT
+def test_platform_hint_defines_the_trigger_narrowly():
+    for sentence in TRIGGER_SENTENCES:
+        assert sentence in plugin.PLATFORM_HINT, sentence
     assert plugin.PLATFORM_HINT.startswith("You are working inside Linear.")
+    assert "if the ticket says" not in plugin.PLATFORM_HINT.lower()
+
+
+def test_skill_description_survives_the_real_index_clip():
+    """The index clips descriptions (60 chars in current Hermes). Detect the real helper by
+    behaviour: older pinned Hermes builds don't have it."""
+    import importlib
+
+    try:
+        clip = importlib.import_module("agent.skill_utils").clip_skill_description
+    except (ImportError, AttributeError):
+        pytest.skip("this Hermes has no clip_skill_description")
+    assert clip(SKILL_DESCRIPTION) == SKILL_DESCRIPTION
 
 
 def _frontmatter(text: str) -> dict:
@@ -392,12 +417,28 @@ def test_skill_frontmatter_valid():
 def test_skill_body_is_a_short_overlay_naming_every_tool():
     text = SKILL_MD.read_text()
     assert len(text.splitlines()) <= 150
-    assert "manage with hermes-linear" in text
+    assert '"build with hermes"' in text
+    assert "manage with hermes-linear" not in text.lower()
     for name in TOOL_NAMES:
         assert f"`{name}`" in text, name
     assert "tool_describe" in text and "tool_call" in text
     for stage in ("brainstorming", "writing-plans", "subagent-driven-development"):
         assert f"superpowers:{stage}" in text, stage
+
+
+def test_skill_and_readme_credit_superpowers():
+    """RET-171: the skill opens by saying it runs obra/superpowers and needs it installed;
+    the README names superpowers as the method and drops the old trigger phrase."""
+    link = "[obra/superpowers](https://github.com/obra/superpowers)"
+    opening = SKILL_MD.read_text().split("## Calling the tools")[0]
+    assert link in opening and "installed" in opening
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "manage with hermes-linear" not in readme.lower()
+    assert "build with hermes" in readme.lower()
+    intro = readme.split("## Contents")[0]
+    assert "https://github.com/obra/superpowers" in intro
+    without = readme.split("## Without superpowers")[1].split("\n## ")[0]
+    assert "*build with hermes*" in without and "built on" in without
 
 
 def test_skill_has_a_fallback_when_superpowers_is_missing():

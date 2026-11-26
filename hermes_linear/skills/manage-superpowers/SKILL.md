@@ -1,19 +1,19 @@
 ---
 name: manage-superpowers
-description: Use when a repo has .hermes-linear.yaml or ticket says so.
+description: 'Use when ticket says "build with hermes". Superpowers flow.'
 ---
 
-# Manage with hermes-linear (superpowers through Linear)
+# Build with hermes (superpowers through Linear)
 
-Load this when a delegated Linear ticket says "manage with hermes-linear", or when the repo you
-work in has `.hermes-linear.yaml` at its root. It runs the superpowers workflow (brainstorm →
-spec → plan → subagent-driven development) inside the ticket. It is an overlay: at each stage,
-load `superpowers:<stage>` and follow it, then apply the differences below. Never restate or edit
-superpowers itself. Git is the source of truth; Linear holds rendered copies of the files.
+This skill runs [obra/superpowers](https://github.com/obra/superpowers) (brainstorm → spec → plan →
+subagent-driven development) inside a Linear ticket and needs superpowers installed. Load it when a
+delegated ticket starts with "build with hermes" or the repo has `.hermes-linear.yaml`. It is an
+overlay: at each stage, load `superpowers:<stage>`, follow it, then apply the differences below.
+Never restate or edit superpowers itself. Git is the source of truth; Linear holds rendered copies.
 
 **Without superpowers** (`superpowers:<stage>` not found): say once in the thread that it isn't
-installed (install it for the full flow): no spec → plan → SDD, no task sub-tickets. Skip Setup and
-Per-stage differences; work the ticket directly with the tools, per Questions and approvals.
+installed, so there is no spec → plan → SDD and no task sub-tickets. Skip Setup and Per-stage
+differences; work the ticket directly with the tools, per Questions and approvals.
 
 ## Calling the tools
 

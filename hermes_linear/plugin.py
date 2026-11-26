@@ -33,17 +33,21 @@ log = logging.getLogger(__name__)
 
 PLATFORM_HINT = (
     "You are working inside Linear. Your final reply is posted as a comment in the thread that "
-    "asked. Linear issue/user URLs in markdown render as mentions. If the ticket says 'manage "
-    "with hermes-linear', or the repo has `.hermes-linear.yaml`, load "
-    "`linear:manage-superpowers` first."
+    "asked. Linear issue/user URLs in markdown render as mentions. Load "
+    "`linear:manage-superpowers` first when the ticket description starts with \"Build with "
+    "hermes\" (any case, optionally followed by \".\" or \":\") or has that phrase alone on a "
+    "line, or when the repo has `.hermes-linear.yaml`. The older \"Manage with hermes-linear\" "
+    "counts the same way. A ticket that only mentions Hermes inside a sentence (\"can we build "
+    "with Hermes instead?\") is not the trigger."
 )
 EMOJI = "📐"
 #: Plugin toolset for the agent tools. Not ``linear``: that name hides the Linear MCP server's
 #: tools (integration notes Q1); not ``hermes-*``: those are platform bundles.
 TOOLSET = "hermes_linear"
 SKILL_NAME = "manage-superpowers"
-#: The skill index clips at 60 chars (notes Q4); the trigger phrase lives in PLATFORM_HINT.
-SKILL_DESCRIPTION = "Use when a repo has .hermes-linear.yaml or ticket says so."
+#: The skill index clips at 60 chars (notes Q4); the exact trigger rule (start of the
+#: description or a line of its own, the old phrase as an alias) lives in PLATFORM_HINT.
+SKILL_DESCRIPTION = 'Use when ticket says "build with hermes". Superpowers flow.'
 SKILL_PATH = Path(__file__).parent / "skills" / SKILL_NAME / "SKILL.md"
 REQUIRED_ENV = [CLIENT_SECRET_KEY, WEBHOOK_SECRET_KEY]
 INSTALL_HINT = "run `hermes linear setup` to store the Linear client and webhook secrets"

@@ -709,7 +709,7 @@ def test_human_comment_with_marker_untouched(pin_ctx, ws, plan):
 
 
 def test_plan_without_spec_part_appends_under_brief(pin_ctx, ws, plan):
-    brief = "Manage with hermes-linear.\n\nThe brief: build the thing.\n\n"
+    brief = "Build with hermes.\n\nThe brief: build the thing.\n\n"
     ws.issue(SELF)["description"] = brief
     out = sync_plan(plan)
     (doc,) = plan_docs(ws)

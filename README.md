@@ -9,6 +9,7 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) channel plugin th
 - **Delegate a ticket to your agent → one Hermes session for the whole ticket.** The agent works in the thread Linear opens on delegation (and in any thread where you @mention it). Plain comments from your team and edits to the ticket and its project reach the same conversation as context, so the agent remembers everything about the ticket.
 - **@mention your agent on any other ticket → a quick, thread-scoped Q&A.** Follow-ups in that thread keep context; nothing is shared ticket-wide.
 - **Native Linear agent UI:** progress (thoughts and tool calls), approvals and questions as pick-lists, the Stop button, and a live plan checklist.
+- **Build with hermes: [superpowers](https://github.com/obra/superpowers) inside a ticket.** Start a delegated ticket's description with "Build with hermes." and the agent runs the superpowers method (brainstorm → spec → plan → subagent-driven development) in the ticket thread: design questions as pick-lists, the spec and plan as Linear documents, one `T<n> · <name>` sub-ticket per task. It needs the superpowers plugin; see [Without superpowers](#without-superpowers).
 
 It runs inside *your* Hermes and connects to *your* Linear workspace through a Linear OAuth app you create. Nothing is hosted by anyone else.
 
@@ -107,7 +108,7 @@ The [superpowers](https://github.com/obra/superpowers) plugin is optional. Witho
 
 **Works without it:** delegation and @mention sessions, the "Since your last turn" context digest, progress in the agent panel, questions and approvals as pick-lists, Stop, and every `linear_*` tool. The tools are deferred behind tool search (load with `tool_describe`, call with `tool_call`), and the agent can use them on any ticket it works.
 
-**Needs it:** the *manage with hermes-linear* flow, which runs brainstorm → spec → plan → subagent-driven development inside the ticket, with automatic `T<n> · <name>` task sub-tickets, their status updates, and large-project decomposition into sub-project tickets. When a ticket asks for that flow and superpowers isn't installed, the agent says so in the thread and works the ticket directly instead.
+**Needs it:** the *build with hermes* flow (a ticket whose description starts with "Build with hermes."). It is built on the superpowers method and runs brainstorm → spec → plan → subagent-driven development inside the ticket, with automatic `T<n> · <name>` task sub-tickets, their status updates, and large-project decomposition into sub-project tickets. When a ticket asks for that flow and superpowers isn't installed, the agent says so in the thread and works the ticket directly instead.
 
 `linear_sync_spec`, `linear_sync_plan` and `linear_task_state` don't need superpowers either. They read the markdown format: a `Linear: <ID>` header line and `### Task N: <name>` headings. A hand-written spec or plan in that shape syncs the same way.
 
