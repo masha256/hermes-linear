@@ -86,7 +86,7 @@ Linear ──HTTPS──▶ Tailscale Funnel ──▶ listener (one per process
 
 | Unit | Responsibility | Depends on |
 |---|---|---|
-| `listener` | Process-wide aiohttp server. First adapter to connect starts it; adapters register/unregister their profile. Routes `/linear/<profile>/webhook`, verifies, dedups, acks, enqueues. | adapter registry, each profile's webhook secret |
+| `listener` | Process-wide aiohttp server per host:port, held in a registry outside the per-profile plugin module copies (RET-181: a `sys.modules` anchor with a protocol version, so copies of different plugin versions refuse rather than mix). First adapter to connect starts it; adapters register/unregister their own endpoint; it stops when the last one leaves. Routes `/linear/<profile>/webhook`, verifies, dedups, acks, enqueues. | adapter registry, each profile's webhook secret |
 | `linear_client` | Per profile. Client-credentials token lifecycle (renew before expiry and on 401), GraphQL, 429 backoff, cached app user id, user-email cache. | `client_id`, `client_secret` |
 | `store` | Per profile, `plugin_db("linear")`. Tables in §5.1. | — |
 | `router` | Linear event → gateway `MessageEvent`, context item, or drop. Owns mode rules and reply targets. Pure given store state. | store, access |
@@ -255,8 +255,8 @@ All settings are declared in the manifest `config_schema` and live at `plugins.e
 | `allow_all_users` | bool | `false` | `LINEAR_ALLOW_ALL_USERS=true` also honoured |
 | `auto_start` | bool | `true` | §8.3 |
 | `session_url` | str | `""` | Template with `{session_id}` for the Linear "Open" link |
-| `listener_host` | str | `127.0.0.1` | Process-wide; read from the default profile only |
-| `listener_port` | int | `8650` | Process-wide; read from the default profile only |
+| `listener_host` | str | `127.0.0.1` | Per profile; profiles with the same host:port share one listener (RET-181; was "read from the default profile only", which the code never did) |
+| `listener_port` | int | `8650` | Per profile; same rule |
 
 Internal constants (not settings): 60 s replay window, 1 MB body cap, 24 h dedup TTL, 5 s delegation wait, 2 s fast-tool skip, 4,000-char digest cap, 200 pending items, 10 min heartbeat.
 

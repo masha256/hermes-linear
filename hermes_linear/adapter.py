@@ -31,9 +31,9 @@ from gateway.platforms.event import MessageEvent, ProcessingOutcome
 
 from . import questions, renderer
 from .access import AccessPolicy, gateway_allow_from
-from .constants import ACK_TIMEOUT_S
+from .constants import ACK_TIMEOUT_S, LISTENER_ERROR_KEY
 from .linear_client import LinearClient
-from .listener import ProfileEndpoint, get_listener
+from .listener import ListenerProtocolError, ProfileEndpoint, error_text, get_listener
 from .outbound import Outbound, media_text
 from .models import (AddContext, AwaitDelegation, Fatal, Ignore, Interrupt, Refuse,
                      Reply, ResolveControl, SetMode, StartTurn)
@@ -91,6 +91,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._client = client
         self._store = store
         self._listener = listener
+        self._listener_injected = listener is not None  # tests; else the shared registry
         self._get_config = get_config
         # OwnAccessPolicyMixin host contract (Q4).
         self._dm_policy = self._group_policy = "allowlist"
@@ -100,6 +101,7 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._router_ctx: RouterContext | None = None
         self._profile = "default"
         self._registered = False
+        self._endpoint: ProfileEndpoint | None = None
         self._events: asyncio.Queue | None = None
         self._worker: asyncio.Task | None = None
         self._tasks: set[asyncio.Task] = set()
@@ -250,27 +252,40 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._events = asyncio.Queue()
         self._worker = asyncio.create_task(self._run_worker())
 
-        if self._listener is None:
-            self._listener = get_listener(settings.listener_host, settings.listener_port)
-        listener = self._listener
         webhook_secret = settings.webhook_secret.encode()
-        listener.register(ProfileEndpoint(
+        self._endpoint = ProfileEndpoint(
             profile=self._profile,
             webhook_secret=lambda: webhook_secret,
             client_id=settings.client_id,
             deliver=self.deliver,
             seen=lambda wid: store.seen_webhook(wid, time.time()),
-        ))
+        )
+        if self._listener_injected:
+            listener = self._listener
+            listener.register(self._endpoint)
+        else:
+            try:  # one listener per host:port for every profile's plugin copy (RET-181)
+                listener = self._listener = get_listener(
+                    settings.listener_host, settings.listener_port, self._endpoint)
+            except ListenerProtocolError as exc:
+                log.error("linear: %s", exc)
+                self._record_listener_error(str(exc))
+                await self._stop_worker()
+                self._set_fatal_error("linear_listener", "Linear webhook listener protocol "
+                                      "mismatch with another profile's plugin", retryable=False)
+                return False
         self._registered = True
         await listener.wait_idle()
         if listener.start_error is not None:
-            log.error("linear: webhook listener %s:%s failed to start: %s", settings.listener_host,
-                      settings.listener_port, type(listener.start_error).__name__)
+            text = (f"Linear webhook listener {settings.listener_host}:{settings.listener_port} "
+                    f"failed to start: {error_text(listener.start_error)}")
+            log.error("linear: %s", text)
+            self._record_listener_error(text)
             self._unregister()
             await self._stop_worker()
-            self._set_fatal_error("linear_listener", "Linear webhook listener failed to start",
-                                  retryable=False)
+            self._set_fatal_error("linear_listener", text, retryable=False)
             return False
+        self._record_listener_error(None)
         ADAPTERS[self._profile] = self
         self._mark_connected()
         return True
@@ -299,10 +314,25 @@ class LinearAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - the sweep never fails connect
             log.warning("linear: restart sweep failed: %s", type(exc).__name__)
 
+    def _record_listener_error(self, text: str | None) -> None:
+        """Keep the listener failure where `linear status` / `linear test` (another process)
+        can show it; ``None`` clears it. Never fails connect."""
+        try:
+            if self._store is None:
+                return
+            if text is None:
+                self._store.clear_plugin_status(LISTENER_ERROR_KEY)
+            else:
+                self._store.set_plugin_status(LISTENER_ERROR_KEY, text, time.time())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("linear: could not record listener status: %s", type(exc).__name__)
+
     def _unregister(self) -> None:
         if self._registered and self._listener is not None:
-            self._listener.unregister(self._profile)
+            # Only our own endpoint: a reconnect's new adapter may already own the route.
+            self._listener.unregister(self._profile, self._endpoint)
         self._registered = False
+        self._endpoint = None
 
     async def _stop_worker(self) -> None:
         tasks = [t for t in (self._worker, *self._tasks) if t is not None and not t.done()]

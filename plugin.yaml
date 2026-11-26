@@ -88,8 +88,8 @@ config_schema:
   listener_host:
     type: str
     default: "127.0.0.1"
-    description: "Webhook listener bind host (process-wide; read from the default profile only)"
+    description: "Webhook listener bind host (profiles with the same host:port share one listener)"
   listener_port:
     type: int
     default: 8650
-    description: "Webhook listener port (process-wide; read from the default profile only)"
+    description: "Webhook listener port (profiles with the same host:port share one listener)"

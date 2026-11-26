@@ -753,6 +753,48 @@ async def test_test_command_signs_and_posts():
         await listener.stop()
 
 
+async def test_test_command_404_names_recorded_listener_failure():
+    """RET-181: the 404 hint says why the profile is missing when the gateway recorded a
+    listener failure (status and test run in another process than the gateway)."""
+    store = Store.open(":memory:")
+    reason = "Linear webhook listener 127.0.0.1:8650 failed to start: OSError errno 98 (x)"
+    store.set_plugin_status("listener_error", reason, time.time() - 90)
+
+    async def post(url, body, headers):
+        return 404
+
+    h = Harness(config={"client_id": CLIENT_ID},
+                secrets={"LINEAR_CLIENT_SECRET": CLIENT_SECRET,
+                         "LINEAR_WEBHOOK_SECRET": WEBHOOK_SECRET},
+                post=post, store=store)
+    assert await setup_cli.run_test(h.env) == 1
+    assert reason in h.text and "last connect" in h.text
+    assert "platform not enabled" not in h.text
+
+    clean = Harness(config={"client_id": CLIENT_ID},
+                    secrets={"LINEAR_CLIENT_SECRET": CLIENT_SECRET,
+                             "LINEAR_WEBHOOK_SECRET": WEBHOOK_SECRET},
+                    post=post, store=Store.open(":memory:"))
+    assert await setup_cli.run_test(clean.env) == 1
+    assert "platform not enabled" in clean.text
+
+
+def test_status_shows_recorded_listener_failure():
+    now = time.time()
+    h = _status_harness()
+    store = Store.open(":memory:")
+    store.set_plugin_status("listener_error", "Linear webhook listener 127.0.0.1:8650 failed "
+                            "to start: OSError errno 98 (Address already in use)", now - 60)
+    h.env.open_store = lambda: store
+    h.env.now = lambda: now
+    setup_cli.run_status(h.env)
+    line = [ln for ln in h.lines if "last connect failed" in ln]
+    assert len(line) == 1 and "errno 98" in line[0] and setup_cli._fmt_ts(now - 60, now) in line[0]
+    h2 = _status_harness()
+    setup_cli.run_status(h2.env)
+    assert not any("last connect failed" in ln for ln in h2.lines)
+
+
 def test_test_event_signature_matches_listener_scheme():
     body, headers = setup_cli.signed_test_event(WEBHOOK_SECRET, CLIENT_ID, now=1_800_000_000.0)
     expected = hmac.new(WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()

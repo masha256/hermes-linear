@@ -579,14 +579,41 @@ def reset_singleton():
     listener_mod._reset_listener_for_tests()
 
 
-async def test_get_listener_singleton(reset_singleton, caplog):
+async def test_get_listener_one_per_host_port(reset_singleton):
     a = get_listener("127.0.0.1", 8650)
-    assert get_listener("127.0.0.1", 8650) is a
-    with caplog.at_level(logging.WARNING, logger="hermes_linear.listener"):
-        b = get_listener("0.0.0.0", 9999)
-    assert b is a
-    assert any("already" in r.getMessage() for r in caplog.records)
+    b = get_listener("0.0.0.0", 9999)  # another profile's listener_port: its own listener
+    assert b is not a and (b.host, b.port) == ("0.0.0.0", 9999)
     assert (a.host, a.port) == ("127.0.0.1", 8650)
+
+
+async def test_get_listener_replaces_only_a_disposable_listener(reset_singleton, clock):
+    ep, _ = make_ep()
+    a = get_listener("127.0.0.1", 0, ep)  # lookup + register in one step
+    assert not a.disposable
+    assert get_listener("127.0.0.1", 0) is a  # in use: shared, never replaced
+    a.unregister("neo")
+    await a.wait_idle()
+    assert a.disposable and not a.running
+    assert get_listener("127.0.0.1", 0) is not a  # idle: a fresh one (new loop, tests)
+
+
+async def test_unregister_with_endpoint_removes_only_that_endpoint(clock):
+    lst = WebhookListener("127.0.0.1", 0, clock=clock, autostart=False)
+    old, _ = make_ep()
+    new, _ = make_ep()
+    lst.register(old)
+    lst.register(new)  # a reconnect's fresh adapter replaced the route
+    lst.unregister("neo", old)  # the old adapter's late disconnect
+    assert lst._endpoints["neo"] is new
+    lst.unregister("neo", new)
+    assert "neo" not in lst._endpoints
+    lst.unregister("neo")  # unknown profile: no-op
+
+
+def test_error_text_names_errno_never_the_message():
+    assert listener_mod.error_text(OSError(98, "Address already in use")) == \
+        "OSError errno 98 (Address already in use)"
+    assert listener_mod.error_text(ValueError("payload text")) == "ValueError"
 
 
 async def test_start_stop_on_register_unregister(clock):

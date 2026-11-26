@@ -165,6 +165,14 @@ CREATE TABLE IF NOT EXISTS created_documents (
     created_at     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS created_documents_owner ON created_documents(owner_issue_id);
+
+-- The adapter's last connect problem, for `hermes linear status` / `test`, which run in
+-- another process than the gateway (RET-181). Cleared on a good connect.
+CREATE TABLE IF NOT EXISTS plugin_status (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    at    REAL NOT NULL
+);
 """
 
 # Approval requests older than this are pruned on ``put_request`` and never taken.
@@ -966,6 +974,22 @@ class Store:
                 "SELECT MAX(at) FROM seen_webhooks WHERE substr(webhook_id, 1, ?) != ?",
                 (len(TEST_WEBHOOK_PREFIX), TEST_WEBHOOK_PREFIX)).fetchone()
         return None if r is None or r[0] is None else float(r[0])
+
+    # plugin status -------------------------------------------------------
+
+    def set_plugin_status(self, key: str, value: str, now: float) -> None:
+        self._write(lambda: self.conn.execute(
+            "INSERT OR REPLACE INTO plugin_status (key, value, at) VALUES (?, ?, ?)",
+            (key, value, now)))
+
+    def clear_plugin_status(self, key: str) -> None:
+        self._write(lambda: self.conn.execute("DELETE FROM plugin_status WHERE key = ?", (key,)))
+
+    def plugin_status(self, key: str) -> tuple[str, float] | None:
+        with self._lock:
+            r = self.conn.execute(
+                "SELECT value, at FROM plugin_status WHERE key = ?", (key,)).fetchone()
+        return None if r is None else (str(r[0]), float(r[1]))
 
     # users ---------------------------------------------------------------
 

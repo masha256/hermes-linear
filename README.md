@@ -151,7 +151,7 @@ The plugin requests the scopes `read, write, app:mentionable, app:assignable`.
 
 ## Expose the webhook
 
-The plugin runs one local listener (default `127.0.0.1:8650`) for all profiles, with a single route: `POST /linear/<profile>/webhook`. Linear must reach it over public HTTPS. Any tunnel or proxy works as long as it forwards to the listener **with the path unchanged**. Forwarding only `/linear/` is enough; nothing else is served.
+The plugin runs one local listener (default `127.0.0.1:8650`) shared by every profile in the gateway, with a single route: `POST /linear/<profile>/webhook`. A profile that sets its own `listener_host`/`listener_port` gets a separate listener there. Linear must reach it over public HTTPS. Any tunnel or proxy works as long as it forwards to the listener **with the path unchanged**. Forwarding only `/linear/` is enough; nothing else is served.
 
 Your webhook URL is always `https://<public_host>/linear/<profile>/webhook`. `hermes linear setup` asks for `public_host` (it suggests your Tailscale name when Tailscale is installed; overwrite it for any other option) and prints the exact URL.
 
@@ -328,8 +328,8 @@ Settings live at `plugins.entries.linear.settings.<key>` in each profile's `conf
 | `outside_session_writes` | string | `approve` | What `linear_comment`, `linear_issue_update`, `linear_issue_create`, `linear_relation`, `linear_attach` (with `id`), `linear_document` (`create`, `update`) and `linear_project` (`post_update`, `milestone`, `link`) do when called from a session that is not a Linear session (Slack, Telegram, CLI, cron): `approve` asks a human in that chat first, `deny` refuses (`NOT_LINEAR_SESSION`), `allow` writes without asking. Case-insensitive. |
 | `default_team` | string | `""` | Base team for `linear_issue_create` outside a Linear session without a `parent`: UUID, key (e.g. `RET`) or name. Empty: the call must pass `team` (else `BAD_ARGS`). A `team` argument always wins, and a wrong value only matters when the default is used: then the create answers `TEAM_NOT_FOUND` with `candidates` and a `message` naming `default_team`. |
 | `default_project` | string | `""` | Base project for the same case (UUID or name). `linear_issue_create` uses it only with `default_team` (set alone, it is ignored there, with a warning in the log). A `project` argument wins, and a `team` other than `default_team` without a `project` gets no project; a wrong value only matters when it is used (`PROJECT_NOT_FOUND`, `message` naming `default_project`). Empty = no project. `linear_project` also uses it outside a Linear session when called without `project`, with or without `default_team`. |
-| `listener_host` | string | `127.0.0.1` | Bind address of the shared webhook listener. **Read from the default profile only.** |
-| `listener_port` | int | `8650` | Port of the shared webhook listener. **Read from the default profile only.** |
+| `listener_host` | string | `127.0.0.1` | Bind address of the webhook listener. Profiles with the same host and port share one listener; each profile reads its own value. |
+| `listener_port` | int | `8650` | Port of the webhook listener. Profiles with the same host and port share one listener; a different port starts a separate one (the tunnel must route that profile's path to it). |
 
 Display verbosity follows Hermes's standard per-platform display settings (`display.platforms.linear`). The default shows every tool call.
 
@@ -380,7 +380,7 @@ Use `hermes -p <profile> linear …` for other profiles. The commands exist only
 - **No events arriving.** Confirm the webhook URL in the Linear app matches `hermes linear status` exactly (including the profile name and port), and that *Agent session events* is ticked.
 - **401s in the gateway log.** The webhook signing secret doesn't match `LINEAR_WEBHOOK_SECRET`, the machine clock is off (replay window is 60 s), or a webhook URL for one profile was pasted into another profile's app.
 - **Tunnel up but nothing reaches the listener.** Test from outside: `curl -i -X POST https://<public_host>/linear/<profile>/webhook` should return a 401 from the plugin (unsigned request). A 404 from the tunnel or proxy means the path was rewritten or not routed; a 502 means it can't reach `127.0.0.1:8650`.
-- **404s.** The profile in the URL doesn't exist or the Linear channel isn't enabled for it.
+- **404s.** The profile in the URL doesn't exist, the Linear channel isn't enabled for it, or its connect failed. `hermes -p <profile> linear status` and `linear test` show the gateway's last listener failure (for example `OSError errno 98 (Address already in use)` when another program holds the port). All profiles in one gateway must run plugin versions with the same listener protocol; on a mismatch the profile that connects later refuses, with an error naming both protocol versions.
 - **"Not authorized" replies.** Add the user to `allowed_users` (UUID or email).
 - **Agent can't see a private team.** Add the team on the app's page in Linear settings.
 - **Tool names like "📐 linear_issue_get..." posted as replies.** Tool calls already show as Linear *action* activities. The plugin defaults `tool_progress` to off for Linear, but a global `display.tool_progress` in your config overrides that default. Add this to the profile's `config.yaml`:
