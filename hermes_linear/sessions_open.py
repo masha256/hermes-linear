@@ -44,14 +44,40 @@ def _approval_refusal(session_key: str, actor_id: str, *, request_id: str | None
     return approval_refusal(session_key, actor_id, request_id=request_id)
 
 
-def _approval_authority(session_key: str, request_id: str) -> dict | None:
-    """Who may answer approval ``request_id`` (Hermes's entry: requester, approvers, chat type),
-    read while it is still pending in Hermes; None if Hermes has no such entry or fails."""
+#: An actor id no Linear user can have: asking ``approval_refusal`` about it tells whether
+#: Hermes lets anyone answer (``approvals.approvers`` holds ``"*"``) and, if not, the refusal
+#: name Hermes words the refusal with (its no-requester sentinel included).
+PROBE_ACTOR = "\0hermes-linear-probe"
+#: Refusal name for a late answer with no usable snapshot ("Only a listed approver can …").
+NO_REQUESTER_NAME = "a listed approver"
+
+
+def _approval_authority(session_key: str, request_id: str,
+                        requester_id: str | None = None) -> dict | None:
+    """Who may answer approval ``request_id``, captured while Hermes still holds it (RET-180):
+    ``{"open", "allowed", "refusal"}``. Every verdict is Hermes's own public
+    ``approval_refusal`` on the real entry; the candidates are the asking turn's user and the
+    profile's ``approvals.approvers`` (the live path passes no admin ids, so admins never apply).
+    None (late approvals refused) when Hermes fails, or when the probe passes although the
+    config is narrowed: ``approval_refusal`` passes everyone when nothing is pending."""
     try:
-        from tools.approval import list_gateway_approval_authority
-        for entry in list_gateway_approval_authority(session_key):
-            if entry.get("request_id") == request_id:
-                return dict(entry)
+        from gateway.approval_actor import approval_refusal
+        from hermes_cli.config import load_config_readonly
+
+        refusal = approval_refusal(session_key, PROBE_ACTOR, request_id=request_id)
+        approvers = (load_config_readonly().get("approvals") or {}).get("approvers")
+        approvers = ["*"] if approvers is None else [str(a) for a in approvers]
+        if refusal is None:
+            if "*" not in approvers:
+                log.warning("linear: approval %s not pending in Hermes; late answers refused",
+                            request_id)
+                return None
+            return {"open": True, "allowed": [], "refusal": None}
+        candidates = list(dict.fromkeys(
+            c for c in [requester_id, *approvers] if c and c != "*"))
+        allowed = [c for c in candidates
+                   if approval_refusal(session_key, c, request_id=request_id) is None]
+        return {"open": False, "allowed": allowed, "refusal": str(refusal)}
     except Exception as exc:  # noqa: BLE001 - unknown authority: a pending answer is refused
         log.warning("linear: approval authority for %s unavailable: %s", request_id,
                     type(exc).__name__)
@@ -59,20 +85,23 @@ def _approval_authority(session_key: str, request_id: str) -> dict | None:
 
 
 def _may_answer(authority: dict, actor_id: str) -> bool:
-    # The live path's ``approval_refusal`` passes no platform extra / admin ids: same here.
-    from gateway.approval_actor import may_answer
-    return may_answer(authority, actor_id)
+    """A late Approve against the asking-time snapshot. Rows stored before RET-180 hold
+    Hermes's entry itself (``requester_id``, ``approvers``): the same rule, without admins."""
+    actor = str(actor_id or "")
+    if "open" not in authority:
+        approvers = [str(a) for a in authority.get("approvers") or []]
+        if "*" in approvers:
+            return True
+        return bool(actor) and actor in {str(authority.get("requester_id") or ""), *approvers}
+    return bool(authority.get("open")) or (bool(actor) and actor in authority.get("allowed", []))
 
 
 def _requester_of(authority: dict | None) -> str:
-    """The name ``refusal_text`` words the refusal with (as ``answerable_request_ids`` does);
-    no requester recorded, or no authority at all: the admins/approvers-only wording."""
-    try:
-        from gateway.approval_actor import _NO_REQUESTER as none
-    except ImportError:  # pragma: no cover - older Hermes
-        none = "the requester"
+    """The name ``refusal_text`` words a refusal with: the one Hermes returned at asking time;
+    a pre-RET-180 row's requester; else :data:`NO_REQUESTER_NAME`."""
     a = authority or {}
-    return str(a.get("requester_name") or a.get("requester_id") or none)
+    return str(a.get("refusal") or a.get("requester_name") or a.get("requester_id")
+               or NO_REQUESTER_NAME)
 
 
 def _refusal_text(requester: str) -> str:
