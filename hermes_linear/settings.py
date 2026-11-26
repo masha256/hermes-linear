@@ -161,8 +161,9 @@ def load_settings(
     default_team = _as_str(get_config("default_team", ""))
     default_project = _as_str(get_config("default_project", ""))
     if default_project and not default_team:
-        log.warning("linear: setting 'default_project' is ignored without 'default_team' "
-                    "(the project belongs to the default team)")
+        log.warning("linear: setting 'default_project' is ignored by linear_issue_create "
+                    "without 'default_team' (the project belongs to the default team); "
+                    "linear_project still uses it")
 
     return Settings(
         client_id=client_id,

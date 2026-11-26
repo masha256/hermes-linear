@@ -78,8 +78,9 @@ class Gate:
                              "title": issue.get("title")})
 
     def record_target(self, id: str, kind: str, name: str) -> None:  # noqa: A002
-        """A team or project target (``kind`` ``team`` / ``project``; RET-121 spec §2.4),
-        shown on the card as ``- <kind> "<name>"``."""
+        """A team, project or document target (``kind`` ``team`` / ``project`` /
+        ``document``; RET-121 spec §2.4, RET-122 spec §2.1), shown on the card as
+        ``- <kind> "<name>"``."""
         if any(t["id"] == id for t in self.targets):
             return
         self.targets.append({"id": id, "kind": kind, "identifier": name, "title": ""})
@@ -1041,7 +1042,7 @@ async def _comment(ctx: ToolContext, a: dict) -> dict:
     return done(await ctx.client.comment_create(issue["id"], text), False)
 
 
-# -- linear_sync_spec (RET-77)
+# -- linear_sync_spec (RET-77; RET-168 spec §6)
 
 
 def _read_source(args: dict, key: str = "path") -> tuple[Path, str]:
@@ -1058,21 +1059,111 @@ def _read_source(args: dict, key: str = "path") -> tuple[Path, str]:
     return p, text
 
 
+def _sync_summary(args: dict) -> str:
+    """The required ``summary`` (spec §6.1): stripped, non-empty, at most
+    ``SYNC_SUMMARY_MAX`` UTF-16 units, else BAD_ARGS. hermes-linear markers are dropped
+    first: a part marker in the summary would split the description on the next sync."""
+    raw = args.get("summary")
+    if not isinstance(raw, str):
+        raise _Refusal("BAD_ARGS")
+    summary = ANY_MARKER_RE.sub("", raw).strip()
+    if not summary or sync.utf16_len(summary) > sync.SYNC_SUMMARY_MAX:
+        raise _Refusal("BAD_ARGS")
+    return summary
+
+
 def _parse_sync_spec(args: dict) -> dict:
-    """In the tool thread, off the loop: read the file, its header, and git (sync.py)."""
+    """In the tool thread, off the loop: the summary, then the file, its header and git."""
+    summary = _sync_summary(args)
     p, text = _read_source(args)
     ticket = sync.read_linear_header(text)
     if ticket is None:
         raise _Refusal("NO_LINEAR_HEADER")
-    description, inline = sync.spec_description(text, sync.source_info(p))
-    return {"ticket": ticket, "description": description, "inline": inline}
+    info = sync.source_info(p)
+    content, inline = sync.document_content(text, info)
+    return {"ticket": ticket, "summary": summary, "info": info, "inline": inline,
+            "title": sync.doc_title("Spec", text, str(p)), "content": content}
+
+
+def _doc_ref(d: dict) -> dict:
+    return {"id": d.get("id"), "title": d.get("title"), "url": d.get("url")}
+
+
+async def _find_document(ctx: ToolContext, issue: dict, kind: str) -> dict | None:
+    """Reads only: the app's ``<kind>: …`` document on ``issue`` (spec §6.2), or None.
+
+    Candidates are the issue's documents the app created (``creator_id`` = the viewer)
+    whose title starts with ``<kind>:``; a human's document is never read or touched. Two
+    or more: ``AMBIGUOUS`` with their ``{id, title, url}``, so callers run this before any
+    write.
+    """
+    me = await ctx.client.viewer_id()
+    prefix = f"{kind}:"
+    mine = [d for d in await ctx.client.documents_on(issue_id=issue["id"])
+            if d.get("creator_id") == me and (d.get("title") or "").startswith(prefix)]
+    if len(mine) > 1:
+        raise _Refusal("AMBIGUOUS", extra={"documents": [_doc_ref(d) for d in mine]})
+    return mine[0] if mine else None
+
+
+async def _write_document(ctx: ToolContext, issue: dict, doc: dict | None, title: str,
+                          content: str) -> dict:
+    """Create the document (``doc`` None; recorded for the session ticket in a Linear
+    session) or update ``doc``: the title only when it differs, the content only when its
+    stored hash marker differs from ``content``'s; neither -> ``document_skipped``.
+    Returns ``{document_id, document_url, document_created, document_skipped}``."""
+    client = ctx.client
+    if doc is None:
+        made = await client.document_create(title, content, issue_id=issue["id"],
+                                            project_id=None)
+        store = getattr(ctx.adapter, "_store", None)
+        if ctx.session_issue_id and not ctx.outside and store is not None:
+            store.record_document(ctx.session_issue_id, made["id"])
+        return {"document_id": made["id"], "document_url": made.get("url"),
+                "document_created": True, "document_skipped": False}
+    fields: dict[str, str] = {}
+    if doc.get("title") != title:
+        fields["title"] = title
+    stored = await client.document_get(doc["id"])
+    # Linear may normalize stored markdown: compare the hash marker, never the text.
+    if stored is None or sync.read_desc_hash(stored.get("content")) \
+            != sync.read_desc_hash(content):
+        fields["content"] = content
+    url = doc.get("url")
+    if fields:
+        url = (await client.document_update(doc["id"], fields)).get("url") or url
+    return {"document_id": doc["id"], "document_url": url, "document_created": False,
+            "document_skipped": not fields}
+
+
+async def _sync_document(ctx: ToolContext, issue: dict, kind: str, title: str,
+                         content: str) -> dict:
+    """Create or update the app's ``<kind>: …`` document on ``issue`` (spec §6.2):
+    ``_find_document`` (``AMBIGUOUS`` before any write), then ``_write_document``."""
+    return await _write_document(ctx, issue, await _find_document(ctx, issue, kind),
+                                 title, content)
 
 
 async def _sync_spec(ctx: ToolContext, a: dict) -> dict:
     issue = await _writable(ctx, a["ticket"])
-    out = await ctx.client.issue_update(issue["id"], {"description": a["description"]})
-    return {"ok": True, "issue": out.get("identifier") or issue.get("identifier"),
-            "url": out.get("url") or issue.get("url"), "inline": a["inline"]}
+    doc = await _sync_document(ctx, issue, "Spec", a["title"], a["content"])
+    current = issue.get("description")
+    source = sync.source_line("Spec", a["title"], doc["document_url"] or "", a["info"])
+    new = sync.spec_part(a["summary"], source)
+    _before, plan_part = sync.split_plan_part(current)
+    if plan_part is not None:
+        new = f"{new}\n\n{plan_part}"
+    url = issue.get("url")
+    if not sync.same_description(current, new):
+        try:
+            out = await ctx.client.issue_update(issue["id"], {"description": new})
+        except LinearError as exc:  # §6.5: say what was written so far
+            return {"ok": False, "error": exc.code or "LINEAR_ERROR",
+                    "message": exc.detail or str(exc), "document_id": doc["document_id"],
+                    "document_url": doc["document_url"]}
+        url = out.get("url") or url
+    return {"ok": True, "issue": issue.get("identifier"), "url": url, **doc,
+            "inline": a["inline"]}
 
 
 # -- linear_sync_plan (RET-78)
@@ -1087,7 +1178,9 @@ def _state_type(issue: dict) -> str | None:
 
 
 def _parse_sync_plan(args: dict) -> dict:
-    """In the tool thread, off the loop: read and parse the plan, and run git (sync.py)."""
+    """In the tool thread, off the loop: the summary, then read and parse the plan, and run
+    git (sync.py)."""
+    summary = _sync_summary(args)
     p, text = _read_source(args)
     ticket = sync.read_linear_header(text)
     if ticket is None:
@@ -1098,8 +1191,8 @@ def _parse_sync_plan(args: dict) -> dict:
     if not tasks or len(set(numbers)) != len(numbers) or len(set(ids)) != len(ids) \
             or ticket in ids:
         raise _Refusal("BAD_ARGS")  # no tasks, a duplicate number/ID, or the project itself
-    return {"path": p, "text": text, "ticket": ticket, "tasks": tasks,
-            "info": sync.source_info(p)}
+    return {"path": p, "text": text, "ticket": ticket, "tasks": tasks, "summary": summary,
+            "title": sync.doc_title("Plan", text, str(p)), "info": sync.source_info(p)}
 
 
 def _is_session(ctx: ToolContext, node: dict) -> bool:
@@ -1172,6 +1265,8 @@ async def _sync_plan(ctx: ToolContext, a: dict) -> dict:
     client, info, tasks = ctx.client, a["info"], a["tasks"]
     project = await _writable(ctx, a["ticket"])
     pid, team = project["id"], _team_of(project)
+    # Before any write: two app 'Plan:' documents -> AMBIGUOUS, nothing written (§6.2).
+    found = await _find_document(ctx, project, "Plan")
     me = await client.viewer_id()  # cached since connect
     target, recreated, errors = await _resolve_tasks(ctx, project, tasks, me)
 
@@ -1227,26 +1322,43 @@ async def _sync_plan(ctx: ToolContext, a: dict) -> dict:
         await client.issue_update(c["id"], {"stateId": cancel_state})
         canceled.append(c["identifier"])
 
-    # The comment shows the plan as it will be on disk (IDs written back), so a rerun on
-    # the written file finds it unchanged. Markers in the plan text are dropped so no
-    # other edit_marker lookup can ever match this comment.
-    tag = _marker_tag(PLAN_MARKER)
+    # The document is written after the sub-tickets, so it holds the plan as it will be on
+    # disk (every ID written back) and a rerun on the written file finds it unchanged.
+    # Markers in the plan text are dropped so no marker lookup can ever match it.
     text = ANY_MARKER_RE.sub("", sync.write_ticket_ids(a["text"], mapping))
-    body, inline = sync.plan_comment(text, info, tasks, tag, mapping)
-    mine = next((c for c in await client.app_comments(pid) if tag in (c.get("body") or "")),
-                None)  # the app's own comments only: a human quoting the marker is never edited
-    if mine is None:
-        await client.comment_create(pid, body)
-        comment = "created"
-    elif mine.get("body") != body:
-        await client.comment_update(mine["id"], body)
-        comment = "edited"
-    else:
-        comment = "unchanged"
-    return {"ok": True, "issue": project.get("identifier"), "url": project.get("url"),
-            "tasks": mapping, "created": created, "canceled": canceled,
-            "recreated": recreated, "unmanaged": unmanaged, "errors": errors,
-            "comment": comment, "comment_inline": inline}
+    content, inline = sync.document_content(text, info)
+    out: dict[str, Any] = {"ok": True, "issue": project.get("identifier"),
+                           "url": project.get("url"), "tasks": mapping, "created": created,
+                           "canceled": canceled, "recreated": recreated,
+                           "unmanaged": unmanaged, "errors": errors}
+    doc: dict[str, Any] = {}
+    try:
+        doc = await _write_document(ctx, project, found, a["title"], content)
+        out.update(doc, inline=inline, comment_migrated=False)
+        current = project.get("description")
+        before = sync.split_plan_part(current)[0].rstrip()
+        lead = f"{before}\n\n" if before else ""
+        source = sync.source_line("Plan", a["title"], doc["document_url"] or "", info)
+        part = sync.fit_plan_part(a["summary"], source, tasks, mapping,
+                                  sync.SPEC_INLINE_MAX - sync.utf16_len(lead))
+        new = lead + part
+        if not sync.same_description(current, new):
+            res = await client.issue_update(pid, {"description": new})
+            out["url"] = res.get("url") or out["url"]
+        # An old plan comment (the app's own, by its marker) becomes a pointer, once.
+        tag = _marker_tag(PLAN_MARKER)
+        pointer = f"Plan moved to [{a['title']}]({doc['document_url'] or ''}).\n\n{tag}"
+        old = next((c for c in await client.app_comments(pid)
+                    if tag in (c.get("body") or "")), None)  # a human's quote is never edited
+        if old is not None and old.get("body") != pointer:
+            await client.comment_update(old["id"], pointer)
+            out["comment_migrated"] = True
+    except LinearError as exc:  # §6.5: say what was written so far; a rerun finishes
+        return {"ok": False, "error": exc.code or "LINEAR_ERROR",
+                "message": exc.detail or str(exc), "document_id": doc.get("document_id"),
+                "document_url": doc.get("document_url"), "tasks": mapping,
+                "created": created, "canceled": canceled}
+    return out
 
 
 def _finish_sync_plan(a: dict, out: dict) -> dict:
@@ -1581,30 +1693,58 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_sync_spec": {
         "name": "linear_sync_spec",
         "description": ("Mirror a committed spec file onto the Linear ticket named by its "
-                        "'Linear: <ID>' header, as the Linear app: overwrites the ticket "
-                        "description with the file plus a source footer (only section 1 and "
-                        "a link if the spec is over 200,000 chars). Commit the file first; "
-                        "uncommitted edits are marked as such."),
+                        "'Linear: <ID>' header, as the Linear app. The whole file plus a "
+                        "source footer goes to a 'Spec: <H1>' document on that ticket, found "
+                        "again by the 'Spec:' title prefix among the app's own documents "
+                        "(a changed H1 retitles it; a human's document is never touched; "
+                        "an unchanged file is not rewritten; over 250,000 chars the file is "
+                        "cut with a link, inline: false). The ticket description becomes "
+                        "your summary plus a link line to the document and the source; "
+                        "the plan part after it (written by linear_sync_plan) is kept. Two "
+                        "app documents with the prefix -> AMBIGUOUS with their ids, nothing "
+                        "written. Commit the file first; uncommitted edits are marked as "
+                        "such."),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string",
                      "description": "Absolute path to the spec file."},
-        }, "required": ["path"]},
+            "summary": {"type": "string",
+                        "description": ("Required: a few sentences on what the spec builds "
+                                        "and its key decisions, written into the ticket "
+                                        "description as given (at most 5,000 chars).")},
+        }, "required": ["path", "summary"]},
     },
     "linear_sync_plan": {
         "name": "linear_sync_plan",
-        "description": ("Mirror a plan file onto Linear as the Linear app: the plan header "
-                        "(before the first task) and the task list as one comment on the "
-                        "ticket named by its 'Linear: <ID>' header, and one sub-ticket "
-                        "'T<n> · <name>' per '### Task <n>: <name>' heading, in plan order, "
-                        "whose description is that task's whole section. Headings with '— <ID>' update that ticket; others adopt "
-                        "the app's open child with that exact title or create one. App-made "
-                        "tickets of removed tasks are canceled; humans' tickets and Done "
-                        "tickets are never touched. Writes the IDs back into "
-                        "the headings (commit the file afterwards). Safe to re-run."),
+        "description": ("Mirror a plan file onto Linear as the Linear app, on the ticket "
+                        "named by its 'Linear: <ID>' header: one sub-ticket 'T<n> · <name>' "
+                        "per '### Task <n>: <name>' heading, in plan order, whose "
+                        "description is that task's whole section. Headings with '— <ID>' "
+                        "update that ticket; others adopt the app's open child with that "
+                        "exact title or create one. App-made tickets of removed tasks are "
+                        "canceled; humans' tickets and Done tickets are never touched. "
+                        "Then the whole file (IDs written back) plus a source footer goes "
+                        "to a 'Plan: <H1>' document on that ticket, found again by the "
+                        "'Plan:' title prefix among the app's own documents (a human's "
+                        "document is never touched; an unchanged file is not rewritten; "
+                        "over 250,000 chars it is cut with a link, inline: false). The "
+                        "ticket description keeps everything above its plan part (the spec "
+                        "summary, or the brief) and gets, after a '---' bar, your summary, "
+                        "a link line to the document and the source, and the task list "
+                        "'T<n> · <name> — <ID>' (cut to fit, task lines first). An old plan "
+                        "comment is edited once to 'Plan moved to <document link>' "
+                        "(comment_migrated: true); no plan comment is posted. Two app "
+                        "documents with the prefix -> AMBIGUOUS with their ids, nothing "
+                        "written. Writes the IDs back into the headings (commit the file "
+                        "afterwards). Safe to re-run."),
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string",
                      "description": "Absolute path to the plan file."},
-        }, "required": ["path"]},
+            "summary": {"type": "string",
+                        "description": ("Required: a few sentences on what the plan builds "
+                                        "and its key decisions, plus the task count and "
+                                        "execution method, written into the ticket "
+                                        "description as given (at most 5,000 chars).")},
+        }, "required": ["path", "summary"]},
     },
     "linear_task_state": {
         "name": "linear_task_state",
@@ -1651,6 +1791,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
     "linear_session_link": {},
     "linear_relation": {},
     "linear_lookup": {},
+    "linear_project": {},
+    "linear_document": {},
 }
 
 TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
@@ -1667,12 +1809,16 @@ TOOL_HANDLERS: dict[str, Callable[..., dict]] = {
     "linear_session_link": None,  # type: ignore[dict-item]  # registered by tools_attach
     "linear_relation": None,  # type: ignore[dict-item]  # registered by tools_relation
     "linear_lookup": None,  # type: ignore[dict-item]  # registered by tools_lookup
+    "linear_project": None,  # type: ignore[dict-item]  # registered by tools_project
+    "linear_document": None,  # type: ignore[dict-item]  # registered by tools_document
 }
 
 
 __all__ = ["TOOL_HANDLERS", "TOOL_SCHEMAS", "ToolContext", "check_write_scope",
-           "linear_attach", "linear_comment", "linear_issue_create", "linear_issue_get",
-           "linear_issue_update", "linear_lookup", "linear_query", "linear_relation",
+           "linear_attach", "linear_comment", "linear_document", "linear_issue_create",
+           "linear_issue_get",
+           "linear_issue_update", "linear_lookup", "linear_project", "linear_query",
+           "linear_relation",
            "linear_search",
            "linear_session_link",
            "linear_sync_plan", "linear_sync_spec", "linear_task_state", "resolve_context",
@@ -1686,3 +1832,5 @@ from . import tools_read  # noqa: E402,F401
 from . import tools_attach  # noqa: E402,F401
 from . import tools_relation  # noqa: E402,F401
 from . import tools_lookup  # noqa: E402,F401
+from . import tools_project  # noqa: E402,F401
+from . import tools_document  # noqa: E402,F401

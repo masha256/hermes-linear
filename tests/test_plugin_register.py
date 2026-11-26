@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import importlib
 import importlib.metadata
+import itertools
 import json
 import os
 import tempfile
@@ -52,7 +53,7 @@ SKILL_MD = REPO_ROOT / "hermes_linear" / "skills" / "manage-superpowers" / "SKIL
 TOOL_NAMES = ["linear_issue_get", "linear_issue_create", "linear_issue_update", "linear_comment",
               "linear_sync_spec", "linear_sync_plan", "linear_task_state", "linear_query",
               "linear_search", "linear_attach", "linear_session_link", "linear_relation",
-              "linear_lookup"]
+              "linear_lookup", "linear_project", "linear_document"]
 
 
 class FakeCtx:
@@ -319,23 +320,31 @@ def test_registered_handlers_return_json_strings_real_registry(monkeypatch):
         assert _json.loads(raw)["ok"] is False
 
 
-@pytest.mark.parametrize("first", ["hermes_linear.tools_lookup", "hermes_linear.tools_relation"])
+_SELF_REGISTERING = ("hermes_linear.tools_relation", "hermes_linear.tools_document",
+                     "hermes_linear.tools_project")
+
+
+@pytest.mark.parametrize("first", [
+    ("hermes_linear.tools_lookup",),
+    *itertools.permutations(_SELF_REGISTERING)])
 def test_import_order_fresh_interpreter(first):
-    """A tool module imported first in a fresh interpreter still yields the full roster,
-    every slot filled, and ``agent_tools`` reaches the sibling modules' helpers."""
+    """Tool modules imported first, in any order, in a fresh interpreter still yield the full
+    roster, every slot filled, and ``agent_tools`` reaches the sibling modules' helpers."""
     import subprocess
     import sys
 
-    code = (f"import {first}; from hermes_linear import agent_tools as a; "
+    imports = "; ".join(f"import {m}" for m in first)
+    code = (f"{imports}; from hermes_linear import agent_tools as a; "
             "print(','.join(a.TOOL_SCHEMAS), ','.join(a.TOOL_HANDLERS), "
             "all(a.TOOL_SCHEMAS.values()), all(callable(h) for h in a.TOOL_HANDLERS.values()), "
             "all(getattr(a, n) is a.TOOL_HANDLERS[n] for n in a.TOOL_HANDLERS), "
-            "callable(a.tools_relation.check_relation))")
+            "callable(a.tools_relation.check_relation), callable(a.tools_document.doc_ref), "
+            "callable(a.tools_project._project))")
     proc = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT,
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stderr
     roster = ",".join(TOOL_NAMES)
-    assert proc.stdout.split() == [roster, roster, "True", "True", "True", "True"]
+    assert proc.stdout.split() == [roster, roster] + ["True"] * 6
 
 
 def test_manifest_declares_every_tool():
@@ -403,6 +412,25 @@ def test_skill_has_a_fallback_when_superpowers_is_missing():
     assert "Setup" in para and "Per-stage" in para
     assert "Questions and approvals" in para
     assert text.index("**Without superpowers**") < text.index("## Calling the tools")
+
+
+def test_skill_sync_stages_pass_summary_and_read_documents():
+    """RET-169 (spec §6.6): both sync stages pass `summary`; review reads the documents but
+    answers stay in the ticket thread; the plan comment is gone from the skill."""
+    text = SKILL_MD.read_text()
+    spec = text.partition("**Spec.**")[2].split("\n\n", 1)[0]
+    plan = text.partition("**Plan.**")[2].split("\n\n", 1)[0]
+    for stage in (spec, plan):
+        assert "summary" in stage
+    assert "`Spec:`" in spec and "`Plan:`" in plan
+    assert "task count" in plan and "execution method" in plan
+    assert "thread" in spec or "thread" in plan
+    assert "plan comment" not in text
+    assert "`linear_sync_spec` (`path`, `summary`)" in text
+    assert "`linear_sync_plan` (`path`, `summary`)" in text
+    assert ("Ticket descriptions and the `Spec:` / `Plan:` documents are written only by the "
+            "sync tools: fix, commit, re-sync.") in text
+    assert "https" in text.partition("## Setup")[2].split("\n4. ", 1)[0]  # step 3
 
 
 def test_skill_finish_links_pr():

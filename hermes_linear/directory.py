@@ -100,6 +100,11 @@ class Directory:
         rows, _ = await self._cached(kind, scope_id)
         return [dict(r) for r in rows]
 
+    def invalidate(self, kind: str, scope_id: str = "") -> None:
+        """Drop the ``(kind, scope_id)`` entry (after a write changed it), so the next
+        ``rows`` / ``resolve`` refetches; other entries stay. Nothing cached: a no-op."""
+        self._entries.pop((kind, scope_id), None)
+
     async def resolve(self, kind: str, scope_id: str, ref: Any, match: Match) -> dict:
         """The one row ``match(rows, ref)`` picks. ``None`` (a miss) refetches once, unless
         this call fetched already; still a miss: the kind's refusal (``miss``). A list

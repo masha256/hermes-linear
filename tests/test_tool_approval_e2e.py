@@ -431,6 +431,149 @@ async def test_e2e_relation_out_of_scope(e2e):
     assert len(h.notified) == 1 and store.request(SK, d) is None
 
 
+async def test_e2e_document_one_prompt(e2e, monkeypatch):
+    """RET-164 (Review Focus 1): ``linear_document`` create on an out-of-scope issue. The
+    hook digests the model's raw args, the handler gets Hermes's real ``coerce_tool_args``
+    output for the plugin's registered schema. One card (``- OTH-9 "Unrelated"``), and after
+    "Allow once" the identical re-call creates the document exactly once. A read (``get``)
+    of it afterwards never asks."""
+    import copy
+
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry
+
+    h, a, client, gw, store, ws, config = e2e
+    tool = "linear_document"
+    real_get_schema = registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(
+        agent_tools.TOOL_SCHEMAS[name]) if name == tool else real_get_schema(name))
+    raw = {"action": "create", "title": "Notes", "content": "", "issue": "OTH-9"}
+    coerced = coerce_tool_args(tool, copy.deepcopy(raw))
+    assert coerced == raw  # all strings: Hermes hands them on unchanged
+    first = await h.run(tool, raw, cid="c-first", coerced=coerced)
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert ws.writes() == []
+    d = tool_approval.digest(tool, raw)
+    assert d == tool_approval.digest(tool, coerced) and store.request(SK, d).targets == [OTHER]
+    task = asyncio.create_task(h.run(tool, raw, cid="c-again", coerced=coerced))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert data["command"] == f"<{tool}> (plugin approval rule)"
+    assert '\n- OTH-9 "Unrelated"\n' in data["description"]
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out["ok"] is True and out["issue"] == "OTH-9", out
+    assert ws.writes() == [("document_create", ("Notes", "", OTHER, None))]
+    assert len(h.notified) == 1 and store.request(SK, d) is None
+    assert store.documents_by(SELF) == {out["document_id"]}
+    got = await h.run(tool, {"action": "get", "id": out["document_id"]}, cid="c-get")
+    assert got["ok"] is True and got["document"]["title"] == "Notes"
+    assert len(h.notified) == 1 and len(ws.writes()) == 1
+
+
+async def test_e2e_project_coerced_args_one_prompt(e2e, monkeypatch):
+    """RET-165 (Review Focus 1): ``linear_project`` with raw model args. A ``get`` with
+    ``updates: "5"`` (Hermes coerces it to ``5`` for the integer schema) reads and never
+    asks. A ``post_update`` on the session ticket's own project, with ``health`` a raw
+    string, gives one card (``- project "Hermes"``); after "Allow once" the identical
+    re-call posts exactly once. The hook digests the raw args, the handler gets the real
+    ``coerce_tool_args`` output for the plugin's registered schema."""
+    import copy
+
+    from fake_workspace import PROJECT
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry
+
+    h, a, client, gw, store, ws, config = e2e
+    tool = "linear_project"
+    real_get_schema = registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(
+        agent_tools.TOOL_SCHEMAS[name]) if name == tool else real_get_schema(name))
+    ws.project_updates[PROJECT["id"]] = [
+        {"id": f"pu-{i}", "created_at": f"2026-11-0{i + 1}T00:00:00.000Z", "author": "Neo",
+         "health": None, "body": f"u{i}"} for i in range(7)]
+    raw_get = {"action": "get", "updates": "5"}
+    coerced_get = coerce_tool_args(tool, copy.deepcopy(raw_get))
+    assert coerced_get == {"action": "get", "updates": 5}
+    assert tool_approval.digest(tool, raw_get) == tool_approval.digest(tool, coerced_get)
+    got = await h.run(tool, raw_get, cid="c-get", coerced=coerced_get)
+    assert got["ok"] is True, got
+    assert [u["id"] for u in got["project"]["updates"]] == ["pu-6", "pu-5", "pu-4", "pu-3",
+                                                            "pu-2"]
+    assert h.notified == [] and ws.writes() == []
+
+    raw = {"action": "post_update", "body": "Weekly: slipping", "health": "at_risk"}
+    coerced = coerce_tool_args(tool, copy.deepcopy(raw))
+    assert coerced == raw  # strings: Hermes hands them on unchanged
+    first = await h.run(tool, raw, cid="c-first", coerced=coerced)
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert ws.writes() == []
+    d = tool_approval.digest(tool, raw)
+    assert d == tool_approval.digest(tool, coerced)
+    assert store.request(SK, d).targets == [PROJECT["id"]]
+    task = asyncio.create_task(h.run(tool, raw, cid="c-again", coerced=coerced))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert data["command"] == f"<{tool}> (plugin approval rule)"
+    assert '\n- project "Hermes"\n' in data["description"]
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out["ok"] is True and out["update_id"], out
+    assert ws.writes() == [("project_update_create",
+                            (PROJECT["id"], "Weekly: slipping", "atRisk"))]
+    assert len(h.notified) == 1 and store.request(SK, d) is None
+
+
+async def test_e2e_milestone_null_target_date_one_prompt(e2e, monkeypatch):
+    """RET-166 (Ruling 3): a milestone update with the raw model arg ``target_date: "null"``.
+    Hermes coerces it to ``None`` for the ``["string", "null"]`` schema; the hook's digest of
+    the raw args equals the handler's of the coerced ones, so the session ticket's own
+    project gives exactly one card (``- project "Hermes"``), and after "Allow once" the
+    identical re-call writes once, with ``targetDate: None``. Seams as
+    ``test_e2e_project_coerced_args_one_prompt``: the registry schema lookup patched to the
+    plugin's schema for ``coerce_tool_args``; the rest is ``e2e``'s."""
+    import copy
+
+    from fake_workspace import PROJECT
+    from tools.arg_coercion import coerce_tool_args
+    from tools.registry import registry
+
+    h, a, client, gw, store, ws, config = e2e
+    tool = "linear_project"
+    real_get_schema = registry.get_schema
+    monkeypatch.setattr(registry, "get_schema", lambda name: copy.deepcopy(
+        agent_tools.TOOL_SCHEMAS[name]) if name == tool else real_get_schema(name))
+    pid = PROJECT["id"]
+    ws.milestones_rows[pid] = [{"id": "ms-beta", "name": "Beta"}]
+    ws.milestone_meta["ms-beta"] = {"project": pid, "description": None,
+                                    "targetDate": "2026-12-31"}
+
+    raw = {"action": "milestone", "milestone": "Beta", "target_date": "null"}
+    coerced = coerce_tool_args(tool, copy.deepcopy(raw))
+    assert coerced == {"action": "milestone", "milestone": "Beta", "target_date": None}
+    d = tool_approval.digest(tool, raw)
+    assert d == tool_approval.digest(tool, coerced)
+    first = await h.run(tool, raw, cid="c-first", coerced=coerced)
+    assert first["ok"] is False and first["error"] == "APPROVAL_REQUIRED", first
+    assert ws.writes() == [] and store.request(SK, d).targets == [pid]
+    task = asyncio.create_task(h.run(tool, raw, cid="c-again", coerced=coerced))
+    await _until(lambda: len(h.sent) == 1, "the approval select")
+    data = h.notified[-1]
+    assert '\n- project "Hermes"\n' in data["description"]
+    assert data["description"].endswith(f"digest: {d}")
+    assert ws.writes() == []
+    await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
+    out = await task
+    assert out == {"ok": True, "milestone_id": "ms-beta", "name": "Beta",
+                   "target_date": None, "created": False}, out
+    assert ws.writes() == [("milestone_update", ("ms-beta", {"targetDate": None}))]
+    assert len(h.notified) == 1 and store.request(SK, d) is None
+
+
 # ------------------------------------------- outside a Linear session (RET-148, Task 1)
 
 SLACK_SK = "agent:main:slack:dm:C0E2E:1700000000.0001"

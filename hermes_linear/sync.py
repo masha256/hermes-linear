@@ -37,8 +37,6 @@ HEADER_RE = re.compile(
     r"^Linear:[ \t]*([A-Z][A-Z0-9]*-\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}"
     r"-[0-9a-f]{12})[ \t]*$", re.MULTILINE)
 _FENCE_RE = re.compile(r"^ {0,3}```")
-_SECTION_ONE_RE = re.compile(r"^## 1\.", re.MULTILINE)
-_NEXT_SECTION_RE = re.compile(r"^## ", re.MULTILINE)
 _GITHUB_RE = re.compile(
     r"^(?:(?:https?|ssh|git)://(?:[^@/\s]+@)?github\.com/|(?:[^@/\s]+@)?github\.com:)"
     r"([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
@@ -155,20 +153,6 @@ def footer(path: str, short_commit: str | None) -> str:
             "edit by asking in this thread")
 
 
-def render_spec(text: str, path: str, short_commit: str | None) -> str:
-    """The file text (trailing whitespace dropped), a rule, then the footer."""
-    return f"{text.rstrip()}\n\n---\n{footer(path, short_commit)}"
-
-
-def spec_summary(text: str) -> str:
-    """From the first ``## 1.`` heading up to the next ``## `` heading (``""`` if none)."""
-    m = _SECTION_ONE_RE.search(text or "")
-    if not m:
-        return ""
-    end = _NEXT_SECTION_RE.search(text, m.end())
-    return text[m.start():end.start() if end else len(text)].strip()
-
-
 # ----------------------------------------------------------------- git / source
 
 
@@ -218,32 +202,8 @@ def source_info(path: str | Path, git: Git = run_git) -> SourceInfo:
     return SourceInfo(path=shown, commit=commit, link=link)
 
 
-# ----------------------------------------------------------------- spec description
-
-
-def spec_description(text: str, info: SourceInfo) -> tuple[str, bool]:
-    """The ticket description for a spec and whether it is the whole spec (``inline``).
-
-    Inline when ``render_spec`` fits ``SPEC_INLINE_MAX``; otherwise §1, a link line to the
-    full file, then the same footer, with §1 cut short if even that would not fit.
-    """
-    full = render_spec(text, info.path, info.commit)
-    if utf16_len(full) <= SPEC_INLINE_MAX:
-        return full, True
-    tail = (f"\n\nFull spec (too long to show here): {info.link}"
-            f"\n\n---\n{footer(info.path, info.commit)}")
-    summary = spec_summary(text)
-    room = SPEC_INLINE_MAX - utf16_len(tail)
-    if utf16_len(summary) > room:
-        summary = utf16_truncate(summary, room - utf16_len(TRUNCATED)).rstrip() + TRUNCATED
-    return (summary + tail).lstrip(), False
-
-
 # ----------------------------------------------------------------- plans (RET-78)
 
-#: Limit for the plan comment (marker included), in UTF-16 units. Linear documents no
-#: comment limit; probe P1 measured 200,000 for descriptions, so the same value is used.
-PLAN_COMMENT_MAX = SPEC_INLINE_MAX
 #: A task heading; group 3 is the first ``— <ID>`` token, even when text follows it.
 TASK_HEADING_RE = re.compile(r"^### Task (\d+): (.+?)(?:\s+—\s+([A-Z]+-\d+)\b.*)?\s*$")
 #: Titles of the ticket the plan sync manages: ``T<n> · …`` (U+00B7).
@@ -314,16 +274,6 @@ def parse_plan(text: str) -> list[PlanTask]:
         out.append(PlanTask(number=int(m.group(1)), name=m.group(2).strip(), ticket=m.group(3),
                             body=_section([ln for ln, _f in lines[i + 1:end]]), line=i + 1))
     return out
-
-
-def plan_header(text: str) -> str:
-    """Everything before the first task heading (outside fences), trailing rules dropped."""
-    out: list[str] = []
-    for _i, line, _raw, fenced in _plan_lines(text or ""):
-        if not fenced and TASK_HEADING_RE.match(line):
-            break
-        out.append(line)
-    return _section(out)
 
 
 def write_ticket_ids(text: str, mapping: dict[int, str]) -> str:
@@ -402,33 +352,153 @@ def read_desc_hash(description: str | None) -> str | None:
     return m.group(1) if m else None
 
 
-def plan_comment(text: str, info: SourceInfo, tasks: list[PlanTask], marker_tag: str,
-                 tickets: dict[int, str]) -> tuple[str, bool]:
-    """The plan comment body ending in ``marker_tag`` and whether the header is whole.
+# ----------------------------------------------------------------- documents (RET-168, §6)
 
-    The plan header (``plan_header``), the task list (``T<n> · <name> — <ID>``), then the
-    footer: task bodies live in the task tickets. A header that would not fit
-    ``PLAN_COMMENT_MAX`` UTF-16 units is cut and followed by a link to the file.
+#: Longest ``summary`` the sync tools take (after ``strip()``), in UTF-16 units.
+SYNC_SUMMARY_MAX = 5_000
+#: Linear refuses document content over 250,000 characters (probed: ``INVALID_INPUT``,
+#: "content must be shorter than or equal to 250000 characters"); in UTF-16 units, the
+#: footer and hash marker included.
+SYNC_DOCUMENT_MAX = 250_000
+#: Hidden markers closing the description's spec part and opening its plan part (HTML
+#: comments survive Linear's markdown normalization, probe P8).
+SPEC_PART_MARKER = "<!-- hermes-linear:spec -->"
+PLAN_PART_MARKER = "<!-- hermes-linear:plan -->"
+_H1_RE = re.compile(r"^# (.*)$")
+#: A ``---`` bar ending ``text`` (blank lines after it allowed: Linear inserts one on save).
+_BAR_BEFORE_RE = re.compile(r"(?:^|(?<=\n))[ \t]*-{3,}[ \t]*\n(?:[ \t]*\n)*[ \t]*\Z")
+_LIST_ITEM_RE = re.compile(r"^(\s*)[-*+] ")
+
+
+#: Title prefixes of the documents the sync tools write (``doc_title``) and find again;
+#: ``linear_document`` refuses them on create and update (Ruling 11).
+SYNC_TITLE_PREFIXES = ("Spec:", "Plan:")
+
+
+def doc_title(kind: str, text: str, path: str) -> str:
+    """``<kind>: <H1>``: the first ``# `` heading outside code fences (stripped), else
+    the file name without its extension. ``kind`` is ``"Spec"`` or ``"Plan"``."""
+    for _i, line, _raw, fenced in _plan_lines(text or ""):
+        m = None if fenced else _H1_RE.match(line)
+        if m and m.group(1).strip():
+            return f"{kind}: {m.group(1).strip()}"
+    return f"{kind}: {Path(path).stem}"
+
+
+def document_content(text: str, info: SourceInfo) -> tuple[str, bool]:
+    """The document content (hash marker last) and whether the whole file is in it.
+
+    The file text, ``\\n\\n---\\n`` and the footer, then ``with_desc_hash``. Over
+    ``SYNC_DOCUMENT_MAX`` the text is cut (``TRUNCATED``; an open code fence is closed)
+    and followed by ``Full file (too long to show here): <link>`` before the footer.
     """
-    items = "\n".join(f"- {task_title(t)}" + (f" — {tickets[t.number]}"
-                                              if tickets.get(t.number) else "")
-                      for t in tasks)
-    tail = f"\n\n---\n{footer(info.path, info.commit)}\n\n{marker_tag}"
-    header = plan_header(text)
-    full = f"{header}\n\n## Tasks\n\n{items}{tail}".lstrip()
-    if utf16_len(full) <= PLAN_COMMENT_MAX:
+    foot = f"\n\n---\n{footer(info.path, info.commit)}"
+    full = with_desc_hash(f"{text.rstrip()}{foot}")
+    if utf16_len(full) <= SYNC_DOCUMENT_MAX:
         return full, True
-    note = f"\n\nFull plan (too long to show here): {info.link}\n\n## Tasks\n\n"
-    room = PLAN_COMMENT_MAX - utf16_len(note) - utf16_len(tail)
-    items = _cut(items, room - min(utf16_len(header), room // 2))  # the list keeps half
-    header = _cut(header, room - utf16_len(items))
-    return f"{header}{note}{items}{tail}".lstrip(), False
+    tail = f"\n\nFull file (too long to show here): {info.link}{foot}"
+    room = SYNC_DOCUMENT_MAX - _DESC_HASH_UNITS - utf16_len(tail)
+    return with_desc_hash(f"{_cut(text.rstrip(), room)}{tail}"), False
+
+
+def source_line(kind: str, title: str, doc_url: str, info: SourceInfo) -> str:
+    """``**<kind>:** [<title>](<doc_url>) · source [<path> @ <commit>](<link>)``."""
+    return (f"**{kind}:** [{title}]({doc_url}) · source "
+            f"[{info.path} @ {info.commit or UNCOMMITTED}]({info.link})")
+
+
+def split_plan_part(description: str | None) -> tuple[str, str | None]:
+    """``(before, plan_part)`` of a ticket description.
+
+    ``plan_part`` runs from the ``---`` line directly before ``PLAN_PART_MARKER`` (blank
+    lines between allowed), or from the marker itself when no bar precedes it, to the end;
+    ``None`` (and the whole description as ``before``) when there is no marker.
+    """
+    desc = description or ""
+    at = desc.find(PLAN_PART_MARKER)
+    if at < 0:
+        return desc, None
+    bar = _BAR_BEFORE_RE.search(desc, 0, at)
+    start = bar.start() if bar else at
+    return desc[:start], desc[start:]
+
+
+def spec_part(summary: str, source: str) -> str:
+    """The description's spec part: the summary, the source line, then the marker."""
+    return f"{summary}\n\n{source}\n{SPEC_PART_MARKER}"
+
+
+def _task_line(t: PlanTask, tickets: dict[int, str]) -> str:
+    ident = tickets.get(t.number)
+    return f"- {task_title(t)}" + (f" — {ident}" if ident else "")
+
+
+def _plan_part(summary: str, source: str, lines: str) -> str:
+    return f"---\n{PLAN_PART_MARKER}\n{summary}\n\n{source}\n\n**Tasks:**\n\n{lines}"
+
+
+def _more_tasks(n: int) -> str:
+    return f"- … {n} more tasks in the plan document"
+
+
+def plan_part(summary: str, source: str, tasks: list[PlanTask],
+              tickets: dict[int, str]) -> str:
+    """The description's plan part (spec §6.3): a ``---`` bar, ``PLAN_PART_MARKER``, the
+    summary, the source line, then ``**Tasks:**`` and one ``- T<n> · <name> — <ID>`` line
+    per task (no `` — <ID>`` for a task without a ticket)."""
+    return _plan_part(summary, source, "\n".join(_task_line(t, tickets) for t in tasks))
+
+
+def fit_plan_part(summary: str, source: str, tasks: list[PlanTask], tickets: dict[int, str],
+                  units: int) -> str:
+    """``plan_part`` cut to at most ``units`` UTF-16 units when it is longer (spec §6.3).
+
+    The task list goes first: as many whole lines as fit, then ``- … <k> more tasks in the
+    plan document``. When not even that note fits beside the whole summary, the list is only
+    the note and the summary is cut (``TRUNCATED``). Best effort below that: the source
+    line and the bar are never cut.
+    """
+    full = plan_part(summary, source, tasks, tickets)
+    if utf16_len(full) <= units:
+        return full
+    lines = [_task_line(t, tickets) for t in tasks]
+    budget = units - utf16_len(_plan_part(summary, source, ""))
+    kept, used = 0, 0
+    for i, line in enumerate(lines):
+        cost = utf16_len(line) + 1  # the line and the newline before the next one
+        if used + cost + utf16_len(_more_tasks(len(lines) - i - 1)) > budget:
+            break
+        used, kept = used + cost, i + 1
+    body = "\n".join([*lines[:kept], _more_tasks(len(lines) - kept)])
+    cut = _plan_part(summary, source, body)
+    if utf16_len(cut) <= units:
+        return cut
+    body = _more_tasks(len(lines))
+    room = units - utf16_len(_plan_part("", source, body))
+    return _plan_part(_cut(summary, max(room, 0)), source, body)
+
+
+def _markdown_key(text: str | None) -> str:
+    """``text`` with Linear's description normalizations undone on both sides (probe P8
+    and RET-148: list bullets, blank lines, ``_x_`` -> ``*x*``, trailing spaces)."""
+    lines = (_LIST_ITEM_RE.sub(r"\1* ", ln.rstrip()).replace("_", "*")
+             for ln in (text or "").replace("\r\n", "\n").split("\n"))
+    return "\n".join(ln for ln in lines if ln)
+
+
+def same_description(current: str | None, new: str) -> bool:
+    """True when ``new`` would not change the stored description ``current`` (as Linear
+    returns it, normalized on save): compared after ``_markdown_key`` on both."""
+    return _markdown_key(current) == _markdown_key(new)
 
 
 __all__ = ["DESC_HASH_RE", "MANAGED_TITLE_RE", "desc_hash", "read_desc_hash",
-           "with_desc_hash", "MAX_SOURCE_BYTES", "PLAN_COMMENT_MAX", "PlanTask",
-           "SPEC_INLINE_MAX", "SourceInfo", "TASK_DESC_MAX", "TASK_HEADING_RE", "footer", "git_short_commit",
-           "github_repo", "parse_plan", "plan_comment", "read_linear_header", "read_source",
-           "plan_header", "render_spec", "run_git", "source_info", "source_path",
-           "spec_description", "spec_summary", "task_description", "task_title", "utf16_len",
+           "with_desc_hash", "MAX_SOURCE_BYTES", "PlanTask",
+           "PLAN_PART_MARKER", "SPEC_INLINE_MAX", "SPEC_PART_MARKER", "SYNC_DOCUMENT_MAX",
+           "SYNC_SUMMARY_MAX", "SYNC_TITLE_PREFIXES", "SourceInfo", "TASK_DESC_MAX",
+           "TASK_HEADING_RE", "TRUNCATED",
+           "doc_title", "document_content", "fit_plan_part", "footer", "git_short_commit",
+           "github_repo", "parse_plan", "plan_part", "read_linear_header", "read_source",
+           "run_git", "same_description", "source_info", "source_line", "source_path",
+           "spec_part", "split_plan_part", "task_description", "task_title", "utf16_len",
            "utf16_truncate", "write_source", "write_ticket_ids"]

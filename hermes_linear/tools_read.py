@@ -61,6 +61,8 @@ def shape_details(node: dict) -> dict:
                          "subtitle": a.get("subtitle"), "url": a.get("url"),
                          "source_type": a.get("sourceType")}
                         for a in _nodes(node.get("attachments"))],
+        "documents": [{"id": d.get("id"), "title": d.get("title"), "url": d.get("url")}
+                      for d in _nodes(node.get("documents"))],
     }
 
 
@@ -89,17 +91,20 @@ def shape_threads(nodes: list[dict], app_id: str) -> list[dict]:
     return out
 
 
-def trim(result: dict, limit: int = ISSUE_GET_MAX_CHARS) -> dict:
+def trim(result: dict, limit: int = ISSUE_GET_MAX_CHARS, *, node: str = "issue",
+         items: str = "comments", flag: str = "comments_truncated") -> dict:
     """Drop the oldest threads (the end of ``issue.comments``) while ``result`` serializes
     to more than ``limit`` chars, setting ``comments_truncated``. Without threads left, a
-    large result is returned as it is."""
-    issue = result.get("issue") or {}
-    threads = issue.get("comments")
+    large result is returned as it is. ``node`` / ``items`` / ``flag`` name another
+    newest-first list the same way (``linear_project``: ``project.updates``,
+    ``updates_truncated``)."""
+    issue = result.get(node) or {}
+    threads = issue.get(items)
     if not isinstance(threads, list):
         return result
     while threads and len(json.dumps(result, ensure_ascii=False, default=str)) > limit:
         threads.pop()
-        issue["comments_truncated"] = True
+        issue[flag] = True
     return result
 
 
@@ -229,7 +234,8 @@ SCHEMAS: dict[str, dict] = {
         "name": "linear_issue_get",
         "description": ("Read a Linear issue as the Linear app: state, team, project and links, "
                         "parent, labels, sub-issues, assignee, delegate, priority, estimate, "
-                        "due date, cycle, milestone, relations and attachments."),
+                        "due date, cycle, milestone, relations, attachments and documents "
+                        "(id, title, url; read one with linear_document)."),
         "parameters": {"type": "object", "properties": {
             "id": {"type": "string", "description": _ISSUE_REF},
             "comments": {"type": "integer", "minimum": 0, "maximum": COMMENTS_MAX,

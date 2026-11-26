@@ -62,7 +62,9 @@ def test_schema_and_registration():
     assert agent_tools.linear_lookup is TOOL_HANDLERS["linear_lookup"]
     assert tools_lookup.HANDLERS == {"linear_lookup": TOOL_HANDLERS["linear_lookup"]}
     assert "linear_lookup" in agent_tools.__all__
-    assert list(TOOL_SCHEMAS)[-1] == list(TOOL_HANDLERS)[-1] == "linear_lookup"
+    names = list(TOOL_SCHEMAS)  # the roster order: right after linear_relation
+    assert names == list(TOOL_HANDLERS)
+    assert names[names.index("linear_relation") + 1] == "linear_lookup"
 
 
 def test_not_gated():

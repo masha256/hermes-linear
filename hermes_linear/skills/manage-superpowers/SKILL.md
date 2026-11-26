@@ -20,7 +20,7 @@ Per-stage differences; work the ticket directly with the tools, per Questions an
 The `linear_*` tools are deferred behind tool search: load a schema with `tool_describe` (exact
 names), then always call via `tool_call`, one entry per call (a batch of plugin tools is
 rejected): `tool_call(calls=[{"name": "linear_issue_get", "arguments": {"id": "RET-12"}}])`. A
-direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The thirteen tools:
+direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The fifteen tools:
 
 - `linear_issue_get` (`id`, `comments?`: newest N threads): fields, relations, attachments, children.
 - `linear_search` (`text?`, `team?`, `project?`, `state?`, `assignee?`, `label?`, `parent?`, …):
@@ -31,31 +31,34 @@ direct call fails as an unknown tool; `linear_x(...)` below is shorthand. The th
 - `linear_issue_update` (`id`, `title?`, `description?`, `state?`, `add_labels?`, `remove_labels?`,
   `parent?`, `project?`, create's others but `team`): `null` clears; `parent: ""` detaches.
 - `linear_comment` (`id`, `body`, `edit_marker?`, `reply_to?`: a comment UUID's thread, `resolve?`).
-- `linear_sync_spec` (`path`) and `linear_sync_plan` (`path`): `path` must be ABSOLUTE.
+- `linear_sync_spec` (`path`, `summary`), `linear_sync_plan` (`path`, `summary`): `path` ABSOLUTE.
 - `linear_task_state` (`id`, `state`, `summary?`, `question?`, `blocked_by?`): states in SDD below.
 - `linear_query` (`query`, `variables?`): read-only GraphQL; a result over 50,000 chars is refused.
 - `linear_attach` (`id` + `path` or `url`, `title?`; or `path` + `embed: true` → `markdown`).
 - `linear_session_link` (`url`, `label?`): show a link (the PR) on this turn's agent session.
 - `linear_relation` (`id`, `type`: `blocks|blocked_by|related|duplicate_of`, `other`).
 - `linear_lookup` (`kind`, `team?`, `project?`, `query?`): the names (and ids) write tools accept.
+- `linear_project` (`action`: `get|post_update|milestone|link`, `project?`, …) and `linear_document`
+  (`action`: `get|create|update`, `id?`, `title?`, `content?`, `issue?|project?`): projects, docs.
 
 They act as the Linear app, never raise and fail as `{"ok": false, "error": …}`. Re-runs are safe (a
 URL re-link is `ALREADY_LINKED`, a relation `ALREADY_RELATED`, any other one between the pair
-`RELATION_CONFLICT`; session links de-duplicate), except that a `path` attach adds a second copy.
-Writes to the session ticket, its descendants and tickets made from it (any turn) just run. Out of
-that scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `linear_attach` and
-`linear_relation` answer `APPROVAL_REQUIRED`; an identical re-call asks a human in Linear. Outside a
-Linear session (Slack, CLI, cron) those five follow `outside_session_writes` and ask in that chat.
+`RELATION_CONFLICT`, a document `create` `ALREADY_EXISTS`; session links de-duplicate), except that a
+`path` attach adds a second copy and `post_update` posts again. Writes to the session ticket, its
+descendants and tickets made from it (any turn), and to documents made from it, just run. Out of that
+scope `linear_comment`, `linear_issue_create`, `linear_issue_update`, `linear_attach`,
+`linear_relation` and `linear_document` answer `APPROVAL_REQUIRED`; an identical re-call asks a human
+in Linear. Every `linear_project` write asks, the session ticket's project included. Outside a Linear
+session (Slack, CLI, cron) these follow `outside_session_writes` and ask in that chat.
 
 ## Questions and approvals
 
 - Every multiple-choice question and approval (**Approve** / **Request changes**) is a
   `clarify` with `choices` (a Linear select), one per call, all needed to answer inside
   the question text (Linear hides the message before it). Open-ended: thread replies.
-- A reply while the select is live answers it in the turn. Otherwise `clarify` returns
-  `outcome: pending`: end the turn now, never assume an answer, don't restate the
-  question (the plugin re-posts it after your final reply). The plugin adds and removes
-  `Blocked` for a pending question itself: no `linear_task_state` `unblocked` for it.
+- A reply while the select is live answers it in the turn. Otherwise `clarify` returns `outcome:
+  pending`: end the turn now, never assume an answer, don't restate the question (the plugin re-posts
+  it after your final reply and sets and clears `Blocked` for it: no `linear_task_state` `unblocked`).
   The answer comes later (restarts too) as the next turn: `Answer to "<question>": <value>`.
 - `Command not run: approval is pending in Linear…`: end the turn. On a later ``Answer to
   approval for `<cmd>`: approved (<choice>)`` re-run exactly `<cmd>` byte for byte in that
@@ -68,15 +71,14 @@ Linear session (Slack, CLI, cron) those five follow `outside_session_writes` and
 
 1. `linear_issue_get` the session ticket: its identifier, team (key: `RET-81` → `RET`), project.
 2. Framework: select via `clarify`; the only choice is `superpowers`.
-3. Repo: a GitHub link among the project's links (`externalLinks`, step 1) is a candidate;
-   the link labelled `repo` wins among several. Offer the result as a select (one repo is
-   still confirmed). With no GitHub link, ask in the ticket (select of known local clones plus
-   "Other") and suggest the user add a project link labelled `repo` (tools can't edit projects).
+3. Repo: a GitHub link among the project's links (`externalLinks`, step 1) is a candidate; the
+   link labelled `repo` wins among several. Offer it as a select (one repo is still confirmed).
+   With no GitHub link, ask in the ticket (select of known local clones plus "Other"), then add
+   its https URL as a project link labelled `repo` (`linear_project` `link`, asks once).
 4. Find a clone whose `origin` matches (workspace, then `~/git/*`); else clone to `~/git/<name>`.
 5. Branch `<identifier lowercase>-<slug>` (e.g. `ret-95-secret-reload`), worked in
    `.worktrees/<branch>`; load `superpowers:using-git-worktrees` for the mechanics.
 6. Commit `.hermes-linear.yaml` at the repo root with real values:
-
    ```yaml
    framework: superpowers
    linear:
@@ -84,7 +86,6 @@ Linear session (Slack, CLI, cron) those five follow `outside_session_writes` and
      project: <project name>
    repo: <GitHub URL chosen in step 3>
    ```
-
    It holds only what the documents do not record; it never changes as work goes on. Later
    sessions on a repo with the file skip setup but still make the sub-project branch and worktree.
 
@@ -94,24 +95,23 @@ Linear session (Slack, CLI, cron) those five follow `outside_session_writes` and
 choices and design-section approvals are selects. No visual companion (it can't work in Linear).
 
 **Spec.** Header line `Linear: <session ticket ID>` (before the first `## ` heading). Commit, then
-`linear_sync_spec` (absolute path). Review gate: a select; each change: edit → commit → sync.
+`linear_sync_spec` (absolute path; `summary`, a few sentences for the description: what it builds
+and the key decisions). Review gate: a select; review reads the `Spec:` document, but answers stay in
+the ticket thread (comments on documents don't reach the session). Each change: edit → commit → sync.
 
-**Plan.** Load `superpowers:writing-plans`. Header line `Linear: <ID>`; tasks keep the
-heading form `### Task N: <name>`. Commit, then `linear_sync_plan` (absolute path). It
-writes the plan comment (header and task list) and one `T<n> · <name>` sub-ticket per
-task (description: the whole task section), and writes the IDs back into the headings
-(`### Task N: <name> — <ID>`). Humans' and Done tickets are untouched. By result: `file_changed:
-true` → commit the plan (the IDs are now in the headings); `file_conflict: true` → the file
-changed during the sync, re-read and sync again; `file_error` → IDs not written, fix and re-sync.
+**Plan.** Load `superpowers:writing-plans`. Header `Linear: <ID>`; task headings `### Task N: <name>`.
+Commit, then `linear_sync_plan` (absolute path; `summary` as for the spec, plus the task count and
+execution method). It makes a `T<n> · <name>` sub-ticket per task (description: its section), puts
+the file in a `Plan:` document, the task list under the description's `---` bar and the IDs into the
+headings (`### Task N: <name> — <ID>`); humans' and Done tickets are untouched. By result:
+`file_changed: true` → commit the plan; `file_conflict: true` → changed mid-sync: re-read, re-sync;
+`file_error` → IDs not written, fix and re-sync. Approval: one select (review reads the `Plan:`
+document) with the execution method (subagent-driven or inline). Later: edit, commit, re-sync, commit.
 
-Plan approval is one select that includes the execution method (subagent-driven or
-inline). A later plan change: edit, commit, `linear_sync_plan`, commit again.
-
-**Implementation.** Load `superpowers:subagent-driven-development`. The ledger's
-line 1 stays its identity line; line 2 is `Linear: <ID>`. Each task's ledger entry
-names its sub-ticket, and commit messages carry the sub-ticket ID. Task progress goes
-on the sub-tickets; the project thread gets only stage changes, stop points and
-questions (a turn that only moves a task along ends with a one-line reply). Then:
+**Implementation.** Load `superpowers:subagent-driven-development`. Ledger line 1 stays its identity
+line, line 2 is `Linear: <ID>`; each task's entry names its sub-ticket, and commit messages carry the
+sub-ticket ID. Task progress goes on the sub-tickets; the project thread gets only stage changes, stop
+points and questions (a turn that only moves a task along ends with a one-line reply). Then:
 - dispatching a task's implementer: `linear_task_state(id, "in_progress")`; its review: `in_review`;
 - a fix round: back to `in_progress` (then `in_review`), plus a `linear_comment` on the sub-ticket
   with the findings being fixed; the clean review: `done` with `summary` (commits, test result,
@@ -138,11 +138,11 @@ umbrella to delegate it to the app (never via other Linear tools or MCP servers;
 
 ## Rules
 
-- Ticket descriptions and the plan comment are written only by the sync tools: fix, commit, re-sync.
-- On a sync failure, keep working (git holds everything). Mark the step `unsynced
-  (<code>)` (in the thread before the ledger exists, then in the ledger); retry at the next
-  sync point and before any approval. Never ask to approve an unsynced spec or plan; ask
-  (select) "Linear sync failed (<code>); retry now or approve from the file link?".
+- Ticket descriptions and the `Spec:` / `Plan:` documents are written only by the sync tools: fix, commit, re-sync.
+- On a sync failure, keep working (git holds everything). Mark the step `unsynced (<code>)` (in the
+  thread before the ledger exists, then in the ledger); retry at the next sync point and before any
+  approval. Never ask to approve an unsynced spec or plan; ask (select) "Linear sync failed
+  (<code>); retry now or approve from the file link?".
 - Edits made in Linear are not synced back. A deleted or canceled sub-ticket whose
   task is still in the plan is recreated on the next plan sync; ask whether to drop it.
 - `T<n> · <name>` task sub-tickets are never delegated (the plugin declines): all SDD work

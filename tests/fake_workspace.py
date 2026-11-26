@@ -52,7 +52,21 @@ Usage::
   Linear answered the live probe: one relation per issue pair; an identical create (or
   ``related`` either way) returns the existing id, any other type or direction replaces it.
 
-Later tasks extend it (documents, …); keep each addition small and listed here.
+- documents and projects (RET-163): ``documents`` (id -> ``{id, slugId, title, content,
+  url, issue, project, creator, updated_at}``; ``add_document`` seeds one) behind
+  ``document_get`` (UUID or slugId; unknown is ``None``) / ``documents_on`` (rows carry
+  ``creator_id``) /
+  ``document_create`` / ``document_update`` (``title``/``content`` only, else
+  ``AssertionError``); ``issue_details`` lists the issue's documents. ``project_detail``
+  reads ``project_meta`` (status, health, lead, target date per project), ``project_links``,
+  ``milestones_rows`` + ``milestone_meta`` and ``project_updates``. As probed: a duplicate
+  document title or link URL is accepted; a duplicate milestone name on create raises
+  Linear's ``INPUT_ERROR`` "name not unique" with its ``userPresentableMessage`` as
+  ``detail``. ``project_update_create`` sets the project's health when given.
+  ``milestone_update`` as probed (RET-166): ``targetDate: null`` clears, ``description``
+  null or ``""`` leaves the description unchanged.
+
+Later tasks extend it; keep each addition small and listed here.
 """
 
 from __future__ import annotations
@@ -142,6 +156,13 @@ class FakeWorkspace:
         self.uploads: dict[str, dict] = {}  # asset URL -> {name, content_type, data}
         self.attachments: dict[str, dict] = {}  # id -> {id, issue, url, title, subtitle}
         self.relations: dict[str, dict] = {}  # id -> {id, type, issue, related}
+        self.documents: dict[str, dict] = {}  # id -> see the module docstring
+        self.project_meta: dict[str, dict] = {}  # project id -> {status, health, lead, ...}
+        self.project_links: dict[str, list[dict]] = {
+            PROJECT["id"]: [{"id": f"link-{n}", **lk}
+                            for n, lk in enumerate(PROJECT["externalLinks"])]}
+        self.milestone_meta: dict[str, dict] = {}  # id -> {project, description, targetDate}
+        self.project_updates: dict[str, list[dict]] = {}  # project id -> oldest first
         self.calls: list[tuple[str, Any]] = []
         self._ids = itertools.count(1)
         self._numbers = itertools.count(100)
@@ -205,7 +226,9 @@ class FakeWorkspace:
         return [c for c in self.calls if c[0] in {
             "issue_create", "issue_update", "comment_create", "comment_update", "file_upload",
             "attachment_create", "attachment_link_url", "attachment_link_github_pr",
-            "relation_create", "comment_resolve"}]
+            "relation_create", "comment_resolve", "document_create", "document_update",
+            "project_update_create", "milestone_create", "milestone_update",
+            "project_link_create"}]
 
     def default_state(self, team: str) -> str:
         """The team's first ``backlog``/``unstarted`` state (see the module docstring)."""
@@ -258,11 +281,13 @@ class FakeWorkspace:
     async def issue_details(self, issue_id: str) -> dict:
         """``LinearClient.issue_details`` for an issue with none of those fields set."""
         self.calls.append(("issue_details", issue_id))
-        self.issue(issue_id)
+        iid = self.issue(issue_id)["id"]
         return {"assignee": None, "delegate": None, "priority": 0,
                 "priorityLabel": "No priority", "estimate": None, "dueDate": None,
                 "cycle": None, "projectMilestone": None, "relations": {"nodes": []},
-                "inverseRelations": {"nodes": []}, "attachments": {"nodes": []}}
+                "inverseRelations": {"nodes": []}, "attachments": {"nodes": []},
+                "documents": {"nodes": [self._doc_row(d) for d in self.documents.values()
+                                        if d["issue"] == iid]}}
 
     def _desc(self, text: str) -> str:
         return normalize_markdown(text) if self.normalize else text
@@ -436,3 +461,165 @@ class FakeWorkspace:
         self.calls.append(("relation_create", (issue_id, related_id, type_)))
         assert type_ in {"blocks", "related", "duplicate", "similar"}, type_
         return self.add_relation(issue_id, related_id, type_)
+
+    # -- documents and projects (RET-163) -------------------------------
+    def add_document(self, title: str, content: str = "", *, issue: str | None = None,
+                     project: str | None = None, creator: str = VIEWER) -> str:
+        """Seed a document on an issue (UUID or identifier) or a project; returns its id."""
+        n = next(self._ids)
+        # UUID-shaped like Linear's (``linear_document`` refuses an id that is neither a
+        # UUID nor a slug id); the slug id is 12 hex digits, as live ones are.
+        did, slug = f"00000000-0000-4000-8000-{n:012x}", f"{n:012x}"
+        self.documents[did] = {
+            "id": did, "slugId": slug, "title": title, "content": content,
+            "url": f"https://linear.app/x/document/doc-{slug}",
+            "issue": self.issue(issue)["id"] if issue else None,
+            "project": self._proj(project)["id"] if project else None,
+            "creator": creator, "updated_at": "2026-11-25T00:00:00.000Z"}
+        return did
+
+    @staticmethod
+    def _doc_row(d: dict) -> dict:
+        return {"id": d["id"], "title": d["title"], "url": d["url"]}
+
+    def _proj(self, project_id: str | None) -> dict:
+        """``_project`` for a required project: a missing or unknown one is NOT_FOUND."""
+        p = self._project(project_id)
+        if p is None:
+            raise _not_found("Project")
+        return p
+
+    def _user_name(self, uid: str | None) -> str | None:
+        return next((u["name"] for u in self.users_rows if u["id"] == uid), None)
+
+    def _doc(self, ref: str) -> dict | None:
+        return self.documents.get(ref) or next(
+            (d for d in self.documents.values() if d["slugId"] == ref), None)
+
+    async def document_get(self, ref: str) -> dict | None:
+        self.calls.append(("document_get", ref))
+        d = self._doc(ref)
+        if d is None:
+            return None
+        issue = self.issues[d["issue"]] if d["issue"] else None
+        project = self._proj(d["project"]) if d["project"] else None
+        return {"id": d["id"], "title": d["title"], "url": d["url"], "content": d["content"],
+                "issue": ({"id": issue["id"], "identifier": issue["identifier"],
+                           "title": issue["title"]} if issue else None),
+                "project": {"id": project["id"], "name": project["name"]} if project else None,
+                "creator": self._user_name(d["creator"]), "updated_at": d["updated_at"]}
+
+    async def documents_on(self, issue_id: str | None = None,
+                           project_id: str | None = None) -> list[dict]:
+        self.calls.append(("documents_on", (issue_id, project_id)))
+        if (issue_id is None) == (project_id is None):
+            raise ValueError("documents_on needs exactly one of issue_id and project_id")
+        if issue_id is not None:
+            key, ref = "issue", self.issue(issue_id)["id"]
+        else:
+            key, ref = "project", self._proj(project_id)["id"]
+        return [{**self._doc_row(d), "creator_id": d["creator"]}
+                for d in self.documents.values() if d[key] == ref]
+
+    async def document_create(self, title: str, content: str, *, issue_id: str | None,
+                              project_id: str | None) -> dict:
+        self.calls.append(("document_create", (title, content, issue_id, project_id)))
+        assert not (issue_id and project_id), "issue_id and project_id"
+        did = self.add_document(title, content, issue=issue_id, project=project_id)
+        return {"id": did, "url": self.documents[did]["url"]}
+
+    async def document_update(self, doc_id: str, fields: dict) -> dict:
+        self.calls.append(("document_update", (doc_id, dict(fields))))
+        assert fields and set(fields) <= {"title", "content"}, set(fields)
+        d = self._doc(doc_id)
+        if d is None:
+            raise _not_found("Document")
+        d.update(fields)
+        return {"id": d["id"], "url": d["url"]}
+
+    def _meta(self, project_id: str) -> dict:
+        return self.project_meta.setdefault(project_id, {
+            "status": "In Progress", "health": None, "lead": None, "targetDate": None})
+
+    async def project_detail(self, project_id: str, updates: int) -> dict:
+        self.calls.append(("project_detail", (project_id, updates)))
+        p = self._proj(project_id)
+        pid, meta = p["id"], self._meta(p["id"])
+        ups = list(reversed(self.project_updates.get(pid, [])))[:updates]
+        return {
+            "id": pid, "name": p["name"], "url": f"https://linear.app/x/project/{pid}",
+            "state": meta["status"], "health": meta["health"], "lead": meta["lead"],
+            "target_date": meta["targetDate"],
+            "links": [dict(lk) for lk in self.project_links.get(pid, [])],
+            "milestones": [{"id": m["id"], "name": m["name"],
+                            "target_date": self.milestone_meta.get(m["id"], {}).get("targetDate")}
+                           for m in self.milestones_rows.get(pid, [])],
+            "documents": [self._doc_row(d) for d in self.documents.values()
+                          if d["project"] == pid],
+            "updates": [{k: u[k] for k in ("id", "created_at", "author", "health", "body")}
+                        for u in ups],
+        }
+
+    async def project_update_create(self, project_id: str, body: str,
+                                    health: str | None) -> dict:
+        self.calls.append(("project_update_create", (project_id, body, health)))
+        assert health in (None, "onTrack", "atRisk", "offTrack"), health
+        pid = self._proj(project_id)["id"]
+        uid = f"pu-{next(self._ids)}"
+        rows = self.project_updates.setdefault(pid, [])
+        # Live probe (RET-165): an update without health takes the project's current health
+        # (the update reads it back too); the project's health stays as it was.
+        if health is None:
+            health = self._meta(pid)["health"]
+        rows.append({"id": uid, "created_at": f"2026-11-25T00:00:{len(rows):02d}.000Z",
+                     "author": self._user_name(VIEWER), "health": health, "body": body})
+        self._meta(pid)["health"] = health
+        return {"id": uid, "url": f"https://linear.app/x/project/{pid}/updates#{uid}"}
+
+    @staticmethod
+    def _dup_milestone(name: str) -> LinearError:
+        return LinearError("name not unique", code="INPUT_ERROR", status=200,
+                           detail=f"A project milestone called '{name}' already exists "
+                                  "on this project.")
+
+    def _milestone_out(self, m: dict) -> dict:
+        return {"id": m["id"], "name": m["name"],
+                "target_date": self.milestone_meta[m["id"]].get("targetDate")}
+
+    async def milestone_create(self, project_id: str, name: str, description: str | None,
+                               target_date: str | None) -> dict:
+        self.calls.append(("milestone_create", (project_id, name, description, target_date)))
+        pid = self._proj(project_id)["id"]
+        rows = self.milestones_rows.setdefault(pid, [])
+        if any(m["name"] == name for m in rows):
+            raise self._dup_milestone(name)
+        m = {"id": f"ms-{next(self._ids)}", "name": name}
+        rows.append(m)
+        self.milestone_meta[m["id"]] = {"project": pid, "description": description,
+                                        "targetDate": target_date}
+        return self._milestone_out(m)
+
+    async def milestone_update(self, milestone_id: str, fields: dict) -> dict:
+        self.calls.append(("milestone_update", (milestone_id, dict(fields))))
+        assert fields and set(fields) <= {"name", "description", "targetDate"}, set(fields)
+        m = next((m for rows in self.milestones_rows.values() for m in rows
+                  if m["id"] == milestone_id), None)
+        if m is None:
+            raise _not_found("ProjectMilestone")
+        meta = self.milestone_meta.setdefault(m["id"], {"description": None,
+                                                        "targetDate": None})
+        if "name" in fields:
+            m["name"] = fields["name"]
+        if "targetDate" in fields:  # null clears (RET-166 probe)
+            meta["targetDate"] = fields["targetDate"]
+        if fields.get("description"):  # null or "" leaves it unchanged (RET-166 probe)
+            meta["description"] = fields["description"]
+        return self._milestone_out(m)
+
+    async def project_link_create(self, project_id: str, url: str, label: str | None) -> dict:
+        self.calls.append(("project_link_create", (project_id, url, label)))
+        pid = self._proj(project_id)["id"]
+        lid = f"link-{next(self._ids)}"
+        self.project_links.setdefault(pid, []).append(
+            {"id": lid, "label": url if label is None else label, "url": url})
+        return {"id": lid}

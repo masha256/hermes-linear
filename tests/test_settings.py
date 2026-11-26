@@ -119,8 +119,9 @@ def test_default_team_and_project_stripped_default_empty():
 
 
 def test_default_project_without_default_team_warns(caplog):
-    """RET-148 review minor 3: default_project alone is never used (it belongs to the
-    default team), so loading warns once naming both settings, and does not fail."""
+    """RET-148 review minor 3: default_project alone is never used by linear_issue_create
+    (it belongs to the default team), so loading warns once naming both settings, and does
+    not fail. RET-122 Ruling 6: linear_project still uses it, and the warning says so."""
     get_config, get_secret = _getters({**REQUIRED_CONFIG, "default_project": "Hermes"})
     with caplog.at_level("WARNING", logger="hermes_linear.settings"):
         s = load_settings(get_config, get_secret, {})
@@ -128,6 +129,8 @@ def test_default_project_without_default_team_warns(caplog):
     [rec] = [r for r in caplog.records if r.name == "hermes_linear.settings"]
     assert rec.levelname == "WARNING"
     assert "default_project" in rec.getMessage() and "default_team" in rec.getMessage()
+    assert "ignored by linear_issue_create" in rec.getMessage()
+    assert "linear_project still uses it" in rec.getMessage()
     caplog.clear()
     get_config, get_secret = _getters({**REQUIRED_CONFIG, "default_team": "RET",
                                        "default_project": "Hermes"})
