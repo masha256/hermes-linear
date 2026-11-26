@@ -1,9 +1,5 @@
 # Hermes Linear Channel
 
-> **Status: pre-release, in development.** This README describes the plugin as designed in
-> [`docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md`](docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md).
-> Commands and settings below are the target interface; until the first release, treat them as a spec.
-
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) channel plugin that turns Linear into a place you work *with* your Hermes agent:
 
 - **Delegate a ticket to your agent → one Hermes session for the whole ticket.** The agent works in the thread Linear opens on delegation (and in any thread where you @mention it). Plain comments from your team and edits to the ticket and its project reach the same conversation as context, so the agent remembers everything about the ticket.
@@ -33,6 +29,8 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
 - [Limitations](#limitations)
+- [Development](#development)
+- [License](#license)
 
 ---
 
@@ -89,7 +87,7 @@ The plugin gives the agent these tools. They act as the Linear app (every write 
 
 ### Attachments
 
-`linear_attach` uploads a file only if Hermes would deliver it as media to any other channel: the path must be absolute, and Hermes's media-delivery policy (`validate_media_delivery_path`) must accept it. Symlinks are judged and read by their target. By default that is any existing regular file outside a denylist: `.env` files anywhere (on Hermes versions that include the check; older ones only deny the listed dirs), `~/.ssh`, `~/.aws`, `~/.gnupg` and the other credential dirs, system dirs such as `/etc`, and Hermes's own state and config (`config.yaml`, `auth.json`, `state.db`, `sessions/`, …). Refused paths answer `PATH_DENIED`; there is no approval for them. In strict mode (`gateway.strict: true` or `HERMES_MEDIA_DELIVERY_STRICT=1`) only the Hermes cache dirs, the dirs in `HERMES_MEDIA_ALLOW_DIRS` and freshly produced files pass. Strict mode also closes the default mode's gap: a credential file outside the denylisted dirs (e.g. `~/.netrc`) passes in default mode.
+`linear_attach` uploads a file only if Hermes would deliver it as media to any other channel: the path must be absolute, and Hermes's media-delivery policy (`validate_media_delivery_path`) must accept it. Symlinks are judged and read by their target. By default that is any existing regular file outside a denylist: `.env` files anywhere, `~/.ssh`, `~/.aws`, `~/.gnupg` and the other credential dirs, system dirs such as `/etc`, and Hermes's own state and config (`config.yaml`, `auth.json`, `state.db`, `sessions/`, …). Refused paths answer `PATH_DENIED`; there is no approval for them. In strict mode (`gateway.strict: true` or `HERMES_MEDIA_DELIVERY_STRICT=1`) only the Hermes cache dirs, the dirs in `HERMES_MEDIA_ALLOW_DIRS` and freshly produced files pass. Strict mode also closes the default mode's gap: a credential file outside the denylisted dirs (e.g. `~/.netrc`) passes in default mode.
 
 - Files over 50 MB are refused (`FILE_TOO_LARGE`).
 - Attaching the same file again adds a second attachment and a second upload (Linear's API cannot delete uploads). Re-linking a URL doesn't: it answers `ALREADY_LINKED`, and the issue keeps one attachment.
@@ -98,7 +96,7 @@ The plugin gives the agent these tools. They act as the Linear app (every write 
 
 ## Requirements
 
-- Hermes Agent with the gateway running (`hermes gateway run` or the systemd service).
+- Hermes Agent v0.23.2 or newer, with the gateway running (`hermes gateway run` or the systemd service).
 - A Linear workspace where you can create an OAuth application (workspace admin).
 - A way for Linear to reach your machine over HTTPS: Tailscale Funnel, Cloudflare Tunnel, ngrok, or a reverse proxy on a public host. See [Expose the webhook](#expose-the-webhook).
 
@@ -408,4 +406,21 @@ Use `hermes -p <profile> linear …` for other profiles. The commands exist only
 
 ## Development
 
-Design spec: [`docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md`](docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md). Work is tracked in the Linear project **hermes-linear** (formerly Valkyrie); dogfooding happens in **hermes linear test project**. Branching, the live checkout and the test-before-PR loop: [`docs/development.md`](docs/development.md).
+Issues and pull requests are welcome. To work on the plugin:
+
+```bash
+git clone https://github.com/masha256/hermes-linear && cd hermes-linear
+scripts/dev-env.sh            # .venv on top of your Hermes install's Python
+.venv/bin/pytest -q
+hermes plugins validate .
+```
+
+CI runs both against the Hermes version in `plugin.yaml`'s `requires_hermes` floor (required) and against hermes-agent `main` (early warning). The plugin uses only Hermes's public plugin API; `hermes plugins validate .` lists any private core import.
+
+- Design docs: the channel's design is [`docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md`](docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md); later features each have a spec in [`docs/superpowers/specs/`](docs/superpowers/specs/) and a plan in [`docs/superpowers/plans/`](docs/superpowers/plans/). They are records of each change as it was built, so this README wins where they differ.
+- Notes on how the plugin hooks into Hermes and superpowers: [`docs/hermes-integration-notes.md`](docs/hermes-integration-notes.md), [`docs/superpowers-integration-notes.md`](docs/superpowers-integration-notes.md).
+- Branching, a live checkout for the gateway, and the test-before-PR loop: [`docs/development.md`](docs/development.md).
+
+## License
+
+[MIT](LICENSE).

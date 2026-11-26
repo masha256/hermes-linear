@@ -27,8 +27,9 @@ jobs:
       matrix:
         hermes:
           # Pinned: the Hermes commit the plugin was last verified against.
-          # Bump deliberately after checking the plugin API notes.
-          - { name: pinned, ref: 3b421578588243f920886e6fe79a6faa87ea026e, experimental: false }
+          # Bump deliberately after checking the plugin API notes. It must equal
+          # plugin.yaml's requires_hermes floor (v0.23.2), so the floor is what CI tests.
+          - { name: pinned, ref: ae2a81ccc00e9b7c06301523e5bb09608397149c, experimental: false }
           # Early warning for public plugin-API drift; never blocks a merge.
           - { name: main, ref: main, experimental: true }
     steps:

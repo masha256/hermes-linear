@@ -44,11 +44,11 @@ loaded commit.
 1. Branch from `main`, fix with tests (TDD), push the branch. CI runs on every
    branch push: `pytest` + `hermes plugins validate` against the pinned
    hermes-agent commit (required) and hermes-agent `main` (early warning).
-2. `scripts/deploy-live <branch>`; restart; test it live in the Linear project
-   **hermes linear test project**.
+2. `scripts/deploy-live <branch>`; restart; test it live in a
+   Linear workspace you use for testing.
 3. Works: open the PR, CI green, merge (merge commit, not squash, so dependent
    branches stay clean descendants). Doesn't: iterate on the same branch.
 4. After a merge: `scripts/deploy-live main` (or the next stack); restart.
 
-Linear issues for plugin work live in the **hermes-linear** project; dogfooding
-tickets go in **hermes linear test project**.
+Keep live-test tickets in a separate Linear project (or workspace), so test
+sessions and the tickets they create stay away from real work.
