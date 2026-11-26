@@ -28,9 +28,10 @@ SELF = "uuid-self"
 FIXTURE = Path(__file__).parent / "fixtures" / "plans" / "channel-plan.md"
 MARKER = "<!-- hermes-linear:plan -->"
 SUMMARY = "Builds the thing in 3 tasks; executed subagent-driven."
-SPEC_DESC = ("The spec summary.\n\n**Spec:** [Spec: Thing](https://linear.app/x/document/s) · "
-             "source [docs/spec.md @ abc1234](https://example.invalid/spec.md)\n"
-             "<!-- hermes-linear:spec -->")
+#: RET-171 layout: the brief, then the spec part opened by a bar and its marker.
+SPEC_DESC = ("Build with hermes.\n\nThe brief.\n\n---\n<!-- hermes-linear:spec-part -->\n"
+             "The spec summary.\n\n**Spec:** [Spec: Thing](https://linear.app/x/document/s) · "
+             "source [docs/spec.md @ abc1234](https://example.invalid/spec.md)")
 TITLE = "Plan: Thing — Implementation Plan"
 
 
@@ -709,7 +710,7 @@ def test_human_comment_with_marker_untouched(pin_ctx, ws, plan):
 
 
 def test_plan_without_spec_part_appends_under_brief(pin_ctx, ws, plan):
-    brief = "Manage with hermes-linear.\n\nThe brief: build the thing.\n\n"
+    brief = "Build with hermes.\n\nThe brief: build the thing.\n\n"
     ws.issue(SELF)["description"] = brief
     out = sync_plan(plan)
     (doc,) = plan_docs(ws)

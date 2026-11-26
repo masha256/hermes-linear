@@ -24,10 +24,11 @@ from hermes_linear import agent_tools, sync
 from hermes_linear.agent_tools import TOOL_HANDLERS, TOOL_SCHEMAS, linear_sync_spec
 from hermes_linear.linear_client import LinearError
 from hermes_linear.store import Store
-from hermes_linear.sync import (PLAN_PART_MARKER, SPEC_PART_MARKER, SYNC_DOCUMENT_MAX,
-                                SYNC_SUMMARY_MAX, TRUNCATED, doc_title, document_content,
-                                footer, git_short_commit, read_linear_header, source_info,
-                                source_line, spec_part, split_plan_part)
+from hermes_linear.sync import (LEGACY_SPEC_MARKER, PLAN_PART_MARKER, SPEC_PART_MARKER,
+                                SYNC_DOCUMENT_MAX, SYNC_SUMMARY_MAX, TRUNCATED, doc_title,
+                                document_content, footer, git_short_commit,
+                                read_linear_header, source_info, source_line, spec_part,
+                                split_plan_part, split_spec_part)
 
 SELF = "uuid-self"
 FOOTER_TAIL = " · edit by asking in this thread"
@@ -133,7 +134,8 @@ def _docs(ws, issue=SELF):
 
 def test_constants():
     assert SYNC_SUMMARY_MAX == 5_000 and SYNC_DOCUMENT_MAX == 250_000
-    assert SPEC_PART_MARKER == "<!-- hermes-linear:spec -->"
+    assert SPEC_PART_MARKER == "<!-- hermes-linear:spec-part -->"
+    assert LEGACY_SPEC_MARKER == "<!-- hermes-linear:spec -->"  # RET-122's closing marker
     assert PLAN_PART_MARKER == "<!-- hermes-linear:plan -->"
     for gone in ("render_spec", "spec_summary", "spec_description"):
         assert not hasattr(sync, gone)
@@ -201,13 +203,39 @@ def test_source_line():
 
 
 def test_spec_part():
-    assert spec_part("Sum.", "**Spec:** x") == f"Sum.\n\n**Spec:** x\n{SPEC_PART_MARKER}"
+    """RET-171: the spec part opens with a bar and its marker, like the plan part."""
+    assert spec_part("Sum.", "**Spec:** x") == f"---\n{SPEC_PART_MARKER}\nSum.\n\n**Spec:** x"
+
+
+SPEC_P = spec_part("Sum.", "**Spec:** x")
+LEGACY_P = f"Old sum.\n\n**Spec:** y\n{LEGACY_SPEC_MARKER}"
+
+
+@pytest.mark.parametrize("desc, want", [
+    (None, ("", None, "")),
+    ("just a brief", ("just a brief", None, "")),
+    (f"Brief.\n\n{SPEC_P}", ("Brief.\n\n", SPEC_P, "")),
+    (f"Brief.\n\n{SPEC_P}\n\n{PLAN_PART}", ("Brief.\n\n", f"{SPEC_P}\n\n", PLAN_PART)),
+    # Linear inserts a blank line after a `---` on save: the bar still opens the part
+    (f"Brief.\n\n---\n\n{SPEC_P[4:]}", ("Brief.\n\n", f"---\n\n{SPEC_P[4:]}", "")),
+    (SPEC_P, ("", SPEC_P, "")),  # empty brief: the part still starts with its bar
+    (f"Brief.\n\n{PLAN_PART}", ("Brief.\n\n", None, PLAN_PART)),
+    # a brief with its own bar further up keeps it
+    (f"a\n\n---\n\nb\n\n{SPEC_P}", ("a\n\n---\n\nb\n\n", SPEC_P, "")),
+    # legacy (RET-122): the old part closes with its marker; everything up to it is the part
+    (f"{LEGACY_P}\n\n{PLAN_PART}", ("", f"{LEGACY_P}\n\n", PLAN_PART)),
+    (LEGACY_P, ("", LEGACY_P, "")),
+    # text a human added below a legacy part is kept as the brief
+    (f"{LEGACY_P}\n\nHuman note.", ("Human note.", LEGACY_P, "")),
+])
+def test_split_spec_part(desc, want):
+    assert split_spec_part(desc) == want
 
 
 def test_split_plan_part():
     assert split_plan_part(None) == ("", None)
     assert split_plan_part("just a brief") == ("just a brief", None)
-    head = f"Sum.\n\n**Spec:** x\n{SPEC_PART_MARKER}\n\n"
+    head = f"Brief.\n\n{SPEC_P}\n\n"
     assert split_plan_part(head + PLAN_PART) == (head, PLAN_PART)
     # Linear inserts a blank line after a `---` on save: the bar still belongs to the part
     normalized = PLAN_PART.replace("---\n", "---\n\n", 1)
@@ -344,10 +372,11 @@ def test_summary_required(pin_ctx, ws, repo, summary):
 def test_summary_at_limit_and_stripped(pin_ctx, ws, repo):
     out = sync_spec(repo / "docs" / "spec.md", "  " + "s" * SYNC_SUMMARY_MAX + "\n")
     assert out["ok"] is True
-    assert ws.issues[SELF]["description"].startswith("s" * SYNC_SUMMARY_MAX + "\n\n**Spec:**")
+    assert ws.issues[SELF]["description"].startswith(
+        f"old\n\n---\n{SPEC_PART_MARKER}\n" + "s" * SYNC_SUMMARY_MAX + "\n\n**Spec:**")
 
 
-def test_first_sync_creates_doc_and_replaces_description(pin_ctx, ws, repo, adapter):
+def test_first_sync_creates_doc_and_keeps_brief(pin_ctx, ws, repo, adapter):
     f = repo / "docs" / "spec.md"
     head = _git(repo, "rev-parse", "--short", "HEAD")
     out = sync_spec(f)
@@ -361,9 +390,9 @@ def test_first_sync_creates_doc_and_replaces_description(pin_ctx, ws, repo, adap
         f"{SPEC.rstrip()}\n\n---\nSource: docs/spec.md @ {head}{FOOTER_TAIL}")
     link = f"https://github.com/acme/widgets/blob/{head}/docs/spec.md"
     want = spec_part(SUMMARY, source_line("Spec", TITLE, doc["url"], info))
-    assert ws.issues[SELF]["description"] == want  # the brief ("old") is replaced
-    assert want == (f"{SUMMARY}\n\n**Spec:** [{TITLE}]({doc['url']}) · source "
-                    f"[docs/spec.md @ {head}]({link})\n{SPEC_PART_MARKER}")
+    assert ws.issues[SELF]["description"] == f"old\n\n{want}"  # RET-171: the brief stays
+    assert want == (f"---\n{SPEC_PART_MARKER}\n{SUMMARY}\n\n**Spec:** [{TITLE}]({doc['url']}) "
+                    f"· source [docs/spec.md @ {head}]({link})")
     assert adapter._store.documents_by(SELF) == {doc["id"]}
     assert _names(ws) == ["document_create", "issue_update"]  # document first
     assert ws.writes()[0][1][2] == SELF  # on the header ticket
@@ -385,8 +414,8 @@ def test_resync_updates_same_doc(pin_ctx, ws, repo, adapter):
     assert "## 3. More" in doc["content"]
     assert _names(ws, n) == ["document_update", "issue_update"]
     assert set(ws.writes()[n][1][1]) == {"title", "content"}
-    assert ws.issues[SELF]["description"].startswith("New summary.\n\n**Spec:** "
-                                                     "[Spec: Thing v2](")
+    assert ws.issues[SELF]["description"].startswith(
+        f"old\n\n---\n{SPEC_PART_MARKER}\nNew summary.\n\n**Spec:** [Spec: Thing v2](")
     assert adapter._store.documents_by(SELF) == {doc["id"]}
     # the same H1 again: the title is not sent
     f.write_text(f.read_text(encoding="utf-8") + "\nmore\n", encoding="utf-8")
@@ -478,11 +507,58 @@ def test_keeps_plan_part(pin_ctx, ws, repo, bar):
     out = sync_spec(repo / "docs" / "spec.md")
     head = spec_part(SUMMARY, source_line("Spec", TITLE, out["document_url"],
                                           source_info(repo / "docs" / "spec.md")))
-    assert ws.issues[SELF]["description"] == f"{head}\n\n{plan_part}"
+    assert ws.issues[SELF]["description"] == f"The old brief.\n\n{head}\n\n{plan_part}"
     assert ws.issues[SELF]["description"].endswith(plan_part)  # byte for byte
     n = len(ws.writes())
     assert sync_spec(repo / "docs" / "spec.md")["ok"] is True
     assert _names(ws, n) == []  # unchanged: no rewrite, the plan part still intact
+
+
+def test_resync_keeps_brief_edits(pin_ctx, ws, repo):
+    """RET-171: a human's edits to the brief survive every spec re-sync."""
+    f = repo / "docs" / "spec.md"
+    sync_spec(f)
+    part = ws.issues[SELF]["description"][len("old\n\n"):]
+    ws.issues[SELF]["description"] = f"Edited brief.\n\n---\n\nwith its own bar\n\n{part}"
+    n = len(ws.writes())
+    assert sync_spec(f)["ok"] is True
+    assert _names(ws, n) == []  # same summary: nothing to write
+    sync_spec(f, "New summary.")
+    desc = ws.issues[SELF]["description"]
+    assert desc.startswith("Edited brief.\n\n---\n\nwith its own bar\n\n---\n")
+    assert "New summary." in desc and SUMMARY not in desc
+    assert desc.count(SPEC_PART_MARKER) == 1
+
+
+@pytest.mark.parametrize("plan", ["", "\n\n" + PLAN_PART])
+def test_legacy_layout_converted(pin_ctx, ws, repo, plan):
+    """RET-122 descriptions end their spec part with the old marker and kept no brief: the
+    whole old part is replaced by the new layout; the plan part stays byte for byte."""
+    ws.issues[SELF]["description"] = LEGACY_P + plan
+    out = sync_spec(repo / "docs" / "spec.md")
+    head = spec_part(SUMMARY, source_line("Spec", TITLE, out["document_url"],
+                                          source_info(repo / "docs" / "spec.md")))
+    assert ws.issues[SELF]["description"] == head + plan
+    n = len(ws.writes())
+    sync_spec(repo / "docs" / "spec.md")
+    assert _names(ws, n) == []
+
+
+def test_resync_with_brief_after_linear_normalization(pin_ctx, loop, repo):
+    """Linear stores a blank line after `---` and `* ` bullets: an unchanged re-sync still
+    makes no write, and a changed one keeps the brief."""
+    w = FakeWorkspace(normalize=True)
+    w.add_issue("RET-1", title="Session issue", uuid=SELF, description="Brief:\n- a\n- b")
+    pin_ctx(ad=new_adapter(loop, client=w))
+    f = repo / "docs" / "spec.md"
+    assert sync_spec(f)["ok"] is True
+    w.issues[SELF]["description"] = w.issues[SELF]["description"].replace("---\n", "---\n\n")
+    n = len(w.writes())
+    sync_spec(f)
+    assert [c[0] for c in w.writes()[n:]] == []
+    sync_spec(f, "Other.")
+    desc = w.issues[SELF]["description"]
+    assert desc.startswith("Brief:\n\n* a\n* b\n\n---\n") and desc.count(SPEC_PART_MARKER) == 1
 
 
 def test_out_of_tree_refused(pin_ctx, ws, tmp_path):
@@ -521,16 +597,18 @@ def test_uncommitted_source_line(pin_ctx, ws, tmp_path):
     assert doc["content"].endswith(f"Source: {info.path} @ uncommitted{FOOTER_TAIL}\n\n"
                                    f"<!-- hermes-linear:h={sync.read_desc_hash(doc['content'])} -->")
     assert ws.issues[SELF]["description"] == (
-        f"{SUMMARY}\n\n**Spec:** [Spec: Loose]({doc['url']}) · source "
-        f"[{info.path} @ uncommitted]({info.link})\n{SPEC_PART_MARKER}")
+        f"old\n\n---\n{SPEC_PART_MARKER}\n{SUMMARY}\n\n**Spec:** [Spec: Loose]({doc['url']}) "
+        f"· source [{info.path} @ uncommitted]({info.link})")
 
 
-def test_summary_markers_dropped(pin_ctx, ws, repo):
+@pytest.mark.parametrize("marker", [PLAN_PART_MARKER, SPEC_PART_MARKER, LEGACY_SPEC_MARKER])
+def test_summary_markers_dropped(pin_ctx, ws, repo, marker):
     """A summary cannot smuggle a part marker in: it would split the description later."""
-    out = sync_spec(repo / "docs" / "spec.md", f"Sum {PLAN_PART_MARKER} end.")
+    out = sync_spec(repo / "docs" / "spec.md", f"Sum {marker} end.")
     assert out["ok"] is True
     desc = ws.issues[SELF]["description"]
-    assert PLAN_PART_MARKER not in desc and desc.startswith("Sum end.")
+    assert desc.count(SPEC_PART_MARKER) == 1 and LEGACY_SPEC_MARKER not in desc
+    assert PLAN_PART_MARKER not in desc and f"{SPEC_PART_MARKER}\nSum end." in desc
     assert split_plan_part(desc)[1] is None
 
 
@@ -546,7 +624,7 @@ def test_description_failure_reports_document(pin_ctx, ws, repo, monkeypatch):
     pin_ctx()
     again = sync_spec(repo / "docs" / "spec.md")  # a re-run finds the document and finishes
     assert again["ok"] is True and again["document_skipped"] is True
-    assert len(_docs(ws)) == 1 and ws.issues[SELF]["description"].startswith(SUMMARY)
+    assert len(_docs(ws)) == 1 and SUMMARY in ws.issues[SELF]["description"]
 
 
 def test_document_failure_writes_nothing_else(pin_ctx, ws, repo, monkeypatch):
@@ -580,7 +658,8 @@ def test_sync_child_header_in_scope(pin_ctx, ws, tmp_path):
     assert sync_spec(f)["issue"] == "RET-2"
     (doc,) = _docs(ws, "uuid-child")
     assert doc["title"] == "Spec: s" and doc["content"].startswith("Linear: RET-2")
-    assert ws.issues["uuid-child"]["description"].startswith(SUMMARY)
+    # no brief: the part is the whole description, bar first
+    assert ws.issues["uuid-child"]["description"].startswith(f"---\n{SPEC_PART_MARKER}\n{SUMMARY}")
 
 
 def test_missing_header_error(pin_ctx, ws, tmp_path):

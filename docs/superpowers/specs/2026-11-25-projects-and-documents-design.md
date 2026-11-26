@@ -31,7 +31,7 @@ write is attributed to the app.
 | # | Question | Decision |
 |---|----------|----------|
 | Q1 | Ship `linear_mutate`? | **No.** D ships typed tools; `linear_query` stays the generic read. A typed tool is added when a real gap shows up. |
-| Q2 | Can `linear_sync_spec` write to a Linear document? | First answered **No**; **reopened by Mike after reviewing on web (Q2')**: spec and plan each sync to a document on the header ticket, the description becomes a summary plus links with the plan part after a `---` bar, and the plan comment is dropped. Folded into D (§6). |
+| Q2 | Can `linear_sync_spec` write to a Linear document? | First answered **No**; **reopened by Mike after reviewing on web (Q2')**: spec and plan each sync to a document on the header ticket, the description becomes a summary plus links with the plan part after a `---` bar (amended by RET-171: both parts go below the kept brief, §6.3), and the plan comment is dropped. Folded into D (§6). |
 | Q2a | Where the description's summary comes from | **Agent-written**: both sync tools take a required `summary` argument, used as given. |
 | Q2b | Document titles and re-sync lookup | `Spec: <H1>` / `Plan: <H1>`, found by the `Spec:` / `Plan:` prefix among the **app's own** documents on the header ticket; a changed H1 retitles the same document; two matches → `AMBIGUOUS`, nothing written. |
 | Q3 | Which project and document writes run without asking | A **document follows issue scope**: it runs with no prompt when it is attached to an in-scope issue or the session ticket's tools created it. **Project updates, milestones, project links and project documents always ask**, the session ticket's own project included. |
@@ -315,14 +315,19 @@ and its scope rule are unchanged: the header ticket must be in the session tree,
 
 ### 6.3 The description
 
-Two parts, each owned by one tool, separated by hidden markers (HTML comments survive
-Linear's markdown normalization, probe P8):
+**Amended by RET-171** (Mike, after RET-172 lost its brief on the first spec sync): the
+spec sync no longer replaces the brief. The original description stays on top, and each
+tool owns one section below it, opened by a `---` bar and a hidden marker (HTML comments
+survive Linear's markdown normalization, probe P8):
 
 ```
+<brief: the original description, never rewritten by the sync tools>
+
+---
+<!-- hermes-linear:spec-part -->
 <spec summary>
 
 **Spec:** [Spec: <H1>](<doc url>) · source [<path> @ <commit>](<link>)
-<!-- hermes-linear:spec -->
 
 ---
 <!-- hermes-linear:plan -->
@@ -337,17 +342,26 @@ Linear's markdown normalization, probe P8):
 
 `<commit>` is `uncommitted` when `source_info` has none (as the footer says today).
 
-- **Spec sync:** the new spec part, followed by the plan part from the current
-  description (from the line `---` directly before `<!-- hermes-linear:plan -->` to the
-  end) when there is one. Everything else is replaced, so the first spec sync replaces
-  the brief (it stays in the description history).
+- **Spec sync:** only the spec part is rewritten (`sync.with_spec_part`). It runs from the
+  `---` line directly before `<!-- hermes-linear:spec-part -->` (blank lines between
+  allowed, since Linear inserts one on save) to the plan part, or to the end. With no spec
+  part yet it goes below the brief, before any plan part. With an empty brief the
+  description starts with the part's bar. The brief and the plan part are kept as they
+  are, so a human's edits to the brief survive every re-sync.
+  ~~Everything else is replaced, so the first spec sync replaces the brief (it stays in the
+  description history).~~ (RET-122 rule, superseded by RET-171.)
+- **Legacy layout** (written before RET-171, e.g. RET-122, RET-172): the spec part ended
+  with `<!-- hermes-linear:spec -->` (`LEGACY_SPEC_MARKER`) and no brief was kept. Everything
+  up to and including that marker is the old spec part and is replaced with the new
+  layout; text after it (above the plan part) is kept as the brief. Briefs already lost
+  stay lost: Linear's issue history records only that the description changed.
 - **Plan sync:** the current description up to (excluding) its plan part, `rstrip()`ed;
   with no plan part yet, the whole current description. Then `\n\n` and the new plan part.
   Task lines are written after the sub-tickets exist, so they carry the IDs.
 - Size: the spec part is bounded (summary ≤ 5,000 plus one source line). The **plan sync**
   fits its own part into `SPEC_INLINE_MAX` (200,000) minus what precedes it, cutting the
-  task list first, then the summary. The spec sync never cuts the plan part (it keeps it
-  byte for byte); if Linear still refuses, its error is returned with `document_id`.
+  task list first, then the summary. The spec sync never cuts the brief or the plan part (it
+  keeps both byte for byte); if Linear still refuses, its error is returned with `document_id`.
 - The description is written only when it changed (compared after the same
   normalization the hash uses), so a no-op re-sync makes no issue update.
 

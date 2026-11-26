@@ -1149,10 +1149,8 @@ async def _sync_spec(ctx: ToolContext, a: dict) -> dict:
     doc = await _sync_document(ctx, issue, "Spec", a["title"], a["content"])
     current = issue.get("description")
     source = sync.source_line("Spec", a["title"], doc["document_url"] or "", a["info"])
-    new = sync.spec_part(a["summary"], source)
-    _before, plan_part = sync.split_plan_part(current)
-    if plan_part is not None:
-        new = f"{new}\n\n{plan_part}"
+    # RET-171: only the spec part is rewritten; the brief above it and the plan part stay.
+    new = sync.with_spec_part(current, sync.spec_part(a["summary"], source))
     url = issue.get("url")
     if not sync.same_description(current, new):
         try:
@@ -1698,9 +1696,11 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "again by the 'Spec:' title prefix among the app's own documents "
                         "(a changed H1 retitles it; a human's document is never touched; "
                         "an unchanged file is not rewritten; over 250,000 chars the file is "
-                        "cut with a link, inline: false). The ticket description becomes "
-                        "your summary plus a link line to the document and the source; "
-                        "the plan part after it (written by linear_sync_plan) is kept. Two "
+                        "cut with a link, inline: false). In the ticket description only the "
+                        "spec part is rewritten: after a '---' bar below the brief, your "
+                        "summary plus a link line to the document and the source. The brief "
+                        "above it and the plan part below it (written by linear_sync_plan) "
+                        "are kept. Two "
                         "app documents with the prefix -> AMBIGUOUS with their ids, nothing "
                         "written. Commit the file first; uncommitted edits are marked as "
                         "such."),
@@ -1727,8 +1727,8 @@ TOOL_SCHEMAS: dict[str, dict] = {
                         "'Plan:' title prefix among the app's own documents (a human's "
                         "document is never touched; an unchanged file is not rewritten; "
                         "over 250,000 chars it is cut with a link, inline: false). The "
-                        "ticket description keeps everything above its plan part (the spec "
-                        "summary, or the brief) and gets, after a '---' bar, your summary, "
+                        "ticket description keeps everything above its plan part (the brief "
+                        "and the spec part) and gets, after a '---' bar, your summary, "
                         "a link line to the document and the source, and the task list "
                         "'T<n> · <name> — <ID>' (cut to fit, task lines first). An old plan "
                         "comment is edited once to 'Plan moved to <document link>' "
