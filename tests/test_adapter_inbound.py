@@ -146,8 +146,9 @@ class FakeListener:
     def register(self, ep):
         self.endpoints[ep.profile] = ep
 
-    def unregister(self, profile):
-        self.endpoints.pop(profile, None)
+    def unregister(self, profile, endpoint=None):
+        if endpoint is None or self.endpoints.get(profile) is endpoint:
+            self.endpoints.pop(profile, None)
         self.unregistered.append(profile)
 
     async def wait_idle(self):

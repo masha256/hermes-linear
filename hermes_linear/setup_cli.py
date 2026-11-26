@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
-from .constants import TEST_WEBHOOK_PREFIX
+from .constants import LISTENER_ERROR_KEY, TEST_WEBHOOK_PREFIX
 from .settings import (
     ALLOWED_USERS_ENV, CLIENT_SECRET_KEY, DEFAULT_LISTENER_HOST,
     DEFAULT_LISTENER_PORT, WEBHOOK_SECRET_KEY, SettingsError, load_scoped_settings,
@@ -379,6 +379,9 @@ def run_status(env: CliEnv) -> int:
     else:
         out(f"last event:    {_fmt_ts(last, env.now())}")
         out(f"last Linear event: {_fmt_ts(last_real, env.now())}")
+        failure = _listener_failure(env, store)
+        if failure:
+            out(f"  ⚠ {failure}")
     for line in _access_lines(settings):
         out(line)
     adapter = env.adapters.get(env.profile)
@@ -437,6 +440,19 @@ _HINTS = {
 }
 
 
+def _listener_failure(env: CliEnv, store: Any = None) -> str | None:
+    """The gateway's recorded listener failure for this profile (RET-181), as one line."""
+    try:
+        store = store if store is not None else env.open_store()
+        row = store.plugin_status(LISTENER_ERROR_KEY) if store is not None else None
+    except Exception:  # noqa: BLE001 - diagnostics only
+        return None
+    if not row:
+        return None
+    text, at = row
+    return f"last connect failed {_fmt_ts(at, env.now())}: {text}"
+
+
 async def run_test(env: CliEnv) -> int:
     out = env.out
     try:
@@ -455,6 +471,10 @@ async def run_test(env: CliEnv) -> int:
         out(f"POST {url} → failed: {type(exc).__name__} (is the gateway running?)")
         return 1
     hint = _HINTS.get(status)
+    if status == 404:
+        failure = _listener_failure(env)
+        if failure:
+            hint = f"profile not registered on the listener; the gateway's {failure}"
     out(f"POST {url} → {status}" + (f" ({hint})" if hint else ""))
     return 0 if status == 200 else 1
 

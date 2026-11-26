@@ -1,6 +1,9 @@
 """Process-wide Linear webhook listener (spec §7.1).
 
-One aiohttp server serves every Hermes profile at ``POST /linear/<profile>/webhook``.
+One aiohttp server per ``host:port`` serves every Hermes profile configured for it at
+``POST /linear/<profile>/webhook``. Hermes imports a separate copy of this module per
+profile scope, so the listeners live in a registry outside any copy (``_REGISTRY_NAME`` in
+``sys.modules``, see ``get_listener``), not in a module global (RET-181).
 Checks run in this exact order:
 
 1. unknown profile / channel not enabled (no webhook secret) -> 404, body unread
@@ -24,8 +27,11 @@ import hmac
 import inspect
 import json
 import logging
+import sys
+import threading
 import time
 import traceback
+import types
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -46,6 +52,10 @@ def verify_signature(secret: bytes, body: bytes, header: str) -> bool:
     expected = hmac.new(secret, body, hashlib.sha256).hexdigest().encode("ascii")
     given = header.strip().lower().encode("utf-8", "replace")
     return hmac.compare_digest(expected, given)
+
+
+class ListenerProtocolError(RuntimeError):
+    """The process's listener registry was made by a plugin copy with another protocol."""
 
 
 @dataclass
@@ -135,9 +145,20 @@ class WebhookListener:
         self._endpoints[ep.profile] = ep
         self._schedule_reconcile()
 
-    def unregister(self, profile: str) -> None:
-        self._endpoints.pop(profile, None)
+    def unregister(self, profile: str, endpoint: Any = None) -> None:
+        """Remove ``profile``'s route; with ``endpoint``, only if it is still that one (a
+        reconnect's fresh adapter may have replaced it)."""
+        current = self._endpoints.get(profile)
+        if current is None or (endpoint is not None and current is not endpoint):
+            return
+        del self._endpoints[profile]
         self._schedule_reconcile()
+
+    @property
+    def disposable(self) -> bool:
+        """No routes, not bound, no start/stop pending: safe to replace with a fresh one."""
+        return (not self._endpoints and self._runner is None
+                and (self._lifecycle is None or self._lifecycle.done()))
 
     def _schedule_reconcile(self) -> None:
         if not self._autostart:
@@ -159,10 +180,8 @@ class WebhookListener:
                     await self._stop_locked()
             except Exception as exc:  # e.g. port already in use
                 self.start_error = exc
-                logger.error(
-                    "Linear webhook listener %s:%s failed: %s",
-                    self.host, self.port, type(exc).__name__,
-                )
+                logger.error("Linear webhook listener %s:%s failed: %s",
+                             self.host, self.port, error_text(exc))
 
     async def wait_idle(self) -> None:
         """Wait until scheduled start/stop work has finished (tests, shutdown)."""
@@ -285,22 +304,71 @@ class WebhookListener:
             logger.debug("delivery traceback (%s):\n%s", type(exc).__name__, frames)
 
 
-_LISTENER: WebhookListener | None = None
+def error_text(exc: BaseException) -> str:
+    """Exception class, plus errno and its strerror for OS errors (never the message:
+    other exceptions may echo payload text)."""
+    name = type(exc).__name__
+    errno = getattr(exc, "errno", None)
+    if isinstance(exc, OSError) and errno is not None:
+        return f"{name} errno {errno} ({exc.strerror or 'no description'})"
+    return name
 
 
-def get_listener(host: str, port: int) -> WebhookListener:
-    """Process-wide listener; the first call fixes host and port."""
-    global _LISTENER
-    if _LISTENER is None:
-        _LISTENER = WebhookListener(host, port)
-    elif (host, port) != (_LISTENER.host, _LISTENER.port):
-        logger.warning(
-            "Linear webhook listener already configured on %s:%s; ignoring %s:%s",
-            _LISTENER.host, _LISTENER.port, host, port,
-        )
-    return _LISTENER
+# ------------------------------------------------------------ shared registry
+#
+# Every plugin copy in the process (one per profile scope, possibly different plugin
+# versions) drives listeners another copy may have built, so this surface is a protocol.
+# Bump SHARED_PROTOCOL whenever any of it changes:
+#   registry: protocol, owner (module name), lock (threading.Lock),
+#             listeners {(host, port): listener}
+#   listener: host, port, running, bound_port, start_error, disposable,
+#             register(endpoint), unregister(profile, endpoint), wait_idle()
+#   endpoint (duck-typed, read by the listener's handler): profile, webhook_secret(),
+#             client_id, deliver(payload), seen(dedup_key)
+# All adapters of a multiplexed gateway connect on the gateway's one event loop
+# (gateway/run_adapters.py awaits each profile's connect in turn), so ``deliver`` is
+# called on that loop with no thread hop.
+
+SHARED_PROTOCOL = 1
+_REGISTRY_NAME = "_hermes_linear_listener_registry"  # outside hermes_plugins.*: the loader's
+# eviction of a reloaded plugin copy never drops it.
+
+
+def _registry() -> types.ModuleType:
+    fresh = types.ModuleType(_REGISTRY_NAME, "Linear webhook listeners shared by plugin copies")
+    fresh.protocol = SHARED_PROTOCOL  # type: ignore[attr-defined]
+    fresh.owner = __name__  # type: ignore[attr-defined]
+    fresh.lock = threading.Lock()  # type: ignore[attr-defined]
+    fresh.listeners = {}  # type: ignore[attr-defined]
+    reg = sys.modules.setdefault(_REGISTRY_NAME, fresh)  # atomic: first copy wins
+    theirs = getattr(reg, "protocol", None)
+    if theirs != SHARED_PROTOCOL:
+        raise ListenerProtocolError(
+            f"Linear webhook listener protocol mismatch: {__name__} speaks protocol "
+            f"{SHARED_PROTOCOL}, but this process's shared listener was set up by "
+            f"{getattr(reg, 'owner', '?')} with protocol {theirs}. Every profile in one "
+            "gateway must run plugin versions with the same listener protocol: update the "
+            "older install, then restart the gateway.")
+    return reg
+
+
+def get_listener(host: str, port: int, endpoint: Any = None) -> WebhookListener:
+    """The process-wide listener for ``host:port``, shared by every plugin copy.
+
+    With ``endpoint``, registers it in the same critical section, so no other copy can
+    swap an idle listener out between lookup and registration. Raises
+    ``ListenerProtocolError`` when the registry speaks another protocol.
+    """
+    reg = _registry()
+    with reg.lock:
+        lst = reg.listeners.get((host, port))
+        if lst is None or lst.disposable:
+            lst = WebhookListener(host, port)
+            reg.listeners[(host, port)] = lst
+        if endpoint is not None:
+            lst.register(endpoint)
+        return lst
 
 
 def _reset_listener_for_tests() -> None:
-    global _LISTENER
-    _LISTENER = None
+    sys.modules.pop(_REGISTRY_NAME, None)
