@@ -425,6 +425,20 @@ sync tools change to match.
   the UUID or the URL's last `-` segment straight to it. `Project.status { name }`,
   `lead`, `targetDate`, `health` and `documents` read fine as the app.
 
+### 5.2 Live test result (2026-11-25, live `2568632`)
+
+Passed. Steps 1–6, the milestone rename onto a taken name (step 8) and step 12 ran on
+RET-170, with 5 cards in its thread and every result read back from Linear. Steps 7, 9
+and 10 ran on RET-122 itself: a `Spec:` and a `Plan:` document were created, the old plan
+comment became the pointer, and a second identical re-sync of each wrote nothing (no new
+issue-history entry, `document_skipped: true`). Linear stores the link line with angle
+brackets (`[title](<url>)`), `- ` becomes `* `, and blank lines are added after `---`
+and `**Tasks:**`. `same_description` treats those as unchanged, so there is no rewrite
+loop. Step 11: a trashed document (`documentDelete`, which is Linear's trash; `documentUpdate
+{trashed: true}` is refused with "cannot be trashed without being archived") is **left out
+of `Issue.documents`** unless `includeArchived: true` is passed, so trashing a duplicate
+clears `AMBIGUOUS`. `document(id:)` still returns a trashed document (`trashed: true`).
+
 ## Out of scope
 
 - `linear_mutate` (Q1).
