@@ -9,10 +9,13 @@ A [Hermes Agent](https://github.com/NousResearch/hermes-agent) channel plugin th
 
 It runs inside *your* Hermes and connects to *your* Linear workspace through a Linear OAuth app you create. Nothing is hosted by anyone else.
 
+This is a community plugin. I am not affiliated with Linear (linear.app), and this is not an official plugin from Linear.
+
 ---
 
 ## Contents
 
+- [Screenshots](#screenshots)
 - [How it behaves](#how-it-behaves)
 - [Agent tools](#agent-tools)
 - [Requirements](#requirements)
@@ -28,9 +31,30 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 - [CLI](#cli)
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
+- [What it touches](#what-it-touches)
 - [Limitations](#limitations)
 - [Development](#development)
 - [License](#license)
+
+---
+
+## Screenshots
+
+Your agent appears under **Agents** when you assign or delegate a ticket:
+
+![The agent listed under Agents in Linear's assignee menu](docs/screenshots/hermes-linear-screenshot0.jpg)
+
+Its replies, progress and questions show up in Linear's agent panel:
+
+![An agent reply in Linear's agent panel](docs/screenshots/hermes-linear-screenshot1.jpg)
+
+Questions, such as a superpowers plan approval, are pick-lists in the thread:
+
+![A plan approval asked as a pick-list](docs/screenshots/hermes-linear-screenshot2.jpg)
+
+A write outside the ticket asks first, with **Allow once** / **Deny**:
+
+![An approval card for a write to another project](docs/screenshots/hermes-linear-screenshot3.jpg)
 
 ---
 
@@ -122,7 +146,7 @@ There is no ticket tree outside a session, so every issue counts as out of scope
 
 ## Requirements
 
-- Hermes Agent v0.23.2 or newer, with the gateway running (`hermes gateway run` or the systemd service).
+- Hermes Agent v0.23.3 or newer, with the gateway running (`hermes gateway run` or the systemd service).
 - A Linear workspace where you can create an OAuth application (workspace admin).
 - A way for Linear to reach your machine over HTTPS: Tailscale Funnel, Cloudflare Tunnel, ngrok, or a reverse proxy on a public host. See [Expose the webhook](#expose-the-webhook).
 
@@ -424,11 +448,23 @@ Use `hermes -p <profile> linear …` for other profiles. The commands exist only
 - An out-of-scope write (`out_of_scope_writes: approve`) goes to a human through Hermes's own approval gate; one approval covers one call with identical arguments. Hermes's bypasses apply to it as to every approval: `/yolo` (or `--yolo`) and `approvals.mode: off` approve it without asking. Hermes's presence rules decide who is asked: where no human is present (cron, a non-gateway run) its gate blocks the write (cron follows `approvals.cron_mode`); a subagent that inherits the gateway session asks in Linear like its parent. `out_of_scope_writes: allow` skips the question entirely; use it only in trusted single-user setups.
 - A write from outside a Linear session (`outside_session_writes: approve`) goes through the same gate, with the same bypasses, and is asked in the calling chat: Slack and Telegram show Hermes's approval card with buttons and its full choice set (*once*, *session*, *always*, *deny*); *session* and *always* cover only later identical calls (same tool and arguments) outside a Linear session; in a Linear session the identical call, when out of scope there, still asks *once* / *deny* in the ticket thread. Where no human is present (a cron job) Hermes blocks the write (cron follows `approvals.cron_mode`); a context with no Hermes session key gets `OUT_OF_SCOPE` (nobody can be asked). `outside_session_writes: allow` writes without asking, cron included. Text written from another channel becomes part of a later Linear session's prompt once someone delegates the ticket; the origin footer shows where it came from.
 
+## What it touches
+
+Everything the plugin does outside Hermes itself, for a quick review before you install it.
+
+- **Network.** It calls `api.linear.app` only: GraphQL, plus `/oauth/token` for client-credentials tokens. `linear_attach` uploads files to the signed URL Linear returns, on `storage.googleapis.com`. Requests send a `hermes-linear/<version>` User-Agent. There is no telemetry.
+- **Listener.** One long-running HTTP listener per gateway, on `127.0.0.1:8650` by default. You expose it yourself with a tunnel or proxy.
+- **Secrets.** `LINEAR_CLIENT_SECRET` and `LINEAR_WEBHOOK_SECRET` live in the profile's `.env` and are read through Hermes. Access tokens stay in memory.
+- **Local files.** State is a SQLite database at `<HERMES_HOME>/plugin-data/linear/data.db`. `linear_attach` reads a file you name, if Hermes's media policy allows it. `linear_sync_spec` and `linear_sync_plan` read the file you name and write ticket IDs back into the plan file.
+- **Commands.** The sync tools run `git` (`log`, `status`, `rev-parse`, `remote get-url`) in the file's repo to build commit links. `hermes linear status` runs `git log` on the plugin's own checkout. `hermes linear setup` runs `tailscale status --json` (read-only) and prints, never runs, a Funnel command.
+- **Test webhook.** `hermes linear test` sends one signed test webhook to your public webhook URL.
+
 ## Limitations
 
 - Webhooks only; there is no polling mode, so Linear must be able to reach your listener.
 - Initiatives, customers and project-level agent sessions are not handled. Comments on documents, and edits made to them in Linear, don't reach the session.
 - Files pasted inline into Linear comments or descriptions still appear to the agent as links; issue attachments are listed by `linear_issue_get` (and can be added with `linear_attach`).
+- It needs the default `plugins.isolation: in_process`. Under `plugins.isolation: host` Hermes doesn't load it, because gateway platform adapters must run in the Hermes process.
 
 ## Development
 

@@ -155,6 +155,34 @@ async def test_429_respects_retry_after(fake, client, sleeps):
     assert len(fake.gql_calls("Viewer")) == 3
 
 
+async def test_retry_after_http_date_and_bounds(fake, client, sleeps):
+    """Hermes's parse_retry_after_seconds reads the HTTP-date form too; the plugin still
+    clamps to 60 s and falls back to 1 s when the header is absent or unreadable."""
+    from email.utils import format_datetime
+    from datetime import datetime, timedelta, timezone
+
+    when = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=30), usegmt=True)
+    ok = {"data": {"viewer": {"id": APP_USER, "name": "Hermes"}}}
+    fake.on("Viewer", Resp(429, None, {"Retry-After": when}),
+            Resp(429, None, {"Retry-After": "3600"}),
+            Resp(429, None, {"Retry-After": "soon"}),
+            ok)
+    assert await client.viewer_id() == APP_USER
+    assert 20 <= sleeps[0] <= 30
+    assert sleeps[1:] == [60.0, 1.0]
+
+
+async def test_requests_send_plugin_user_agent(fake, client):
+    from hermes_linear.constants import PLUGIN_VERSION
+
+    await client.viewer_id()
+    (tok,) = fake.token_calls()
+    (gql,) = fake.gql_calls("Viewer")
+    for call in (tok, gql):
+        ua = call.headers["User-Agent"]
+        assert ua.startswith(f"hermes-linear/{PLUGIN_VERSION} Hermes-Agent/"), ua
+
+
 async def test_429_gives_up_after_write_retries(fake, client, sleeps):
     fake.on("Viewer", Resp(429, None, {"Retry-After": "1"}))
     with pytest.raises(LinearError) as ei:

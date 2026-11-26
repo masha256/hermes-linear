@@ -483,12 +483,6 @@ def test_skill_finish_links_pr():
     assert "`linear_attach`" in finish
 
 
-def test_skill_ships_as_package_data():
-    meta = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
-    data = meta["tool"]["setuptools"]["package-data"]["hermes_linear"]
-    assert "skills/*/SKILL.md" in data
-
-
 # ------------------------------------------------------------------ fakes for the CLI
 
 
@@ -937,21 +931,16 @@ def test_status_unconfigured_nonzero():
 # ------------------------------------------------------------------ packaging
 
 
-def test_entry_point_resolves():
+def test_plugin_ships_as_directory_not_entry_point():
+    """RET-185: no pip entry point (a [build-system] made Hermes's PM build the plugin as a
+    package). Hermes loads the repo-root ``__init__.py`` shim, which re-exports register."""
     meta = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())
-    target = meta["project"]["entry-points"]["hermes_agent.plugins"]["linear"]
-    assert target == "hermes_linear.plugin"
-    assert "build-system" in meta
-    mod = importlib.import_module(target)
+    assert "entry-points" not in meta["project"]
+    assert "build-system" not in meta
+    shim = (REPO_ROOT / "__init__.py").read_text()
+    assert "from .hermes_linear.plugin import register" in shim
+    mod = importlib.import_module("hermes_linear.plugin")
     assert callable(mod.register)
-
-
-def test_entry_point_via_metadata_when_installed():
-    eps = [ep for ep in importlib.metadata.entry_points(group="hermes_agent.plugins")
-           if ep.name == "linear"]
-    if not eps:
-        pytest.skip("hermes-linear is not pip-installed in this environment")
-    assert callable(eps[0].load().register)
 
 
 # ------------------------------------------------------------------ platform pinning

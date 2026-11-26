@@ -1,15 +1,19 @@
 name: linear
 label: Linear
 kind: platform
-version: 0.2.0
-# Floor: v0.23.2 is the first release whose media-delivery policy refuses .env files
-# anywhere (linear_attach relies on it). CI's pinned job runs this exact version.
-requires_hermes: ">=0.23.2"
+version: 0.2.1
+# Floor: v0.23.3. v0.23.2 is the first release whose media-delivery policy refuses .env files
+# anywhere (linear_attach relies on it); v0.23.3 is the first whose public plugin API lists
+# parse_retry_after_seconds and hermes_user_agent. CI's pinned job runs this exact version.
+requires_hermes: ">=0.23.3"
 description: >
   Linear channel for Hermes Agent. Receives Linear agent-session and
   workspace webhooks on a shared listener and runs one Hermes session per
   delegated ticket, reporting progress back as Linear agent activities.
 author: masha256
+license: MIT
+homepage: https://github.com/masha256/hermes-linear
+tags: [gateway, linear, issues, agent-sessions, superpowers]
 provides_tools:
   - linear_issue_get
   - linear_issue_create
@@ -36,11 +40,17 @@ requires_env:
     prompt: "Linear client secret"
     url: "https://linear.app/settings/api/applications"
     password: true
+    # `hermes plugins install` masks its prompt only on `secret: true`;
+    # `password: true` is what the gateway setup UI reads. Keep both.
+    secret: true
   - name: LINEAR_WEBHOOK_SECRET
     description: "Linear app webhook signing secret (HMAC-SHA256 verification)"
     prompt: "Linear webhook signing secret"
     url: "https://linear.app/settings/api/applications"
     password: true
+    # `hermes plugins install` masks its prompt only on `secret: true`;
+    # `password: true` is what the gateway setup UI reads. Keep both.
+    secret: true
 optional_env:
   - name: LINEAR_ALLOWED_USERS
     description: "Comma-separated Linear user UUIDs or emails allowed to drive the agent (* = anyone)"
