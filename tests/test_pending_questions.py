@@ -691,16 +691,16 @@ async def test_other_session_does_not_answer(env, session_env):
     assert _removed(client) == []
 
 
-NARROWED = {"requester_id": HUMAN, "requester_name": "Human", "approvers": [],
-            "chat_type": "dm"}  # approvals.approvers narrowed: only the requester answers
+NARROWED = {"open": False, "allowed": [HUMAN],
+            "refusal": "Human"}  # approvals.approvers narrowed: only the requester answers
 
 
 def _authority(monkeypatch, authority=NARROWED):
-    """Stub the asking-time capture (``tools.approval.list_gateway_approval_authority``)."""
+    """Stub the asking-time capture (public ``approval_refusal`` probes, RET-180)."""
     seen = []
     monkeypatch.setattr(sessions_open_mod, "_approval_authority",
-                        lambda sk, rid: seen.append((sk, rid)) or (
-                            None if authority is None else {"request_id": rid, **authority}))
+                        lambda sk, rid, requester_id=None: seen.append((sk, rid, requester_id))
+                        or (None if authority is None else dict(authority)))
     return seen
 
 
@@ -712,8 +712,8 @@ async def test_pending_approval_approve(env, session_env, monkeypatch):
     monkeypatch.setattr(sessions_open_mod, "_resolve_approval_card",
                         lambda *a, **k: pytest.fail("a pending approval has no waiter"))
     n = await _pending_approval(a, client, gw, session_env)
-    assert seen == [("agent:main:linear:dm:x", "req-1")]
-    assert store.control("req-1").authority == {"request_id": "req-1", **NARROWED}
+    assert seen == [("agent:main:linear:dm:x", "req-1", HUMAN)]  # the asking turn's user
+    assert store.control("req-1").authority == NARROWED
     await deliver(a, prompted(D_SID, D_ISSUE, "Allow once", "act-ans"))
     await settle(a)
     assert len(gw.events) == n + 1
@@ -729,8 +729,8 @@ async def test_pending_approval_non_approver_refused(env, session_env, monkeypat
     """Final review 1: Hermes no longer has the timed-out approval, so the check uses the
     authority captured when it was asked; another user's Approve is refused, row kept."""
     a, client, gw, store, order = env
-    _authority(monkeypatch, {"requester_id": "u-alice", "requester_name": "Alice",
-                             "approvers": ["u-bob"], "chat_type": "dm"})
+    _authority(monkeypatch, {"open": False, "allowed": ["u-alice", "u-bob"],
+                             "refusal": "Alice"})
     monkeypatch.setattr(sessions_open_mod, "_refusal_text", lambda who: f"only {who}")
     n = await _pending_approval(a, client, gw, session_env)
     await deliver(a, prompted(D_SID, D_ISSUE, "once", "act-ans"))
@@ -742,7 +742,7 @@ async def test_pending_approval_non_approver_refused(env, session_env, monkeypat
 
 async def test_pending_approval_listed_approver_accepted(env, session_env, monkeypatch):
     a, client, gw, store, order = env
-    _authority(monkeypatch, {"requester_id": "u-alice", "approvers": [HUMAN]})
+    _authority(monkeypatch, {"open": False, "allowed": ["u-alice", HUMAN], "refusal": "Alice"})
     n = await _pending_approval(a, client, gw, session_env)
     await deliver(a, prompted(D_SID, D_ISSUE, "session", "act-ans"))
     await settle(a)
@@ -759,12 +759,14 @@ async def test_pending_approval_without_authority_refused(env, session_env, monk
     assert store.control("req-1").authority is None
     await deliver(a, prompted(D_SID, D_ISSUE, "once", "act-ans"))
     await settle(a)
-    assert len(got) == 1 and client.activities[-1][1] == {"type": "thought", "body": "no"}
+    assert got == [sessions_open_mod.NO_REQUESTER_NAME]
+    assert client.activities[-1][1] == {"type": "thought", "body": "no"}
     assert store.control("req-1").state == "pending"
     assert len(gw.events) == n and _grants(store) == [] and _removed(client) == []
 
 
-@pytest.mark.parametrize("authority", [None, {"requester_id": "u-alice", "approvers": []}])
+@pytest.mark.parametrize("authority", [None, {"open": False, "allowed": ["u-alice"],
+                                               "refusal": "Alice"}])
 async def test_pending_approval_deny(env, session_env, monkeypatch, authority):
     """Deny needs no authority (ruling R7 revised): anyone allowed in the thread may deny."""
     a, client, gw, store, order = env
@@ -781,25 +783,93 @@ async def test_pending_approval_deny(env, session_env, monkeypatch, authority):
     assert _removed(client) == [(D_ISSUE, [BLOCKED])]
 
 
-def test_approval_authority_picks_the_request(monkeypatch):
-    import tools.approval as approval
-    monkeypatch.setattr(approval, "list_gateway_approval_authority", lambda sk: [
-        {"request_id": "other", "requester_id": "x"},
-        {"request_id": "req-1", "requester_id": "u1", "approvers": ["*"]}])
-    assert sessions_open_mod._approval_authority("K", "req-1") == {
-        "request_id": "req-1", "requester_id": "u1", "approvers": ["*"]}
-    assert sessions_open_mod._approval_authority("K", "gone") is None
+def _refusals(monkeypatch, verdicts, approvers=None):
+    """Stub the PUBLIC Hermes calls ``_approval_authority`` makes: ``approval_refusal`` answers
+    from ``verdicts`` (actor -> refusal name or None) and the profile's ``approvals`` block."""
+    import gateway.approval_actor as actor_mod
+    import hermes_cli.config as config_mod
+    calls = []
 
-    def boom(sk):
+    def refusal(sk, actor, *, request_id=None, **kw):
+        calls.append((sk, actor, request_id))
+        return verdicts(actor) if callable(verdicts) else verdicts.get(actor, "Alice")
+    monkeypatch.setattr(actor_mod, "approval_refusal", refusal)
+    block = {} if approvers is None else {"approvers": approvers}
+    monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {"approvals": block})
+    return calls
+
+
+def test_approval_authority_open_by_default(monkeypatch):
+    calls = _refusals(monkeypatch, lambda actor: None)  # approvers unset = ["*"]
+    assert sessions_open_mod._approval_authority("K", "req-1", "u1") == {
+        "open": True, "allowed": [], "refusal": None}
+    assert calls == [("K", sessions_open_mod.PROBE_ACTOR, "req-1")]
+
+
+def test_approval_authority_narrowed(monkeypatch):
+    calls = _refusals(monkeypatch, {"u1": None, "u-bob": None, "u-gone": "Alice"},
+                      approvers=["u-bob", "u-gone", "u1"])
+    assert sessions_open_mod._approval_authority("K", "req-1", "u1") == {
+        "open": False, "allowed": ["u1", "u-bob"], "refusal": "Alice"}
+    assert [c[1] for c in calls] == [sessions_open_mod.PROBE_ACTOR, "u1", "u-bob", "u-gone"]
+    assert all(c[2] == "req-1" for c in calls)
+
+
+def test_approval_authority_no_requester(monkeypatch):
+    _refusals(monkeypatch, {"u-bob": None}, approvers=["u-bob"])
+    assert sessions_open_mod._approval_authority("K", "req-1", None) == {
+        "open": False, "allowed": ["u-bob"], "refusal": "Alice"}
+
+
+def test_approval_authority_open_but_config_narrowed_fails_closed(monkeypatch):
+    """``approval_refusal`` also passes everyone when Hermes has no such entry: a narrowed
+    config with an "open" probe is that case, so nothing is captured (late approvals refused)."""
+    _refusals(monkeypatch, lambda actor: None, approvers=[])
+    assert sessions_open_mod._approval_authority("K", "req-1", "u1") is None
+
+
+def test_approval_authority_error_is_none(monkeypatch):
+    import gateway.approval_actor as actor_mod
+
+    def boom(*a, **k):
         raise RuntimeError("x")
-    monkeypatch.setattr(approval, "list_gateway_approval_authority", boom)
-    assert sessions_open_mod._approval_authority("K", "req-1") is None
+    monkeypatch.setattr(actor_mod, "approval_refusal", boom)
+    assert sessions_open_mod._approval_authority("K", "req-1", "u1") is None
 
 
-def test_may_answer_uses_hermes_check():
+def test_may_answer_snapshot():
+    closed = {"open": False, "allowed": ["u1"], "refusal": "Alice"}
+    assert sessions_open_mod._may_answer(closed, "u1")
+    assert not sessions_open_mod._may_answer(closed, "u2")
+    assert not sessions_open_mod._may_answer(closed, "")
+    assert sessions_open_mod._may_answer({"open": True, "allowed": [], "refusal": None}, "u2")
+
+
+def test_may_answer_legacy_rows():
+    """Rows stored before RET-180 hold Hermes's own entry (requester_id, approvers)."""
     assert sessions_open_mod._may_answer({"requester_id": "u1", "approvers": []}, "u1")
     assert not sessions_open_mod._may_answer({"requester_id": "u1", "approvers": []}, "u2")
+    assert sessions_open_mod._may_answer({"requester_id": "u1", "approvers": ["u2"]}, "u2")
     assert sessions_open_mod._may_answer({"requester_id": "u1", "approvers": ["*"]}, "u2")
+    assert not sessions_open_mod._may_answer({"requester_id": "", "approvers": []}, "")
+
+
+def test_requester_of_both_shapes():
+    f = sessions_open_mod._requester_of
+    assert f({"open": False, "allowed": [], "refusal": "Alice"}) == "Alice"
+    assert f({"requester_id": "u1", "requester_name": "Alice", "approvers": []}) == "Alice"
+    assert f({"requester_id": "u1", "approvers": []}) == "u1"
+    assert f({"requester_id": "", "approvers": []}) == sessions_open_mod.NO_REQUESTER_NAME
+    assert f(None) == sessions_open_mod.NO_REQUESTER_NAME
+
+
+def test_no_private_core_imports():
+    """RET-180: the plugin imports only public Hermes names (catalog rule 9)."""
+    import pathlib
+    src = "".join(p.read_text() for p in
+                  pathlib.Path(sessions_open_mod.__file__).parent.glob("*.py"))
+    for name in ("list_gateway_approval_authority", "import may_answer", "_NO_REQUESTER"):
+        assert name not in src, name
 
 
 # --- final review 2: a grant lives only as long as its answer turn ------------------------

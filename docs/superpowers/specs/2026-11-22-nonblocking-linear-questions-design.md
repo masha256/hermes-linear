@@ -171,9 +171,17 @@ state. `SessionOpener.resolve_control`:
   option click arrives as its label).
 - **pending, approval**: parse the answer with `renderer.parse_approval_answer`. An
   unrecognised answer is re-asked as today (`REASK_TEXT`). For `once` / `session`: run the
-  answer check against the approval's authority captured when it was asked
-  (`tools.approval.list_gateway_approval_authority`, stored on the row; checked with
-  `gateway.approval_actor.may_answer`). `approval_refusal` cannot be used here: once Hermes
+  answer check against the approval's authority captured when it was asked, stored on the
+  row. (Amended by RET-180, which removed the private imports; originally the snapshot came from
+  `tools.approval.list_gateway_approval_authority` and was checked with
+  `gateway.approval_actor.may_answer`.) At asking time, while Hermes still holds the entry,
+  the public `approval_refusal` is asked about a probe id no user can have (anyone may answer →
+  `open`; otherwise its result is the refusal name) and about each candidate: the asking turn's
+  user and the profile's `approvals.approvers` (`hermes_cli.config.load_config_readonly`).
+  The row stores `{open, allowed, refusal}`; the late check is `open` or actor in `allowed`.
+  A probe that passes while the config is narrowed means nothing was pending: no authority is
+  stored. Rows stored before RET-180 (Hermes's entry) keep working with the same rule.
+  `approval_refusal` cannot be used at answer time: once Hermes
   timed the approval out it is no longer pending, and nothing pending is never refused. On
   refusal post the refusal text and keep the row; a row with no stored authority is refused. Otherwise store a grant `(session_key, command, choice, actor_id)`, drop
   the row, remove `Blocked`, and start the turn `Answer to approval for \`<command>\`: approved

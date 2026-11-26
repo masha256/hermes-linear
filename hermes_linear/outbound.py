@@ -584,7 +584,10 @@ class Outbound:
             return SendResult(success=True, message_id=f"approval:{rid}")  # no row, no post
         # Who may answer, read now while Hermes still holds the entry (it is queued before
         # notify): a pending answer comes after Hermes timed it out and forgot it.
-        authority = sessions_open_mod._approval_authority(str(prompt.session_key), rid)
+        turn = self.a.turns.current_turn_for(*target.key)
+        requester = turn.decision.user_id if turn is not None else None
+        authority = sessions_open_mod._approval_authority(str(prompt.session_key), rid,
+                                                          requester)
         self._put_control(rid, "approval", target, choices, prompt.session_key,
                           question=prompt.text, command=command, authority=authority)
         ok = await self._elicit(target.sid, "approval", prompt.text, choices)
