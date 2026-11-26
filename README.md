@@ -1,9 +1,5 @@
 # Hermes Linear Channel
 
-> **Status: pre-release, in development.** This README describes the plugin as designed in
-> [`docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md`](docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md).
-> Commands and settings below are the target interface; until the first release, treat them as a spec.
-
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) channel plugin that turns Linear into a place you work *with* your Hermes agent:
 
 - **Delegate a ticket to your agent → one Hermes session for the whole ticket.** The agent works in the thread Linear opens on delegation (and in any thread where you @mention it). Plain comments from your team and edits to the ticket and its project reach the same conversation as context, so the agent remembers everything about the ticket.
@@ -33,6 +29,8 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 - [Troubleshooting](#troubleshooting)
 - [Security notes](#security-notes)
 - [Limitations](#limitations)
+- [Development](#development)
+- [License](#license)
 
 ---
 
@@ -40,65 +38,91 @@ It runs inside *your* Hermes and connects to *your* Linear workspace through a L
 
 | You do in Linear | What happens |
 |---|---|
-| Delegate a ticket to the agent | A Hermes session opens for the ticket. The agent acknowledges within seconds, moves the ticket to your team's first *started* status (configurable), and starts working. |
-| Reply in the agent's thread | The reply is a new turn in the ticket's session. |
-| Comment on a delegated ticket without @mentioning the agent (a new thread, or a reply in a thread that isn't the agent's) | Recorded as context, like an edit: the agent sees it in the "Since your last turn" summary of its next turn. Plain comments never wake the agent; threads outside the agent's own are for people. |
-| @mention the agent in another thread on a delegated ticket | The agent joins that thread in the **same** ticket session and answers there. |
-| Edit the ticket (status, labels, description, links) or its project, or post a project update | Recorded as context. The agent sees a "Since your last turn" summary at the start of its next turn. Edits never wake the agent on their own. |
-| @mention the agent on a ticket that is *not* delegated | A one-off session for that thread only. |
-| Press **Stop** | The running turn is interrupted; the agent reports what it finished and what it didn't. |
-| Answer an approval / question pick-list | The agent continues. Free text never counts as approval of a risky action. |
-| The agent wants to write to a ticket outside its own (not the session ticket, its sub-tickets or tickets it created from it) | It asks first: an **Allow once / Deny** pick-list in the thread names the tool, the target ticket and the arguments. *Allow once* runs exactly that call; any other call asks again. Unanswered within Hermes's `approvals.timeout`, the question stays pending: answer it later and the agent re-runs the call without a second prompt. Set with `out_of_scope_writes`. |
-| Ask the agent in Slack, Telegram, the CLI or a cron job to file, comment on, update, link or attach to a ticket | Set with `outside_session_writes`. `approve` (default): Hermes asks in that chat first with its own approval card (buttons on Slack and Telegram, a text prompt elsewhere) naming the tool, the target tickets or the new issue's destination (`destination "<team> / <project>"`), and the arguments. `deny`: refused (`NOT_LINEAR_SESSION`). `allow`: written without asking. Issues it files and comments it posts end with `Filed by <profile> via <platform>`. |
-| The agent attaches a file or link (e.g. its PR) | It shows in the ticket's attachments, added by the app. The agent also links its PR on the agent session (`linear_session_link`). Only files Hermes would deliver as media are uploaded (see [Attachments](#attachments)); another ticket asks first, like any out-of-scope write. |
-| The agent creates or edits a Linear document (`linear_document`) | A document on the session ticket or another in-scope ticket, or one the agent created from this ticket in any session (remembered across restarts in the plugin's `created_documents` table), is written without asking. A new document on a ticket outside that scope or on any project, and an edit of any other document, ask first with the same pick-list (the card names the issue, `project "<name>"` or `document "<title>"`). A document with the same title already on that issue or project answers `ALREADY_EXISTS` instead of a duplicate. Documents are never moved, trashed or deleted. |
-| The agent posts a project update, creates or edits a milestone, or adds a project link (`linear_project`) | It always asks first (as an out-of-scope write, so `out_of_scope_writes` applies), the session ticket's own project included. Each post is a new update (a re-run posts again); a link whose URL the project already has answers `ALREADY_LINKED` without asking. Linear can't clear a milestone description (only replace it), and a link added without a label gets its URL as the label. |
-| Remove the delegation | Any running turn stops. The session's memory is kept; re-delegating resumes it — unless the ticket is Done or Canceled, which starts a fresh session. |
+| Delegate a ticket to the agent | A Hermes session opens for the ticket. The agent acknowledges within seconds, moves the ticket to your team's first *started* status (configurable) and gets to work. |
+| Reply in the agent's thread | The reply is the next turn in the ticket's session. |
+| Comment on a delegated ticket without @mentioning the agent | The agent doesn't wake up. It sees the comment in a "Since your last turn" summary on its next turn. |
+| Edit the ticket or its project | Same as a plain comment: recorded, then summarized on the next turn. |
+| @mention the agent in another thread on a delegated ticket | The agent answers there, in the same ticket session. |
+| @mention the agent on a ticket that isn't delegated | A one-off session for that thread only. |
+| Press **Stop** | The running turn stops, and the agent says what it finished. |
+| Answer an approval or question pick-list | The agent carries on. Free text never counts as approving a risky action. |
+| The agent wants to write outside its ticket tree | It asks with an **Allow once / Deny** pick-list first. See [Write scope](#write-scope). |
+| Ask the agent in Slack, Telegram, the CLI or cron to change a ticket | Hermes asks in that chat first. See [Outside a Linear session](#outside-a-linear-session). |
+| Remove the delegation | Any running turn stops. Re-delegating resumes the same session, unless the ticket is Done or Canceled. |
 
-Everything the agent does appears in Linear's agent session panel: every tool call as an *action* with its result preview, commentary as *thoughts*, the final answer as a comment in the thread. Two prompts arriving at once (e.g. from two threads) are queued, never interleaved.
+Tool calls show up in Linear's agent panel as actions, commentary as thoughts, and the final answer as a comment in the thread. Prompts that arrive together (from two threads, say) run one after the other.
 
 ## Agent tools
 
-The plugin gives the agent these tools. They act as the Linear app (every write is attributed to it), never raise, and answer `{"ok": false, "error": "<CODE>"}` on failure (a failure Linear reported also carries Linear's `message`).
+The tools act as the Linear app, so every write is attributed to it. On failure they return `{"ok": false, "error": "<CODE>"}`; they don't raise.
 
 | Tool | What it does |
 |---|---|
-| `linear_issue_get` | Read any issue: state, labels, project and its links, parent, children, assignee, delegate, priority, estimate, due date, cycle, milestone, relations (both directions), attachments and documents (`id`, `title`, `url`; read one with `linear_document`). `comments: N` (0–50, default 0) adds the newest N comment threads, newest first, each with its replies oldest first; past 50,000 characters the oldest threads are dropped and `comments_truncated` is `true`. |
-| `linear_search` | Find issues: full-text `text` (optionally `include_comments`), or the most recently updated issues. Typed filters, ANDed: `team` (key), `project` (UUID or name), `state` (workflow type or state name), `assignee` / `delegate` (`me`, an email or a name), `label`, `parent`. Pages of `limit` rows (1–50, default 25) with `next_cursor`; anything more complex goes through `linear_query`. |
-| `linear_issue_create` | Create an issue with title, description, labels, state, `assignee`, `delegate`, `priority`, `estimate`, `due_date`, `cycle` and `milestone`. It lands in the `parent`'s team and project, or without a `parent` in the session ticket's (outside a Linear session: `default_team` / `default_project`, see *Outside a Linear session*); a `team` or `project` other than that asks first (see *Write scope*). A `team` other than that without a `project` creates the issue with no project. `delegate` can't be this app (`SELF_DELEGATION`) and `assignee` can't be an app user (`ASSIGNEE_IS_APP`); see *Delegation*. |
-| `linear_issue_update` | Change title, description, state, labels, parent, `project`, `assignee`, `delegate`, `priority`, `estimate`, `due_date`, `cycle` or `milestone`. `null` or `""` clears `project`, `assignee`, `delegate`, `priority`, `estimate`, `due_date`, `cycle` or `milestone`, and detaches `parent`; a `null` `title`, `description` or `state` is left as it is. The issue's current project, the session ticket's and the parent's need no approval; another project asks first. A project change without `milestone` clears the milestone. No `team`: moving issues between teams is not supported. `delegate` and `assignee` refuse as on create (`SELF_DELEGATION`, `ASSIGNEE_IS_APP`). |
-| `linear_comment` | Comment on an issue, or edit the app's own marked comment. `reply_to` (a comment UUID from `linear_issue_get`) replies in that comment's thread (`COMMENT_NOT_ON_ISSUE` if it is not on the issue); `resolve: true` also resolves the thread. The result then carries `thread_id` and `resolved`; with `resolve: true` on a thread resolved before, also `already_resolved: true` (the thread is not resolved again). If resolving fails after the reply was posted, the error carries `posted: true` with `comment_id` and `thread_id`: the reply exists, so the agent must not re-run the call. |
-| `linear_sync_spec` | Mirror a committed spec (`path`, `summary`; the ticket comes from its `Linear: <ID>` header) to Linear: the whole file plus a source footer goes to a `Spec: <H1>` document on the ticket, found again by the `Spec:` title prefix among the app's own documents (a changed H1 retitles it; humans' documents are never touched; an unchanged file is not rewritten; over 250,000 characters the file is cut with a link and `inline: false`). In the ticket description only the spec part is rewritten: below the original description (the brief) and a `---` bar, the agent's `summary` (at most 5,000 characters) and a link line to the document and the source. The brief and the plan part below are kept, so edits to the brief survive re-syncs. Two app `Spec:` documents answer `AMBIGUOUS` with their ids, and nothing is written. |
-| `linear_sync_plan` | Mirror a committed plan (`path`, `summary`): one `T<n> · <name>` task sub-ticket per `### Task <n>: <name>` heading (its whole section as the description; adopted by title, canceled when removed; humans' and Done tickets untouched), then the whole file with the ticket IDs written back to a `Plan: <H1>` document (found and skipped like the spec's), then the description's plan part: everything above it is kept (the brief and the spec part), followed by a `---` bar, the `summary`, a link line and the task list `T<n> · <name> — <ID>` (cut to fit the 200,000-character description, task lines first). An old plan comment from the app is edited once to `Plan moved to <document link>` (`comment_migrated: true`); no plan comment is posted. The IDs are written back into the headings (`file_changed`). Two app `Plan:` documents answer `AMBIGUOUS` before any write. |
-| `linear_task_state` | Move a task sub-ticket along (`in_progress`, `in_review`, `done`, `blocked`, `unblocked`). `blocked` with `blocked_by: <issue>` also records `<issue> blocks <task>` (`question` becomes optional); the blocker must be in the session tree. `unblocked` removes only the label. |
-| `linear_relation` | Link two issues: `type` is `blocks`, `blocked_by`, `related` or `duplicate_of` (`duplicate_of` also moves the issue to its team's Duplicate state). The same relation again answers `ALREADY_RELATED`. Linear keeps one relation per pair of issues and would silently replace it, so any other existing relation between the two answers `RELATION_CONFLICT` with `existing`, and a human changes it in Linear. Relations are never deleted. |
-| `linear_lookup` | List what the write tools accept by name: `kind` is `teams`, `states`, `labels`, `users`, `cycles`, `projects` or `milestones`. `team` / `project` default to the session ticket's; `milestones` for a session ticket with no project answers `PROJECT_NOT_FOUND` with `candidates` (pass `project`). `cycles` rows carry `current: true` / `next: true` on those cycles. `query` filters by substring. At most 250 rows (`truncated: true` past that). Cached for 5 minutes. |
-| `linear_query` | Run a read-only GraphQL query as the app (mutations and subscriptions are refused; a result over 50,000 characters is refused with `RESPONSE_TOO_LARGE`). Works in any session. |
-| `linear_attach` | Attach to an issue: `path` + `id` uploads a local file (see [Attachments](#attachments)); `url` + `id` links a URL (a GitHub PR URL as a PR attachment; a URL the issue already has answers `ALREADY_LINKED`); `path` + `embed: true` (no `id`) only uploads and returns `markdown` to put in a comment. |
-| `linear_session_link` | Show a link (usually the PR) on the current turn's Linear agent session. Label defaults to `Pull request` for a GitHub PR URL, else the URL's host; re-adding the same URL is a no-op. |
-| `linear_project` | Read a project or write to it; `action` is `get`, `post_update`, `milestone` or `link`. `project` (UUID or name) defaults to the session ticket's project, outside a Linear session to `default_project` (with or without `default_team`); none answers `PROJECT_NOT_FOUND` with `candidates`. `get` (`updates`: 0–20, default 3) returns state, health, lead, target date, links, milestones, documents and the newest updates, newest first (each body cut at 4,000 characters with `body_truncated`; past 50,000 characters the oldest updates are dropped and `updates_truncated` is `true`). `post_update` (`body`, optional `health`: `on_track`, `at_risk`, `off_track`) posts a project update, which sets the project's health; without `health` the health stays as it is. A re-run posts a second update. `milestone` without `milestone` creates one (`name`; optional `description`, `target_date` `YYYY-MM-DD`); with `milestone` (a name or UUID in the project, else `MILESTONE_NOT_FOUND`) it edits that one: at least one of `name`, `description`, `target_date`; `target_date: null` clears the date, while `description: null` counts as absent and a blank `description` answers `BAD_ARGS` with a `message` (Linear can't clear a milestone description; pass new text to replace it). A name the project already uses answers `ALREADY_EXISTS` with Linear's message (Linear refuses it on write, so after the approval). `link` (`url`, `http(s)` only; optional `label`, which defaults to the URL) adds a project link; the same URL again answers `ALREADY_LINKED` with its `link_id`, before any approval and without writing. Links are never edited or removed, and the project itself (name, status, dates, lead) is not editable. Every write asks first (see *Write scope*). |
-| `linear_document` | Read, create or edit a Linear document; `action` is `get`, `create` or `update`. `get` (`id`: the document's UUID, slug id or `linear.app/<ws>/document/…` URL) returns title, url, content (cut at 50,000 characters with `content_truncated` and `content_length`), its issue or project, creator and last update; an unknown id answers `DOCUMENT_NOT_FOUND`. `create` (`title`, `content` (may be empty); `issue` or `project`, at most one, else the session ticket) attaches a new document there; a document with the same title (trimmed, case-sensitive) on that issue or project answers `ALREADY_EXISTS` with its `document_id` and `url`, before any approval and without writing. `update` (`id`; `title` and/or `content`, which replaces the body) edits in place: it never moves, trashes, hides or deletes a document. A `title` starting with `Spec:` or `Plan:` answers `BAD_ARGS` on `create` and `update`: those titles are reserved for `linear_sync_spec` / `linear_sync_plan`. |
+| `linear_issue_get` | Read any issue: fields, relations, attachments, documents, and with `comments: N` the newest N comment threads. |
+| `linear_search` | Find issues by text, or filter by team, project, state, assignee, delegate, label or parent. Paged. |
+| `linear_issue_create` | Create an issue with any of the usual fields. It lands in the parent's team and project, or the session ticket's. |
+| `linear_issue_update` | Change an issue's fields, parent or project. `null` clears a field. Issues can't move between teams. |
+| `linear_comment` | Comment on an issue, reply in a thread (`reply_to`), resolve a thread, or edit the app's own marked comment. |
+| `linear_relation` | Add a `blocks`, `blocked_by`, `related` or `duplicate_of` relation between two issues. |
+| `linear_attach` | Upload a local file or link a URL (a GitHub PR becomes a PR attachment) to an issue, or upload a file to embed in a comment. |
+| `linear_session_link` | Show a link, usually the PR, on the agent session. |
+| `linear_document` | Read, create or edit a Linear document on an issue or project. |
+| `linear_project` | Read a project, post a project update with a health status, create or edit a milestone, or add a link. |
+| `linear_lookup` | List valid teams, states, labels, users, cycles, projects or milestones. |
+| `linear_query` | Run any read-only GraphQL query. Mutations are refused. |
+| `linear_sync_spec` | Copy a committed spec file to a `Spec:` document on its ticket and put the agent's summary in the description, below the original brief. |
+| `linear_sync_plan` | Same for a plan, plus one `T<n> · <name>` sub-ticket per task. The ticket IDs are written back into the plan file. |
+| `linear_task_state` | Move a task sub-ticket to in progress, in review, done or blocked. |
 
-**Write scope.** In a Linear session, writes go without asking to the session ticket, its descendants, and tickets the app created from it. A `linear_comment`, `linear_issue_update`, `linear_issue_create`, `linear_attach` or `linear_relation` aimed elsewhere first answers `APPROVAL_REQUIRED`; the agent's identical re-call asks a human in the thread (see [How it behaves](#how-it-behaves) and `out_of_scope_writes`). `linear_relation` checks both issues. A team or project other than the base on `linear_issue_create`, or a project change on `linear_issue_update` beyond those that need no approval (see the table), asks the same way: the approval card names it as `team "<key>"` or `project "<name>"` next to any issues. A refusal found by reading first (`ALREADY_RELATED`, `RELATION_CONFLICT`, `COMMENT_NOT_ON_ISSUE`, `SELF_DELEGATION`, `ASSIGNEE_IS_APP`, `DELEGATE_NOT_AGENT`, a document title's `ALREADY_EXISTS`, a project link's `ALREADY_LINKED`, a name that doesn't resolve) needs no approval, and a call that asks writes nothing until it is approved. `linear_document` asks the same way for a `create` on an issue outside the scope (the card names the issue) or on any project (`project "<name>"`), and for an `update` unless the document's issue is in scope or the document was created from this session ticket (`document "<title>"`). Documents created from a Linear session are remembered against the session ticket in the plugin's store (`created_documents`), whatever they are attached to, so that ticket's later sessions edit them without asking, across restarts. Every `linear_project` write (`post_update`, `milestone`, `link`) asks, the session ticket's own project included (`project "<name>"`). `linear_sync_spec`, `linear_sync_plan` and `linear_task_state` refuse any other ticket (`OUT_OF_SCOPE`; for `linear_task_state` also a `blocked_by` outside the session tree, which the agent links with `linear_relation` instead). `linear_attach` with `embed` and `linear_session_link` target no issue, so they have no scope check, but they too need a Linear session (`NOT_LINEAR_SESSION`). Reads (`linear_issue_get`, `linear_search`, `linear_query`, `linear_lookup`, and the `get` action of `linear_project` and `linear_document`) work from any session; outside a Linear session `linear_lookup` needs an explicit `team` / `project` where the kind uses one (`NOT_LINEAR_SESSION` otherwise).
+### Write scope
 
-**Names and fields.** `linear_issue_create` and `linear_issue_update` take each kind in these forms, matched case-insensitively: `team` a UUID, key or name; `project` and `milestone` a UUID or name; `assignee` / `delegate` a UUID, name, display name, email or `me` (the app); `cycle` a UUID, number, name, `current` or `next`; `state` a state name or workflow type (not a UUID); labels a name (not a UUID). (`linear_search` filters differ; see its row.) Names are resolved from a directory cached for 5 minutes and refetched once on a miss. A miss answers `TEAM_NOT_FOUND`, `PROJECT_NOT_FOUND`, `STATE_NOT_FOUND`, `USER_NOT_FOUND`, `CYCLE_NOT_FOUND` or `MILESTONE_NOT_FOUND` with `candidates` to pick from, several matches answer `AMBIGUOUS` with `candidates`, and an unknown label answers `LABEL_MISSING` with `available` (the label names it could use). `priority` is `none`, `urgent`, `high`, `medium` or `low` (or Linear's 0–4); `estimate` an integer ≥ 0, which Linear stores even when the team doesn't use estimates; `due_date` is `YYYY-MM-DD`; a `milestone` resolves in the issue's resulting project. A bad value answers `BAD_ARGS`.
+Inside a Linear session the agent writes freely to its own ticket tree and asks before touching anything else.
 
-**Delegation.** `delegate` must be an agent (app) user other than this app (`DELEGATE_NOT_AGENT` for a human). Delegating to this app itself (`me`, its name, email or UUID) is refused with `SELF_DELEGATION` and nothing is written: Linear does open an agent session for a delegation the app sets on itself, but with no creator, so the plugin can't tell who asked and refuses the session on the issue, leaving it in `error`. Only a human can delegate an issue to this app; the agent asks in the thread. An `assignee` that is any app user (this app or another) is refused with `ASSIGNEE_IS_APP`, also before any write, because Linear turns an app assignee into a delegation; use `delegate` for another agent. Both refusals carry a `message`, and clearing (`null` / `""`) still works.
+- It writes without asking to the session ticket, its sub-tickets, and tickets and documents it created from that ticket. The plugin remembers what it created across restarts.
+- Anything else asks first: a comment, edit, relation or attachment on another issue, a create in another team or project, a document outside the tree, and every `linear_project` write (the ticket's own project included). You get an **Allow once / Deny** pick-list in the thread, and nothing is written until you allow it. `out_of_scope_writes` (`approve`, `deny` or `allow`) changes this.
+- *Allow once* covers that one call. If nobody answers before Hermes's `approvals.timeout`, the question stays open in the thread, and answering it later runs the call.
+- `linear_sync_spec`, `linear_sync_plan` and `linear_task_state` only work on the session ticket's tree.
+- Reads work on anything, from any session, without asking.
+- Nothing is ever deleted.
 
-**Outside a Linear session** (Slack, Telegram, the CLI, cron, and any context with no bound `HERMES_SESSION_PLATFORM`, such as a script or a thread without session variables), `linear_comment` (thread replies and `resolve` included), `linear_issue_update`, `linear_issue_create`, `linear_relation`, `linear_attach` with an `id`, `linear_document` (`create`, `update`) and `linear_project` (`post_update`, `milestone`, `link`) follow `outside_session_writes`. `approve` (default): the first call answers `APPROVAL_REQUIRED` and the agent's identical re-call asks a human in that same chat through Hermes's approval gate (see [Security notes](#security-notes)). `deny`: they refuse (`NOT_LINEAR_SESSION`). `allow`: they write without asking. There is no session tree there, so every issue counts as out of scope, and an issue or document created from outside a session is not remembered: each later write to it asks again. A `linear_document` `create` there needs an `issue` or `project` (`BAD_ARGS` otherwise: there is no session ticket). `linear_issue_create` takes the same arguments, name forms and refusals as in a session (see *Names and fields* and *Delegation*); its base is the `parent`'s team and project, or without a `parent` the `default_team` / `default_project` settings. No `parent`, no `team` and no `default_team` answers `BAD_ARGS`; for `linear_issue_create`, `default_project` is used only together with `default_team` (`linear_project` uses it on its own too), and a `team` other than the base without a `project` creates the issue with no project. A `team` / `project` argument always wins over the defaults, so a wrong default only matters when a create uses it (it then refuses with a `message` naming the setting). Every create there asks (the base too): the approval card names where the issue lands as `destination "<team key> / <project>"`, and an approved re-run that would land elsewhere (a default changed meanwhile) answers `OUT_OF_SCOPE` and writes nothing. Issues created and comments posted (or edited, or replied) from outside a session end with an origin footer `Filed by <profile> via <platform>`, taken from the calling session, never from the arguments; `linear_issue_update`, `linear_document` and `linear_project` add none. `linear_sync_spec`, `linear_sync_plan`, `linear_task_state`, `linear_session_link` and `linear_attach` with `embed` stay session-only (`NOT_LINEAR_SESSION`). Out-of-scope writes inside Linear sessions still follow `out_of_scope_writes` only; each setting governs its own side, and a context without a bound session platform is on the outside side. Reads (`linear_issue_get`, `linear_search`, `linear_query`, `linear_lookup`, and the `get` action of `linear_project` and `linear_document`) work from any session.
+### Names and fields
+
+The write tools take names instead of UUIDs: a team key, a project or milestone name, a user's name or email (`me` is the app), a cycle number or `current` / `next`, and a state name or type.
+
+- A name that doesn't match returns an error such as `TEAM_NOT_FOUND` or `PROJECT_NOT_FOUND`, with candidates to pick from. An unknown label returns `LABEL_MISSING` with the labels that exist.
+- `linear_lookup` lists the valid names for a team or project.
+- `priority` is `urgent`, `high`, `medium`, `low` or `none`. `due_date` is `YYYY-MM-DD`.
+
+### Delegation
+
+Only a person can delegate a ticket to this app.
+
+- `delegate` can name another agent. Naming this app fails with `SELF_DELEGATION`: Linear would open a session with no creator, and the plugin would reject it with an error on the ticket.
+- `assignee` can't be an app (`ASSIGNEE_IS_APP`), because Linear turns an app assignee into a delegation.
+
+### Outside a Linear session
+
+The tools also work from Slack, Telegram, the CLI and cron. There, every write follows `outside_session_writes`:
+
+- `approve` (default): Hermes asks in that chat before each write.
+- `deny`: writes are refused with `NOT_LINEAR_SESSION`.
+- `allow`: writes go through without asking.
+
+There is no ticket tree outside a session, so every issue counts as out of scope there, including ones created from that chat. `linear_issue_create` without a `parent` or `team` uses the `default_team` and `default_project` settings. Issues and comments written from outside a session end with `Filed by <profile> via <platform>`. The sync tools, `linear_task_state`, `linear_session_link` and `linear_attach` with `embed` need a Linear session.
 
 ### Attachments
 
-`linear_attach` uploads a file only if Hermes would deliver it as media to any other channel: the path must be absolute, and Hermes's media-delivery policy (`validate_media_delivery_path`) must accept it. Symlinks are judged and read by their target. By default that is any existing regular file outside a denylist: `.env` files anywhere (on Hermes versions that include the check; older ones only deny the listed dirs), `~/.ssh`, `~/.aws`, `~/.gnupg` and the other credential dirs, system dirs such as `/etc`, and Hermes's own state and config (`config.yaml`, `auth.json`, `state.db`, `sessions/`, …). Refused paths answer `PATH_DENIED`; there is no approval for them. In strict mode (`gateway.strict: true` or `HERMES_MEDIA_DELIVERY_STRICT=1`) only the Hermes cache dirs, the dirs in `HERMES_MEDIA_ALLOW_DIRS` and freshly produced files pass. Strict mode also closes the default mode's gap: a credential file outside the denylisted dirs (e.g. `~/.netrc`) passes in default mode.
+`linear_attach` uploads a local file only if Hermes would also send it as media to another channel (its `validate_media_delivery_path` check).
 
-- Files over 50 MB are refused (`FILE_TOO_LARGE`).
-- Attaching the same file again adds a second attachment and a second upload (Linear's API cannot delete uploads). Re-linking a URL doesn't: it answers `ALREADY_LINKED`, and the issue keeps one attachment.
-- On another ticket, a file or URL attach asks for approval first, like any out-of-scope write. If the upload worked but attaching it failed, the error carries `asset_url` so the agent can embed the file instead.
-- A local file named in a final reply (`MEDIA:`) is still shown by its basename and never uploaded; `linear_attach` is the only upload path.
+- Refused with `PATH_DENIED`, with no approval possible: `.env` files, `~/.ssh`, `~/.aws` and other credential dirs, system dirs such as `/etc`, and Hermes's own config and state.
+- Any other file passes in the default mode, so a credential file outside those dirs (`~/.netrc`, say) gets through. Strict mode (`gateway.strict: true` or `HERMES_MEDIA_DELIVERY_STRICT=1`) only allows Hermes's cache dirs, `HERMES_MEDIA_ALLOW_DIRS` and freshly produced files.
+- Files over 50 MB are refused.
+- Attaching the same file twice uploads it twice, and Linear's API can't delete uploads. Linking the same URL twice returns `ALREADY_LINKED`.
+- A file named with `MEDIA:` in a final reply is shown by name and never uploaded.
 
 ## Requirements
 
-- Hermes Agent with the gateway running (`hermes gateway run` or the systemd service).
+- Hermes Agent v0.23.2 or newer, with the gateway running (`hermes gateway run` or the systemd service).
 - A Linear workspace where you can create an OAuth application (workspace admin).
 - A way for Linear to reach your machine over HTTPS: Tailscale Funnel, Cloudflare Tunnel, ngrok, or a reverse proxy on a public host. See [Expose the webhook](#expose-the-webhook).
 
@@ -408,4 +432,21 @@ Use `hermes -p <profile> linear …` for other profiles. The commands exist only
 
 ## Development
 
-Design spec: [`docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md`](docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md). Work is tracked in the Linear project **hermes-linear** (formerly Valkyrie); dogfooding happens in **hermes linear test project**. Branching, the live checkout and the test-before-PR loop: [`docs/development.md`](docs/development.md).
+Issues and pull requests are welcome. To work on the plugin:
+
+```bash
+git clone https://github.com/masha256/hermes-linear && cd hermes-linear
+scripts/dev-env.sh            # .venv on top of your Hermes install's Python
+.venv/bin/pytest -q
+hermes plugins validate .
+```
+
+CI runs both against the Hermes version in `plugin.yaml`'s `requires_hermes` floor (required) and against hermes-agent `main` (early warning). The plugin uses only Hermes's public plugin API; `hermes plugins validate .` lists any private core import.
+
+- Design docs: the channel's design is [`docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md`](docs/superpowers/specs/2026-11-21-hermes-linear-channel-design.md); later features each have a spec in [`docs/superpowers/specs/`](docs/superpowers/specs/) and a plan in [`docs/superpowers/plans/`](docs/superpowers/plans/). They are records of each change as it was built, so this README wins where they differ.
+- Notes on how the plugin hooks into Hermes and superpowers: [`docs/hermes-integration-notes.md`](docs/hermes-integration-notes.md), [`docs/superpowers-integration-notes.md`](docs/superpowers-integration-notes.md).
+- Branching, a live checkout for the gateway, and the test-before-PR loop: [`docs/development.md`](docs/development.md).
+
+## License
+
+[MIT](LICENSE).
