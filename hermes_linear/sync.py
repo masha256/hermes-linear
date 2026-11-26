@@ -360,10 +360,13 @@ SYNC_SUMMARY_MAX = 5_000
 #: "content must be shorter than or equal to 250000 characters"); in UTF-16 units, the
 #: footer and hash marker included.
 SYNC_DOCUMENT_MAX = 250_000
-#: Hidden markers closing the description's spec part and opening its plan part (HTML
-#: comments survive Linear's markdown normalization, probe P8).
-SPEC_PART_MARKER = "<!-- hermes-linear:spec -->"
+#: Hidden markers opening the description's spec and plan parts, each right after a
+#: ``---`` bar (HTML comments survive Linear's markdown normalization, probe P8).
+SPEC_PART_MARKER = "<!-- hermes-linear:spec-part -->"
 PLAN_PART_MARKER = "<!-- hermes-linear:plan -->"
+#: RET-122's spec marker, which CLOSED a spec part that had replaced the brief. A spec
+#: sync replaces everything up to it with the current layout (RET-171).
+LEGACY_SPEC_MARKER = "<!-- hermes-linear:spec -->"
 _H1_RE = re.compile(r"^# (.*)$")
 #: A ``---`` bar ending ``text`` (blank lines after it allowed: Linear inserts one on save).
 _BAR_BEFORE_RE = re.compile(r"(?:^|(?<=\n))[ \t]*-{3,}[ \t]*\n(?:[ \t]*\n)*[ \t]*\Z")
@@ -423,9 +426,45 @@ def split_plan_part(description: str | None) -> tuple[str, str | None]:
     return desc[:start], desc[start:]
 
 
+def split_spec_part(description: str | None) -> tuple[str, str | None, str]:
+    """``(brief, spec_part, plan_part)`` of a ticket description (spec §6.3, RET-171).
+
+    ``plan_part`` is ``split_plan_part``'s (``""`` when absent). In what precedes it, the
+    spec part runs from the ``---`` line directly before ``SPEC_PART_MARKER`` (blank lines
+    between allowed; from the marker itself without a bar) to the plan part. A legacy
+    description (``LEGACY_SPEC_MARKER``, no new marker) has its spec part from the start up
+    to and including that marker, plus the whitespace after it. No marker: ``None`` and the
+    whole text before the plan part as the brief.
+    """
+    rest, plan = split_plan_part(description)
+    plan = plan or ""
+    at = rest.find(SPEC_PART_MARKER)
+    if at >= 0:
+        bar = _BAR_BEFORE_RE.search(rest, 0, at)
+        start = bar.start() if bar else at
+        return rest[:start], rest[start:], plan
+    at = rest.find(LEGACY_SPEC_MARKER)
+    if at >= 0:
+        end = at + len(LEGACY_SPEC_MARKER)
+        tail = rest[end:]
+        if not tail.strip():
+            return "", rest, plan
+        return tail.lstrip("\n"), rest[:end], plan
+    return rest, None, plan
+
+
 def spec_part(summary: str, source: str) -> str:
-    """The description's spec part: the summary, the source line, then the marker."""
-    return f"{summary}\n\n{source}\n{SPEC_PART_MARKER}"
+    """The description's spec part: a ``---`` bar, the marker, the summary, the source."""
+    return f"---\n{SPEC_PART_MARKER}\n{summary}\n\n{source}"
+
+
+def with_spec_part(current: str | None, part: str) -> str:
+    """``current`` with its spec part replaced by ``part`` (added below the brief, before
+    any plan part, when it has none). The brief and the plan part are kept as they are."""
+    brief, _old, plan = split_spec_part(current)
+    brief = brief.rstrip()
+    new = f"{brief}\n\n{part}" if brief else part
+    return f"{new}\n\n{plan}" if plan else new
 
 
 def _task_line(t: PlanTask, tickets: dict[int, str]) -> str:
@@ -494,11 +533,11 @@ def same_description(current: str | None, new: str) -> bool:
 
 __all__ = ["DESC_HASH_RE", "MANAGED_TITLE_RE", "desc_hash", "read_desc_hash",
            "with_desc_hash", "MAX_SOURCE_BYTES", "PlanTask",
-           "PLAN_PART_MARKER", "SPEC_INLINE_MAX", "SPEC_PART_MARKER", "SYNC_DOCUMENT_MAX",
+           "LEGACY_SPEC_MARKER", "PLAN_PART_MARKER", "SPEC_INLINE_MAX", "SPEC_PART_MARKER", "SYNC_DOCUMENT_MAX",
            "SYNC_SUMMARY_MAX", "SYNC_TITLE_PREFIXES", "SourceInfo", "TASK_DESC_MAX",
            "TASK_HEADING_RE", "TRUNCATED",
            "doc_title", "document_content", "fit_plan_part", "footer", "git_short_commit",
            "github_repo", "parse_plan", "plan_part", "read_linear_header", "read_source",
            "run_git", "same_description", "source_info", "source_line", "source_path",
-           "spec_part", "split_plan_part", "task_description", "task_title", "utf16_len",
-           "utf16_truncate", "write_source", "write_ticket_ids"]
+           "spec_part", "split_plan_part", "split_spec_part", "task_description", "task_title",
+           "utf16_len", "utf16_truncate", "with_spec_part", "write_source", "write_ticket_ids"]
