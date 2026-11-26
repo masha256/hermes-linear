@@ -55,8 +55,10 @@ def test_pyproject_is_not_an_install_declaration():
     if read is None:
         pytest.skip("read_python_declaration not in this Hermes")
     result = read(REPO_ROOT)
-    assert not getattr(result, "installs", False)
-    assert not tuple(getattr(result, "install_requirements", ()) or ())
+    if not hasattr(result, "pyproject_installs"):
+        pytest.skip("PythonDeclaration has no pyproject_installs in this Hermes")
+    assert result.pyproject_installs is False
+    assert tuple(result.install_requirements) == ()
 
 
 def test_readme_not_affiliated_with_linear():
