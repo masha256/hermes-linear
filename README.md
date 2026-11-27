@@ -1,6 +1,6 @@
 # Hermes Linear Channel
 
-A [Hermes Agent](https://github.com/NousResearch/hermes-agent) channel plugin that turns Linear into a place you work *with* your Hermes agent:
+A [Hermes Agent](https://github.com/NousResearch/hermes-agent) channel plugin that turns [Linear](https://linear.app/) into a place you work *with* your Hermes agent:
 
 - **Delegate a ticket to your agent → one Hermes session for the whole ticket.** The agent works in the thread Linear opens on delegation (and in any thread where you @mention it). Plain comments from your team and edits to the ticket and its project reach the same conversation as context, so the agent remembers everything about the ticket.
 - **@mention your agent on any other ticket → a quick, thread-scoped Q&A.** Follow-ups in that thread keep context; nothing is shared ticket-wide.
@@ -100,7 +100,7 @@ The tools act as the Linear app, so every write is attributed to it. On failure 
 
 ### Write scope
 
-Inside a Linear session the agent writes freely to its own ticket tree and asks before touching anything else.
+Inside a [Linear session](https://linear.app/developers/agent-interaction) the agent writes freely to its own ticket tree and asks before touching anything else.
 
 - It writes without asking to the session ticket, its sub-tickets, and tickets and documents it created from that ticket. The plugin remembers what it created across restarts.
 - Anything else asks first: a comment, edit, relation or attachment on another issue, a create in another team or project, a document outside the tree, and every `linear_project` write (the ticket's own project included). You get an **Allow once / Deny** pick-list in the thread, and nothing is written until you allow it. `out_of_scope_writes` (`approve`, `deny` or `allow`) changes this.
